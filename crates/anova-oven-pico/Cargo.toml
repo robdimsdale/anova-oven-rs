@@ -11,7 +11,9 @@
 
 [dependencies]
   # Main branch uses embedded-hal 1.0 but is not yet published to crates.io.
-  hd44780-driver = { git = "https://github.com/JohnDoneth/hd44780-driver", branch = "master", features = ["async"] }
+  hd44780-driver = { git = "https://github.com/JohnDoneth/hd44780-driver", branch = "master", features = [
+    "async",
+  ] }
   embedded-hal = "1"
 
   anova-oven-api = { path = "../anova-oven-api", default-features = false }
@@ -38,6 +40,7 @@
     "medium-ethernet",
     "proto-ipv4",
   ] }
+  embassy-futures = "0.1"
   embassy-time = "0.5"
 
   embedded-alloc = "0.7"

@@ -85,6 +85,57 @@ async fn stop_button_task(
     }
 }
 
+#[embassy_executor::task]
+async fn rot_enc_button_task(
+    stack: embassy_net::Stack<'static>,
+    mut button: Input<'static>,
+) -> ! {
+    loop {
+        button.wait_for_falling_edge().await;
+        info!("Rotary encoder button pressed");
+
+        // Debounce: ignore further presses for 500ms.
+        Timer::after(Duration::from_millis(500)).await;
+    }
+}
+
+#[embassy_executor::task]
+async fn rotary_encoder_task(mut pin_a: Input<'static>, mut pin_b: Input<'static>) -> ! {
+    // Quadrature encoder lookup table.
+    // Index = (prev_state << 2) | curr_state, where state = (A << 1) | B.
+    // +1 = CW, -1 = CCW, 0 = no movement or invalid (bounced) transition.
+    const QEM: [i8; 16] = [0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0];
+
+    let mut prev = ((pin_a.is_low() as u8) << 1) | (pin_b.is_low() as u8);
+    // Accumulate steps: each detent produces 4 quadrature transitions.
+    let mut accum: i8 = 0;
+
+    loop {
+        // Wait for either pin to change (interrupt-driven, no polling).
+        embassy_futures::select::select(
+            pin_a.wait_for_any_edge(),
+            pin_b.wait_for_any_edge(),
+        )
+        .await;
+
+        // Brief settle time for contact bounce.
+        Timer::after(Duration::from_micros(500)).await;
+
+        let curr = ((pin_a.is_low() as u8) << 1) | (pin_b.is_low() as u8);
+        let dir = QEM[((prev << 2) | curr) as usize];
+        prev = curr;
+        accum += dir;
+
+        if accum >= 4 {
+            info!("Rotary encoder: CW");
+            accum = 0;
+        } else if accum <= -4 {
+            info!("Rotary encoder: CCW");
+            accum = 0;
+        }
+    }
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     // Initialize the heap allocator.
@@ -199,6 +250,17 @@ async fn main(spawner: Spawner) {
     let stop_button = Input::new(p.PIN_15, Pull::Up);
     spawner.spawn(stop_button_task(stack, stop_button).unwrap());
     info!("Stop button task spawned on GPIO 15");
+
+    // --- Rotary Encoder button setup (GPIO 11, physical pin 15, pull-up, active low) ---
+    let rot_enc_button = Input::new(p.PIN_11, Pull::Up);
+    spawner.spawn(rot_enc_button_task(stack, rot_enc_button).unwrap());
+    info!("Rotary encoder button task spawned on GPIO 11");
+
+    // --- Rotary Encoder rotation setup (GPIO 10/physical pin 14, GPIO 12, physical pin 16, pull-up) ---
+    let enc_a = Input::new(p.PIN_10, Pull::Up);
+    let enc_b = Input::new(p.PIN_12, Pull::Up);
+    spawner.spawn(rotary_encoder_task(enc_a, enc_b).unwrap());
+    info!("Rotary encoder task spawned on GPIO 10/12");
 
     // Fetch recipes once on startup.
     #[allow(static_mut_refs)]
