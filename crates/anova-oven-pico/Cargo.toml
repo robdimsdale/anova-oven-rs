@@ -10,6 +10,10 @@
   edition = "2021"
 
 [dependencies]
+  # Main branch uses embedded-hal 1.0 but is not yet published to crates.io.
+  hd44780-driver = { git = "https://github.com/JohnDoneth/hd44780-driver", branch = "master", features = ["async"] }
+  embedded-hal = "1"
+
   anova-oven-api = { path = "../anova-oven-api", default-features = false }
   serde_json = { version = "1.0", default-features = false, features = [
     "alloc",
@@ -40,7 +44,9 @@
   embedded-io-async = "0.7"
 
   # Plain HTTP client (no TLS needed — server is on local network)
-  reqwless = { version = "0.14", default-features = false, features = ["defmt"] }
+  reqwless = { version = "0.14", default-features = false, features = [
+    "defmt",
+  ] }
 
   cyw43 = { version = "0.7.0", features = ["defmt", "firmware-logs"] }
   cyw43-pio = { version = "0.10.0", features = ["defmt"] }

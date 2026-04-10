@@ -79,7 +79,9 @@ dependencies = [
  "embassy-rp",
  "embassy-time",
  "embedded-alloc",
+ "embedded-hal 1.0.0",
  "embedded-io-async 0.7.0",
+ "hd44780-driver",
  "panic-probe",
  "portable-atomic",
  "reqwless",
@@ -1306,6 +1308,15 @@ name = "hashbrown"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
+
+[[package]]
+name = "hd44780-driver"
+version = "0.4.0"
+source = "git+https://github.com/JohnDoneth/hd44780-driver?branch=master#9009f2c24771ba0a20f8f7534471c9869188f76c"
+dependencies = [
+ "embedded-hal 1.0.0",
+ "embedded-hal-async",
+]
 
 [[package]]
 name = "heapless"
