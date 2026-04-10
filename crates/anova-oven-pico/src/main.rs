@@ -282,16 +282,13 @@ async fn main(spawner: Spawner) {
         let poll_timer = Timer::after(Duration::from_secs(POLL_INTERVAL_SECS));
         let event_recv = EVENT_CHANNEL.receive();
 
-        let do_poll = match embassy_futures::select::select(poll_timer, event_recv).await {
-            embassy_futures::select::Either::First(()) => true,
+        match embassy_futures::select::select(poll_timer, event_recv).await {
+            embassy_futures::select::Either::First(()) => {
+                app.poll_status_if_due(stack).await;
+            }
             embassy_futures::select::Either::Second(event) => {
                 app.handle_user_activity(event, &recipes, &mut backlight);
-                false
             }
-        };
-
-        if do_poll {
-            app.poll_status_if_due(stack).await;
         }
         app.apply_backlight_policy(&mut backlight);
         app.render_current_view(&mut lcd, &mut delay, &recipes).await;
