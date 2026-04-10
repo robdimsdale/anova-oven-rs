@@ -1,6 +1,13 @@
 use hd44780_driver::non_blocking::{Cursor, CursorBlink, Display, DisplayMode, HD44780};
 
-use embassy_time::Delay;
+use alloc::string::String;
+use alloc::vec::Vec;
+use embassy_time::{Delay, Duration, Instant};
+
+const LCD_WIDTH: usize = 16;
+const SCROLL_STEP_MS: u64 = 350;
+const CHAR_SCROLL_COUNT: usize = 3;
+const END_PAUSE_MS: u64 = 1200;
 
 pub(crate) struct LcdController<B, M, C>
 where
@@ -10,6 +17,17 @@ where
 {
     lcd: HD44780<B, M, C>,
     delay: Delay,
+    row0_scroll_state: Option<RowScrollState>,
+    row1_scroll_state: Option<RowScrollState>,
+    row0_last_rendered: Option<String>,
+    row1_last_rendered: Option<String>,
+}
+
+struct RowScrollState {
+    text: String,
+    offset: usize,
+    last_step_at: Instant,
+    pause_until: Instant,
 }
 
 impl<B, M, C> LcdController<B, M, C>
@@ -19,7 +37,14 @@ where
     C: hd44780_driver::charset::CharsetWithFallback,
 {
     pub(crate) fn new(lcd: HD44780<B, M, C>, delay: Delay) -> Self {
-        Self { lcd, delay }
+        Self {
+            lcd,
+            delay,
+            row0_scroll_state: None,
+            row1_scroll_state: None,
+            row0_last_rendered: None,
+            row1_last_rendered: None,
+        }
     }
 
     pub(crate) async fn configure(&mut self) {
@@ -39,13 +64,13 @@ where
     }
 
     pub(crate) async fn render_wifi_init(&mut self) {
-        self.write_row(0, "Anova Oven").await;
-        self.write_row(1, "Init: WIFI...").await;
+        self.write_row(0, "Anova Oven", 0).await;
+        self.write_row(1, "Init: WIFI...", 0).await;
     }
 
     pub(crate) async fn render_dhcp_init(&mut self) {
-        self.write_row(0, "Anova Oven").await;
-        self.write_row(1, "Init: DHCP...").await;
+        self.write_row(0, "Anova Oven", 0).await;
+        self.write_row(1, "Init: DHCP...", 0).await;
     }
 
     pub(crate) async fn render_status_display(
@@ -57,8 +82,8 @@ where
         const ROTATION_PERIOD: u64 = 3;
 
         let Some(status) = status else {
-            self.write_row(0, "").await;
-            self.write_row(1, "Status: N/A").await;
+            self.write_row(0, "", tick).await;
+            self.write_row(1, "Status: N/A", tick).await;
             return;
         };
 
@@ -68,7 +93,7 @@ where
             let cook = current_cook.expect("current cook should exist when is_cooking is true");
 
             let name = cook.display_name();
-            self.write_row(0, name).await;
+            self.write_row(0, name, tick).await;
 
             let has_timer_or_probe =
                 status.timer_remaining_secs().is_some() || status.probe_temperature_c.is_some();
@@ -89,7 +114,7 @@ where
                             alloc::format!("Stage: {phase}")
                         }
                     };
-                    self.write_row(1, &row1).await;
+                    self.write_row(1, &row1, tick).await;
                 }
                 1 => {
                     self.lcd.set_cursor_xy((0, 1), &mut self.delay).await.ok();
@@ -107,12 +132,12 @@ where
                         self.lcd.write_byte(0xDF, &mut self.delay).await.ok();
                         self.lcd.write_str("F", &mut self.delay).await.ok();
                     }
-                    for _ in len..16 {
+                    for _ in len..LCD_WIDTH {
                         self.lcd.write_byte(b' ', &mut self.delay).await.ok();
                     }
                 }
                 2 => {
-                    self.write_row(1, phase).await;
+                    self.write_row(1, phase, tick).await;
                 }
                 3 => {
                     if let Some(remaining) = status.timer_remaining_secs() {
@@ -124,7 +149,7 @@ where
                         } else {
                             alloc::format!("Timer: {m:02}:{s:02}")
                         };
-                        self.write_row(1, &row1).await;
+                        self.write_row(1, &row1, tick).await;
                     } else if let Some(probe_c) = status.probe_temperature_c {
                         self.lcd.set_cursor_xy((0, 1), &mut self.delay).await.ok();
                         let probe_f = celcius_to_fahrenheit(probe_c);
@@ -142,11 +167,11 @@ where
                             self.lcd.write_byte(0xDF, &mut self.delay).await.ok();
                             self.lcd.write_str("F", &mut self.delay).await.ok();
                         }
-                        for _ in len..16 {
+                        for _ in len..LCD_WIDTH {
                             self.lcd.write_byte(b' ', &mut self.delay).await.ok();
                         }
                     } else {
-                        self.write_row(1, "--").await;
+                        self.write_row(1, "--", tick).await;
                     }
                 }
                 _ => {}
@@ -168,7 +193,7 @@ where
                 self.lcd.write_byte(0xDF, &mut self.delay).await.ok();
                 self.lcd.write_str("F", &mut self.delay).await.ok();
             }
-            for _ in row0_len..16 {
+            for _ in row0_len..LCD_WIDTH {
                 self.lcd.write_byte(b' ', &mut self.delay).await.ok();
             }
 
@@ -177,7 +202,7 @@ where
             } else {
                 status.mode.clone()
             };
-            self.write_row(1, &row1).await;
+            self.write_row(1, &row1, tick).await;
         }
     }
 
@@ -185,24 +210,134 @@ where
         &mut self,
         recipes: &[anova_oven_api::Recipe],
         index: usize,
+        tick: u64,
     ) {
         if recipes.is_empty() {
-            self.write_row(0, "No recipes").await;
-            self.write_row(1, "").await;
+            self.write_row(0, "No recipes", tick).await;
+            self.write_row(1, "", tick).await;
             return;
         }
 
         let header = alloc::format!("Recipe {}/{}", index + 1, recipes.len());
-        self.write_row(0, &header).await;
-        self.write_row(1, &recipes[index].title).await;
+        self.write_row(0, &header, tick).await;
+        self.write_row(1, &recipes[index].title, tick).await;
     }
 
-    async fn write_row(&mut self, row: u8, text: &str) {
+    async fn write_row(&mut self, row: u8, text: &str, _tick: u64) {
+        let now = Instant::now();
+        let row_state = self.row_scroll_state_mut(row);
+
+        let text_changed = row_state
+            .as_ref()
+            .is_none_or(|state| state.text.as_str() != text);
+
+        if text_changed {
+            *row_state = Some(RowScrollState {
+                text: text.into(),
+                offset: 0,
+                last_step_at: now,
+                pause_until: now + Duration::from_millis(END_PAUSE_MS),
+            });
+        }
+
+        let is_scrolling = text.chars().count() > LCD_WIDTH;
+        let (visible, step_changed) = if let Some(state) = row_state.as_mut() {
+            Self::visible_window(text, state, now)
+        } else {
+            Self::visible_window(
+                text,
+                &mut RowScrollState {
+                    text: text.into(),
+                    offset: 0,
+                    last_step_at: now,
+                    pause_until: now,
+                },
+                now,
+            )
+        };
+
+        if is_scrolling && !text_changed && !step_changed {
+            return;
+        }
+
+        let mut rendered = visible;
+        while rendered.len() < LCD_WIDTH {
+            rendered.push(' ');
+        }
+
+        let last_rendered = self.row_last_rendered_mut(row);
+        if last_rendered.as_deref() == Some(rendered.as_str()) {
+            return;
+        }
+
+        *last_rendered = Some(rendered.clone());
+
         self.lcd.set_cursor_xy((0, row), &mut self.delay).await.ok();
-        let len = text.len().min(16);
-        self.lcd.write_str(&text[..len], &mut self.delay).await.ok();
-        for _ in len..16 {
+        let len = rendered.len().min(LCD_WIDTH);
+        self.lcd
+            .write_str(&rendered[..len], &mut self.delay)
+            .await
+            .ok();
+        for _ in len..LCD_WIDTH {
             self.lcd.write_byte(b' ', &mut self.delay).await.ok();
+        }
+    }
+
+    fn visible_window(text: &str, state: &mut RowScrollState, now: Instant) -> (String, bool) {
+        let chars: Vec<char> = text.chars().collect();
+        let len = chars.len();
+        if len <= LCD_WIDTH {
+            state.offset = 0;
+            state.last_step_at = now;
+            state.pause_until = now;
+            return (text.into(), true);
+        }
+
+        let overflow = len - LCD_WIDTH;
+        let mut changed = false;
+
+        // Keep marquee smooth: never "catch up" by multiple chars after delays.
+        if now >= state.pause_until
+            && now.duration_since(state.last_step_at).as_millis() >= SCROLL_STEP_MS
+        {
+            state.last_step_at = now;
+            if state.offset < overflow {
+                state.offset += CHAR_SCROLL_COUNT;
+                changed = true;
+                if state.offset >= overflow {
+                    state.offset = overflow;
+                    // Pause at the right edge before wrapping to the start.
+                    state.pause_until = now + Duration::from_millis(END_PAUSE_MS);
+                }
+            } else {
+                state.offset = 0;
+                changed = true;
+                // Keep the existing pause at the left edge after wrapping.
+                state.pause_until = now + Duration::from_millis(END_PAUSE_MS);
+            }
+        }
+
+        (
+            chars[state.offset..state.offset + LCD_WIDTH]
+                .iter()
+                .collect(),
+            changed,
+        )
+    }
+
+    fn row_scroll_state_mut(&mut self, row: u8) -> &mut Option<RowScrollState> {
+        if row == 0 {
+            &mut self.row0_scroll_state
+        } else {
+            &mut self.row1_scroll_state
+        }
+    }
+
+    fn row_last_rendered_mut(&mut self, row: u8) -> &mut Option<String> {
+        if row == 0 {
+            &mut self.row0_last_rendered
+        } else {
+            &mut self.row1_last_rendered
         }
     }
 }

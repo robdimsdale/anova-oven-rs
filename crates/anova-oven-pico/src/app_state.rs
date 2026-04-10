@@ -7,6 +7,10 @@ use crate::display::LcdController;
 use crate::events::{handle_input_event, InputEvent, UIState};
 use crate::logic::{is_active_cook, should_dim_backlight};
 
+const MENU_INACTIVITY_TIMEOUT_SECS: u64 = 15;
+const LED_DIM_TIMER_SECS: u64 = 5;
+const COOK_POLL_INTERVAL: u64 = 10;
+
 pub(crate) struct AppState<DB, MM, CH>
 where
     DB: hd44780_driver::non_blocking::bus::DataBus,
@@ -66,7 +70,7 @@ where
 
     pub(crate) fn update_inactivity_timeout(&mut self) {
         if let Some(t) = self.last_input_at {
-            if t.elapsed() >= Duration::from_secs(crate::INACTIVITY_TIMEOUT_SECS) {
+            if t.elapsed() >= Duration::from_secs(MENU_INACTIVITY_TIMEOUT_SECS) {
                 if !matches!(self.ui_state, UIState::ShowStatus) {
                     info!("Inactivity timeout: reverting to ShowStatus");
                     self.ui_state = UIState::ShowStatus;
@@ -99,7 +103,7 @@ where
     }
 
     pub(crate) async fn poll_status_if_due(&mut self, stack: embassy_net::Stack<'static>) {
-        if self.tick % crate::COOK_POLL_INTERVAL == 0 {
+        if self.tick % COOK_POLL_INTERVAL == 0 {
             #[allow(static_mut_refs)]
             let rx_buf = unsafe { &mut crate::HTTP_RX_BUF };
             self.current_cook = fetch_current_cook(stack, rx_buf).await;
@@ -131,7 +135,7 @@ where
             }
             UIState::BrowseRecipes { index } => {
                 self.lcd_controller
-                    .render_recipe_browser(&self.recipes, *index)
+                    .render_recipe_browser(&self.recipes, *index, self.tick)
                     .await;
             }
         }
@@ -149,7 +153,7 @@ where
             matches!(self.ui_state, UIState::ShowStatus),
             baseline_elapsed_secs,
             active_cook,
-            crate::LED_DIM_TIMER_SECS,
+            LED_DIM_TIMER_SECS,
         );
 
         if should_dim {

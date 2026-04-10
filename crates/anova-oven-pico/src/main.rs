@@ -41,9 +41,7 @@ const WIFI_PASSWORD: &str = env!("ANOVA_WIFI_PASSWORD");
 pub(crate) const SERVER_URL: &str = env!("ANOVA_SERVER_URL");
 
 const POLL_INTERVAL_SECS: u64 = 1;
-pub(crate) const INACTIVITY_TIMEOUT_SECS: u64 = 5;
-pub(crate) const LED_DIM_TIMER_SECS: u64 = 5;
-pub(crate) const COOK_POLL_INTERVAL: u64 = 10;
+const DISPLAY_REFRESH_MS: u64 = 50;
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO0>;
@@ -206,13 +204,18 @@ async fn main(spawner: Spawner) {
         app.update_inactivity_timeout();
 
         let poll_timer = Timer::after(Duration::from_secs(POLL_INTERVAL_SECS));
+        let display_timer = Timer::after(Duration::from_millis(DISPLAY_REFRESH_MS));
         let event_recv = EVENT_CHANNEL.receive();
 
-        match embassy_futures::select::select(poll_timer, event_recv).await {
-            embassy_futures::select::Either::First(()) => {
+        match embassy_futures::select::select3(poll_timer, display_timer, event_recv).await {
+            embassy_futures::select::Either3::First(()) => {
                 app.poll_status_if_due(stack).await;
             }
-            embassy_futures::select::Either::Second(event) => {
+            embassy_futures::select::Either3::Second(()) => {
+                // This branch is a no-op; we just want to trigger a display refresh at a regular interval for smoother scrolling,
+                // independent of status polling or user input. The display task will run at the end of the loop unconditionally, so no action is needed here.
+            }
+            embassy_futures::select::Either3::Third(event) => {
                 app.handle_user_activity(event, stack).await;
             }
         }
