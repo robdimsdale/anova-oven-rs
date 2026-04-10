@@ -170,8 +170,8 @@ async fn ws_connect_and_run(
                         match protocol::parse_message(payload) {
                             Ok(protocol::Event::ApoState(state)) => {
                                 let status = protocol::to_oven_status(&state);
-                                eprintln!("[ws] State: mode={} temp={:.1}°C steam={:.0}%/{:.0}% probe={:.1}°F",
-                                status.mode, status.temperature_c, status.steam_pct, status.steam_target_pct.unwrap_or(0.0), celcius_to_fahrenheit(status.probe_temperature_c.unwrap_or(0.0)) );
+                                eprintln!("[ws] State: mode={} temp={:.1}°F steam={:.0}%/{:.0}% probe={:.1}°F",
+                                status.mode, celcius_to_fahrenheit(status.temperature_c), status.steam_pct, status.steam_target_pct.unwrap_or(0.0), celcius_to_fahrenheit(status.probe_temperature_c.unwrap_or(0.0)) );
                                 let _ = status_tx.send(Some(status));
                             }
                             Ok(protocol::Event::ApoWifiList { cooker_id: id }) => {

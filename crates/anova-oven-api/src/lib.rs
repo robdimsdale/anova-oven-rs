@@ -11,34 +11,76 @@ use serde::{Deserialize, Serialize};
 pub struct OvenStatus {
     /// Operating mode: `"idle"`, `"cook"`, or `"preheat"`.
     pub mode: String,
+    /// Temperature unit preference: `"F"` or `"C"`.
+    pub temperature_unit: String,
 
     /// Current dry-bulb temperature in Celsius.
     pub temperature_c: f32,
-
     /// Target temperature in Celsius, if a cook is active.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub target_temperature_c: Option<f32>, // seems like this is always zero?
-
-    /// Timer elapsed, in seconds.
-    pub timer_current_secs: u64,
-
-    /// Timer total duration, in seconds.
-    pub timer_total_secs: u64,
-
-    /// Steam percentage (0–100).
-    pub steam_pct: f32,
-
-    /// Steam target percentage (0–100), if a cook is active.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub steam_target_pct: Option<f32>,
-
+    pub target_temperature_c: Option<f32>,
+    /// Temperature bulb mode: `"dry"` or `"wet"` (sous vide).
+    pub temperature_bulbs_mode: String,
+    /// Current top dry-bulb temperature in Celsius.
+    pub dry_top_temperature_c: f32,
+    /// Current bottom dry-bulb temperature in Celsius.
+    pub dry_bottom_temperature_c: f32,
+    /// Current wet-bulb temperature in Celsius.
+    pub wet_bulb_temperature_c: f32,
     /// Current probe temperature in Celsius, if probe is connected.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub probe_temperature_c: Option<f32>,
 
+    /// Timer elapsed, in seconds.
+    pub timer_current_secs: u64,
+    /// Timer total duration, in seconds.
+    pub timer_total_secs: u64,
+    /// Timer mode: `"idle"` or `"running"`.
+    pub timer_mode: String,
+
+    /// Current relative humidity percentage (0–100).
+    pub steam_pct: f32,
+    /// Steam target percentage (0–100), if a cook is active.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub steam_target_pct: Option<f32>,
+    /// Steam generator mode: `"idle"` or `"running"`.
+    pub steam_generator_mode: String,
+    /// Boiler temperature in Celsius.
+    pub boiler_celsius: f32,
+    /// Boiler wattage.
+    pub boiler_watts: f32,
+    /// Whether the boiler requires descaling.
+    pub boiler_descale_required: bool,
+    /// Evaporator temperature in Celsius.
+    pub evaporator_celsius: f32,
+    /// Evaporator wattage.
+    pub evaporator_watts: f32,
+
+    /// Fan speed (0–100).
+    pub fan_speed: u32,
+
+    /// Whether the top heating element is on.
+    pub heating_element_top_on: bool,
+    /// Top heating element wattage.
+    pub heating_element_top_watts: f32,
+    /// Whether the rear heating element is on.
+    pub heating_element_rear_on: bool,
+    /// Rear heating element wattage.
+    pub heating_element_rear_watts: f32,
+    /// Whether the bottom heating element is on.
+    pub heating_element_bottom_on: bool,
+    /// Bottom heating element wattage.
+    pub heating_element_bottom_watts: f32,
+
+    /// Whether the lamp is on.
+    pub lamp_on: bool,
+    /// Lamp preference setting: `"on"` or `"off"`.
+    pub lamp_preference: String,
+
+    /// Whether the vent is open.
+    pub vent_open: bool,
     /// Whether the door is open.
     pub door_open: bool,
-
     /// Whether the water tank is empty.
     pub water_tank_empty: bool,
 }
@@ -88,23 +130,47 @@ mod tests {
     #[test]
     fn oven_status_round_trip() {
         let status = OvenStatus {
-            mode: "idle".into(),
-            temperature_c: 20.5,
+            mode: "cook".into(),
+            temperature_unit: "F".into(),
+            temperature_c: 200.0,
             target_temperature_c: Some(220.0),
+            temperature_bulbs_mode: "dry".into(),
+            dry_top_temperature_c: 201.0,
+            dry_bottom_temperature_c: 199.0,
+            wet_bulb_temperature_c: 180.0,
+            probe_temperature_c: Some(65.0),
             timer_current_secs: 300,
             timer_total_secs: 3600,
+            timer_mode: "running".into(),
             steam_pct: 50.0,
             steam_target_pct: Some(30.0),
-            probe_temperature_c: Some(65.0),
+            steam_generator_mode: "running".into(),
+            boiler_celsius: 90.0,
+            boiler_watts: 240.0,
+            boiler_descale_required: false,
+            evaporator_celsius: 85.0,
+            evaporator_watts: 80.0,
+            fan_speed: 100,
+            heating_element_top_on: true,
+            heating_element_top_watts: 800.0,
+            heating_element_rear_on: true,
+            heating_element_rear_watts: 1200.0,
+            heating_element_bottom_on: false,
+            heating_element_bottom_watts: 0.0,
+            lamp_on: false,
+            lamp_preference: "on".into(),
+            vent_open: false,
             door_open: false,
             water_tank_empty: false,
         };
         let json = serde_json::to_string(&status).unwrap();
         let parsed: OvenStatus = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.mode, "idle");
-        assert_eq!(parsed.temperature_c, 20.5);
+        assert_eq!(parsed.mode, "cook");
+        assert_eq!(parsed.temperature_c, 200.0);
         assert_eq!(parsed.target_temperature_c, Some(220.0));
         assert_eq!(parsed.timer_current_secs, 300);
+        assert_eq!(parsed.fan_speed, 100);
+        assert!(parsed.heating_element_top_on);
         assert!(!parsed.door_open);
     }
 
