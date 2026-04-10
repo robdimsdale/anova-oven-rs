@@ -4,6 +4,7 @@
 extern crate alloc;
 
 mod api;
+mod app_state;
 mod backlight;
 mod display;
 mod events;
@@ -23,7 +24,7 @@ use embassy_rp::gpio::{Input, Level, Output, Pull};
 use embassy_rp::peripherals::{DMA_CH0, PIO0};
 use embassy_rp::pio::Pio;
 use embassy_rp::pwm::{Config as PwmConfig, Pwm};
-use embassy_time::{Delay, Duration, Instant, Timer};
+use embassy_time::{Delay, Duration, Timer};
 use hd44780_driver::{
     bus::FourBitBusPins, memory_map::MemoryMap1602, non_blocking::HD44780,
     setup::DisplayOptions4Bit,
@@ -32,51 +33,21 @@ use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
 use crate::api::{fetch_and_log_recipes, fetch_and_log_status, fetch_current_cook};
-use crate::backlight::set_backlight_rgb;
-use crate::display::{configure_lcd_display, render_recipe_browser, render_status_display};
+use crate::app_state::AppState;
+use crate::backlight::BacklightController;
+use crate::display::{configure_lcd_display, render_status_display};
 use crate::events::{
-    handle_input_event, rot_enc_button_task, rotary_encoder_task, stop_button_task, UIState,
-    EVENT_CHANNEL,
+    rot_enc_button_task, rotary_encoder_task, stop_button_task, EVENT_CHANNEL,
 };
-use crate::logic::{is_active_cook, should_dim_backlight};
 
 const WIFI_SSID: &str = env!("ANOVA_WIFI_SSID");
 const WIFI_PASSWORD: &str = env!("ANOVA_WIFI_PASSWORD");
 pub(crate) const SERVER_URL: &str = env!("ANOVA_SERVER_URL");
 
 const POLL_INTERVAL_SECS: u64 = 1;
-const BACKLIGHT_FULL_LEVEL: u8 = 255;
-const BACKLIGHT_DIM_LEVEL: u8 = 64;
-const INACTIVITY_TIMEOUT_SECS: u64 = 5;
-const LED_DIM_TIMER_SECS: u64 = 5;
-const COOK_POLL_INTERVAL: u64 = 10;
-
-struct AppState {
-    tick: u64,
-    ui_state: UIState,
-    last_input_at: Option<Instant>,
-    baseline_reentered_at: Option<Instant>,
-    backlight_dimmed: bool,
-    current_cook: Option<anova_oven_api::CurrentCook>,
-    latest_status: Option<anova_oven_api::OvenStatus>,
-}
-
-impl AppState {
-    fn new(
-        current_cook: Option<anova_oven_api::CurrentCook>,
-        latest_status: Option<anova_oven_api::OvenStatus>,
-    ) -> Self {
-        Self {
-            tick: 0,
-            ui_state: UIState::ShowStatus,
-            last_input_at: None,
-            baseline_reentered_at: Some(Instant::now()),
-            backlight_dimmed: true,
-            current_cook,
-            latest_status,
-        }
-    }
-}
+pub(crate) const INACTIVITY_TIMEOUT_SECS: u64 = 5;
+pub(crate) const LED_DIM_TIMER_SECS: u64 = 5;
+pub(crate) const COOK_POLL_INTERVAL: u64 = 10;
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO0>;
@@ -89,7 +60,7 @@ static NVRAM: &cyw43::Aligned<cyw43::A4, [u8]> =
     &cyw43::Aligned(*include_bytes!("../nvram_rp2040.bin"));
 static CLM: &[u8] = include_bytes!("../firmware/43439A0_clm.bin");
 
-static mut HTTP_RX_BUF: [u8; 16384] = [0u8; 16384];
+pub(crate) static mut HTTP_RX_BUF: [u8; 16384] = [0u8; 16384];
 
 fn init_heap() {
     use core::mem::MaybeUninit;
@@ -109,7 +80,7 @@ fn init_backlight_pwm(
     pin7: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_7>,
     pwm_slice4: embassy_rp::Peri<'static, embassy_rp::peripherals::PWM_SLICE4>,
     pin8: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_8>,
-) -> (Pwm<'static>, Pwm<'static>) {
+) -> BacklightController {
     let mut backlight_cfg = PwmConfig::default();
     backlight_cfg.top = 0x8000;
     backlight_cfg.invert_a = true;
@@ -122,7 +93,7 @@ fn init_backlight_pwm(
     backlight_cfg.compare_b = 0;
     let pwm_blue = Pwm::new_output_a(pwm_slice4, pin8, backlight_cfg);
 
-    (pwm_red_green, pwm_blue)
+    BacklightController::new(pwm_red_green, pwm_blue)
 }
 
 async fn connect_wifi(control: &mut cyw43::Control<'static>) {
@@ -199,129 +170,6 @@ async fn fetch_initial_data(
     (recipes, current_cook, latest_status)
 }
 
-fn update_inactivity_timeout(app: &mut AppState) {
-    if let Some(t) = app.last_input_at {
-        if t.elapsed() >= Duration::from_secs(INACTIVITY_TIMEOUT_SECS) {
-            if !matches!(app.ui_state, UIState::ShowStatus) {
-                info!("Inactivity timeout: reverting to ShowStatus");
-                app.ui_state = UIState::ShowStatus;
-                app.baseline_reentered_at = Some(Instant::now());
-            }
-            app.last_input_at = None;
-        }
-    }
-}
-
-fn handle_user_activity(
-    app: &mut AppState,
-    event: crate::events::InputEvent,
-    recipes: &[anova_oven_api::Recipe],
-    pwm_red_green: &mut Pwm<'_>,
-    pwm_blue: &mut Pwm<'_>,
-) {
-    app.last_input_at = Some(Instant::now());
-    app.baseline_reentered_at = None;
-
-    if app.backlight_dimmed {
-        set_backlight_rgb(
-            pwm_red_green,
-            pwm_blue,
-            BACKLIGHT_FULL_LEVEL,
-            BACKLIGHT_FULL_LEVEL,
-            BACKLIGHT_FULL_LEVEL,
-        );
-        app.backlight_dimmed = false;
-        info!("Backlight: 100% (input activity)");
-    }
-
-    handle_input_event(event, &mut app.ui_state, recipes);
-}
-
-async fn poll_status_if_due(app: &mut AppState, stack: embassy_net::Stack<'static>) {
-    if app.tick % COOK_POLL_INTERVAL == 0 {
-        #[allow(static_mut_refs)]
-        let rx_buf = unsafe { &mut HTTP_RX_BUF };
-        app.current_cook = fetch_current_cook(stack, rx_buf).await;
-    }
-
-    #[allow(static_mut_refs)]
-    let rx_buf = unsafe { &mut HTTP_RX_BUF };
-    if let Some(status) = fetch_and_log_status(stack, rx_buf).await {
-        if status.mode == "idle" && app.current_cook.is_some() {
-            app.current_cook = None;
-        }
-        app.latest_status = Some(status);
-    }
-
-    app.tick += 1;
-}
-
-fn apply_backlight_policy(app: &mut AppState, pwm_red_green: &mut Pwm<'_>, pwm_blue: &mut Pwm<'_>) {
-    let active_cook = is_active_cook(
-        app.current_cook.is_some(),
-        app.latest_status
-            .as_ref()
-            .map(|status| status.mode.as_str()),
-    );
-    let baseline_elapsed_secs = app.baseline_reentered_at.map(|t| t.elapsed().as_secs());
-    let should_dim = should_dim_backlight(
-        matches!(app.ui_state, UIState::ShowStatus),
-        baseline_elapsed_secs,
-        active_cook,
-        LED_DIM_TIMER_SECS,
-    );
-
-    if should_dim && !app.backlight_dimmed {
-        set_backlight_rgb(
-            pwm_red_green,
-            pwm_blue,
-            BACKLIGHT_DIM_LEVEL,
-            BACKLIGHT_DIM_LEVEL,
-            BACKLIGHT_DIM_LEVEL,
-        );
-        app.backlight_dimmed = true;
-        info!("Backlight: dim (idle baseline)");
-    } else if (active_cook || !matches!(app.ui_state, UIState::ShowStatus)) && app.backlight_dimmed
-    {
-        set_backlight_rgb(
-            pwm_red_green,
-            pwm_blue,
-            BACKLIGHT_FULL_LEVEL,
-            BACKLIGHT_FULL_LEVEL,
-            BACKLIGHT_FULL_LEVEL,
-        );
-        app.backlight_dimmed = false;
-        info!("Backlight: full (active state)");
-    }
-}
-
-async fn render_current_view(
-    app: &AppState,
-    lcd: &mut HD44780<
-        impl hd44780_driver::non_blocking::bus::DataBus,
-        impl hd44780_driver::memory_map::DisplayMemoryMap,
-        impl hd44780_driver::charset::CharsetWithFallback,
-    >,
-    delay: &mut Delay,
-    recipes: &[anova_oven_api::Recipe],
-) {
-    match &app.ui_state {
-        UIState::ShowStatus => {
-            render_status_display(
-                lcd,
-                delay,
-                app.tick,
-                app.latest_status.as_ref(),
-                app.current_cook.as_ref(),
-            )
-            .await;
-        }
-        UIState::BrowseRecipes { index } => {
-            render_recipe_browser(lcd, delay, recipes, *index).await;
-        }
-    }
-}
-
 #[embassy_executor::task]
 async fn cyw43_task(
     runner: cyw43::Runner<'static, cyw43::SpiBus<Output<'static>, PioSpi<'static, PIO0, 0>>>,
@@ -359,15 +207,9 @@ async fn main(spawner: Spawner) {
     };
     configure_lcd_display(&mut lcd, &mut delay).await;
 
-    let (mut pwm_red_green, mut pwm_blue) =
+    let mut backlight =
         init_backlight_pwm(p.PWM_SLICE3, p.PIN_6, p.PIN_7, p.PWM_SLICE4, p.PIN_8);
-    set_backlight_rgb(
-        &mut pwm_red_green,
-        &mut pwm_blue,
-        BACKLIGHT_FULL_LEVEL,
-        BACKLIGHT_FULL_LEVEL,
-        BACKLIGHT_FULL_LEVEL,
-    );
+    backlight.set_full();
 
     lcd.write_str("Anova Oven", &mut delay).await.ok();
     lcd.set_cursor_xy((0, 1), &mut delay).await.ok();
@@ -422,13 +264,7 @@ async fn main(spawner: Spawner) {
     let mut app = AppState::new(current_cook, latest_status);
 
     info!("Init complete, dimming backlight and entering main loop");
-    set_backlight_rgb(
-        &mut pwm_red_green,
-        &mut pwm_blue,
-        BACKLIGHT_DIM_LEVEL,
-        BACKLIGHT_DIM_LEVEL,
-        BACKLIGHT_DIM_LEVEL,
-    );
+    backlight.set_dim();
 
     render_status_display(
         &mut lcd,
@@ -441,7 +277,7 @@ async fn main(spawner: Spawner) {
 
     loop {
         debug!("--- Main loop tick {} ---", app.tick);
-        update_inactivity_timeout(&mut app);
+        app.update_inactivity_timeout();
 
         let poll_timer = Timer::after(Duration::from_secs(POLL_INTERVAL_SECS));
         let event_recv = EVENT_CHANNEL.receive();
@@ -449,15 +285,15 @@ async fn main(spawner: Spawner) {
         let do_poll = match embassy_futures::select::select(poll_timer, event_recv).await {
             embassy_futures::select::Either::First(()) => true,
             embassy_futures::select::Either::Second(event) => {
-                handle_user_activity(&mut app, event, &recipes, &mut pwm_red_green, &mut pwm_blue);
+                app.handle_user_activity(event, &recipes, &mut backlight);
                 false
             }
         };
 
         if do_poll {
-            poll_status_if_due(&mut app, stack).await;
+            app.poll_status_if_due(stack).await;
         }
-        apply_backlight_policy(&mut app, &mut pwm_red_green, &mut pwm_blue);
-        render_current_view(&app, &mut lcd, &mut delay, &recipes).await;
+        app.apply_backlight_policy(&mut backlight);
+        app.render_current_view(&mut lcd, &mut delay, &recipes).await;
     }
 }
