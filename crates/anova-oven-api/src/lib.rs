@@ -85,6 +85,57 @@ pub struct OvenStatus {
     pub water_tank_empty: bool,
 }
 
+impl OvenStatus {
+    /// Current temperature in Celsius, matching what the Anova app displays.
+    ///
+    /// In dry-bulb mode this is the dry-bulb reading; in wet-bulb (sous vide)
+    /// mode this is the wet-bulb reading.
+    pub fn current_temperature_c(&self) -> f32 {
+        if self.temperature_bulbs_mode == "wet" {
+            self.wet_bulb_temperature_c
+        } else {
+            self.temperature_c
+        }
+    }
+
+    /// Whether the oven is actively cooking (not idle).
+    pub fn is_cooking(&self) -> bool {
+        self.mode != "idle"
+    }
+
+    /// Infer the human-readable phase: "Preheating", "Cooking", or "Idle".
+    ///
+    /// The WebSocket `state.mode` reports `"cook"` for both preheat and cook
+    /// stages. During preheat, the timer is idle and hasn't started counting.
+    pub fn phase(&self) -> &'static str {
+        match self.mode.as_str() {
+            "idle" => "Idle",
+            "cook" if self.timer_mode == "idle" && self.timer_current_secs == 0 => "Preheating",
+            "cook" => "Cooking",
+            _ => "Unknown",
+        }
+    }
+
+    /// Infer the stage `kind` value matching the current phase.
+    ///
+    /// Returns `"preheat"` or `"cook"` to match against [`Stage::kind`].
+    pub fn stage_kind(&self) -> &'static str {
+        match self.mode.as_str() {
+            "cook" if self.timer_mode == "idle" && self.timer_current_secs == 0 => "preheat",
+            _ => "cook",
+        }
+    }
+
+    /// Timer remaining in seconds, if a timer is running.
+    pub fn timer_remaining_secs(&self) -> Option<u64> {
+        if self.timer_mode == "running" && self.timer_total_secs > 0 {
+            Some(self.timer_total_secs.saturating_sub(self.timer_current_secs))
+        } else {
+            None
+        }
+    }
+}
+
 /// A saved recipe, as served by `GET /recipes`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Recipe {
@@ -172,6 +223,23 @@ pub struct CurrentCook {
     pub cook_stage_count: usize,
     /// Total number of stages (including preheat).
     pub total_stage_count: usize,
+}
+
+impl CurrentCook {
+    /// Display name: recipe title, or "Manual cook" for custom cooks.
+    pub fn display_name(&self) -> &str {
+        if self.recipe_title == "[custom]" {
+            "Manual cook"
+        } else {
+            &self.recipe_title
+        }
+    }
+
+    /// Find the stage matching the oven's current phase.
+    pub fn current_stage(&self, status: &OvenStatus) -> Option<&Stage> {
+        let kind = status.stage_kind();
+        self.stages.iter().find(|s| s.kind == kind)
+    }
 }
 
 #[cfg(test)]
