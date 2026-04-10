@@ -23,7 +23,7 @@ use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::{Input, Level, Output, Pull};
 use embassy_rp::peripherals::{DMA_CH0, PIO0};
 use embassy_rp::pio::Pio;
-use embassy_time::{Delay, Duration, Timer};
+use embassy_time::{Delay, Duration, Instant, Timer};
 use hd44780_driver::{
     bus::FourBitBusPins, memory_map::MemoryMap1602, non_blocking::HD44780,
     setup::DisplayOptions4Bit,
@@ -167,6 +167,10 @@ async fn main(spawner: Spawner) {
     spawner.spawn(net_task(runner).unwrap());
 
     info!("Connecting to WiFi: {}", WIFI_SSID);
+    info!("Configured server URL: {}", SERVER_URL);
+    if SERVER_URL.contains("localhost") || SERVER_URL.contains("127.0.0.1") {
+        warn!("ANOVA_SERVER_URL points to loopback; Pico cannot reach your laptop via localhost");
+    }
     loop {
         match control
             .join(WIFI_SSID, cyw43::JoinOptions::new(WIFI_PASSWORD.as_bytes()))
@@ -199,26 +203,30 @@ async fn main(spawner: Spawner) {
 
     info!("Init complete, entering main loop");
 
+    let mut next_poll_at = Instant::now() + Duration::from_secs(POLL_INTERVAL_SECS);
+
     loop {
         debug!("--- Main loop tick {} ---", app.tick);
         app.update_inactivity_timeout();
 
-        let poll_timer = Timer::after(Duration::from_secs(POLL_INTERVAL_SECS));
         let display_timer = Timer::after(Duration::from_millis(DISPLAY_REFRESH_MS));
         let event_recv = EVENT_CHANNEL.receive();
 
-        match embassy_futures::select::select3(poll_timer, display_timer, event_recv).await {
-            embassy_futures::select::Either3::First(()) => {
-                app.poll_status_if_due(stack).await;
-            }
-            embassy_futures::select::Either3::Second(()) => {
+        match embassy_futures::select::select(display_timer, event_recv).await {
+            embassy_futures::select::Either::First(()) => {
                 // This branch is a no-op; we just want to trigger a display refresh at a regular interval for smoother scrolling,
                 // independent of status polling or user input. The display task will run at the end of the loop unconditionally, so no action is needed here.
             }
-            embassy_futures::select::Either3::Third(event) => {
+            embassy_futures::select::Either::Second(event) => {
                 app.handle_user_activity(event, stack).await;
             }
         }
+
+        if Instant::now() >= next_poll_at {
+            app.poll_status_if_due(stack).await;
+            next_poll_at += Duration::from_secs(POLL_INTERVAL_SECS);
+        }
+
         app.render_current_view().await;
     }
 }

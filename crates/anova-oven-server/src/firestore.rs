@@ -737,6 +737,301 @@ async fn fetch_recipe_titles(
     map
 }
 
+fn document_path_from_reference(reference: &str) -> Option<String> {
+    let marker = "/documents/";
+    if let Some(idx) = reference.find(marker) {
+        let start = idx + marker.len();
+        let path = reference.get(start..)?.trim_matches('/');
+        if !path.is_empty() {
+            return Some(path.to_string());
+        }
+        return None;
+    }
+
+    let trimmed = reference.trim_matches('/');
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+async fn fetch_recipe_title_from_reference(
+    client: &reqwest::Client,
+    session: &FirebaseSession,
+    reference: &str,
+) -> Option<String> {
+    let document_path = document_path_from_reference(reference)?;
+    let url = get_document_url(&document_path);
+    let Ok(resp) = client.get(&url).bearer_auth(&session.id_token).send().await else {
+        return None;
+    };
+    if !resp.status().is_success() {
+        return None;
+    }
+    let Ok(doc): Result<Document, _> = resp.json().await else {
+        return None;
+    };
+    let json = doc.to_json();
+    json.get("title")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
+fn extract_cook_title(json: &JsonValue) -> Option<String> {
+    // Custom/user-authored cooks do not always include a recipeRef, but often
+    // include a direct recipe title field in the cook document payload.
+    const TITLE_POINTERS: &[&str] = &[
+        "/recipeTitle",
+        "/title",
+        "/name",
+        "/recipe/title",
+        "/recipe/name",
+        "/recipeSnapshot/title",
+        "/recipeSnapshot/name",
+        "/recipeInfo/title",
+        "/recipeInfo/name",
+    ];
+
+    for ptr in TITLE_POINTERS {
+        if let Some(title) = json.pointer(ptr).and_then(|v| v.as_str()) {
+            let trimmed = title.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+
+    fn collect_title_candidates(
+        value: &JsonValue,
+        path: &str,
+        out: &mut Vec<(String, String)>,
+        depth: usize,
+    ) {
+        if depth > 8 {
+            return;
+        }
+
+        match value {
+            JsonValue::Object(map) => {
+                for (k, v) in map {
+                    let child_path = if path.is_empty() {
+                        format!("/{k}")
+                    } else {
+                        format!("{path}/{k}")
+                    };
+
+                    let key_lower = k.to_ascii_lowercase();
+                    let path_lower = child_path.to_ascii_lowercase();
+                    let recipe_like_path =
+                        path_lower.contains("recipe") || path_lower.contains("cook");
+                    let title_like_key = key_lower == "title"
+                        || key_lower == "name"
+                        || key_lower == "recipetitle"
+                        || key_lower == "recipename";
+
+                    if recipe_like_path && title_like_key && !path_lower.contains("/stages/") {
+                        if let Some(s) = v.as_str() {
+                            let trimmed = s.trim();
+                            if !trimmed.is_empty() {
+                                out.push((child_path.clone(), trimmed.to_string()));
+                            }
+                        }
+                    }
+
+                    collect_title_candidates(v, &child_path, out, depth + 1);
+                }
+            }
+            JsonValue::Array(items) => {
+                for (idx, v) in items.iter().enumerate() {
+                    let child_path = if path.is_empty() {
+                        format!("/{idx}")
+                    } else {
+                        format!("{path}/{idx}")
+                    };
+                    collect_title_candidates(v, &child_path, out, depth + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut candidates = Vec::new();
+    collect_title_candidates(json, "", &mut candidates, 0);
+    if let Some((_, title)) = candidates.into_iter().next() {
+        return Some(title);
+    }
+
+    None
+}
+
+fn cook_title_candidates_for_log(json: &JsonValue) -> Vec<(String, String)> {
+    fn collect(value: &JsonValue, path: &str, out: &mut Vec<(String, String)>, depth: usize) {
+        if depth > 6 || out.len() >= 12 {
+            return;
+        }
+        match value {
+            JsonValue::Object(map) => {
+                for (k, v) in map {
+                    let child_path = if path.is_empty() {
+                        format!("/{k}")
+                    } else {
+                        format!("{path}/{k}")
+                    };
+                    let key_lower = k.to_ascii_lowercase();
+                    if (key_lower.contains("title") || key_lower.contains("name"))
+                        && !child_path.to_ascii_lowercase().contains("/stages/")
+                    {
+                        if let Some(s) = v.as_str() {
+                            let trimmed = s.trim();
+                            if !trimmed.is_empty() {
+                                out.push((child_path.clone(), trimmed.to_string()));
+                            }
+                        }
+                    }
+                    collect(v, &child_path, out, depth + 1);
+                }
+            }
+            JsonValue::Array(items) => {
+                for (idx, v) in items.iter().enumerate() {
+                    let child_path = if path.is_empty() {
+                        format!("/{idx}")
+                    } else {
+                        format!("{path}/{idx}")
+                    };
+                    collect(v, &child_path, out, depth + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut out = Vec::new();
+    collect(json, "", &mut out, 0);
+    out
+}
+
+fn extract_recipe_identity_candidates(json: &JsonValue) -> Vec<(String, String)> {
+    const DIRECT_POINTERS: &[&str] = &[
+        "/recipeRef",
+        "/recipeId",
+        "/recipe/id",
+        "/recipe/ref",
+        "/recipe/reference",
+        "/recipeInfo/id",
+        "/recipeInfo/ref",
+        "/recipeInfo/reference",
+        "/recipeSnapshot/id",
+        "/recipeSnapshot/ref",
+        "/recipeSnapshot/reference",
+        "/sourceRecipeRef",
+        "/sourceRecipeId",
+    ];
+
+    let mut out = Vec::new();
+
+    for ptr in DIRECT_POINTERS {
+        if let Some(v) = json.pointer(ptr).and_then(|v| v.as_str()) {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                out.push(((*ptr).to_string(), trimmed.to_string()));
+            }
+        }
+    }
+
+    fn collect(value: &JsonValue, path: &str, out: &mut Vec<(String, String)>, depth: usize) {
+        if depth > 8 || out.len() >= 24 {
+            return;
+        }
+
+        match value {
+            JsonValue::Object(map) => {
+                for (k, v) in map {
+                    let child_path = if path.is_empty() {
+                        format!("/{k}")
+                    } else {
+                        format!("{path}/{k}")
+                    };
+
+                    let key = k.to_ascii_lowercase();
+                    let looks_like_recipe_key = key.contains("recipe")
+                        && (key.contains("id")
+                            || key.contains("ref")
+                            || key.contains("path")
+                            || key.contains("document"));
+
+                    if looks_like_recipe_key {
+                        if let Some(s) = v.as_str() {
+                            let trimmed = s.trim();
+                            if !trimmed.is_empty() {
+                                out.push((child_path.clone(), trimmed.to_string()));
+                            }
+                        }
+                    }
+
+                    collect(v, &child_path, out, depth + 1);
+                }
+            }
+            JsonValue::Array(items) => {
+                for (idx, v) in items.iter().enumerate() {
+                    let child_path = if path.is_empty() {
+                        format!("/{idx}")
+                    } else {
+                        format!("{path}/{idx}")
+                    };
+                    collect(v, &child_path, out, depth + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    collect(json, "", &mut out, 0);
+    out
+}
+
+fn choose_recipe_ref_and_id(candidates: &[(String, String)]) -> (Option<String>, Option<String>) {
+    // Prefer values that look like Firestore document references first.
+    let recipe_ref = candidates
+        .iter()
+        .map(|(_, v)| v)
+        .find(|v| v.contains("/documents/") || v.contains("oven-recipes/"))
+        .cloned();
+
+    if let Some(reference) = recipe_ref {
+        let recipe_id = document_path_from_reference(&reference)
+            .and_then(|path| path.rsplit('/').next().map(String::from))
+            .filter(|s| !s.is_empty());
+        return (Some(reference), recipe_id);
+    }
+
+    // Fall back to plain IDs if present.
+    let recipe_id = candidates
+        .iter()
+        .map(|(_, v)| v)
+        .find(|v| {
+            let looks_like_path = v.contains('/');
+            let len_ok = (8..=64).contains(&v.len());
+            !looks_like_path && len_ok
+        })
+        .cloned();
+
+    (None, recipe_id)
+}
+
+fn debug_current_cook_logging_enabled() -> bool {
+    std::env::var("ANOVA_DEBUG")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on" | "debug"
+            )
+        })
+        .unwrap_or(false)
+}
+
 /// Fetch the most recent in-progress cook from Firestore, if any.
 ///
 /// Queries `oven-cooks` ordered by `createdTimestamp DESC` to find documents
@@ -788,6 +1083,14 @@ pub async fn fetch_current_cook(
             continue;
         }
 
+        if debug_current_cook_logging_enabled() {
+            eprintln!("[current-cook] in-progress document: {}", doc.name);
+            match serde_json::to_string_pretty(&json) {
+                Ok(pretty) => eprintln!("[current-cook] raw json:\n{pretty}"),
+                Err(e) => eprintln!("[current-cook] failed to pretty-print json: {e}"),
+            }
+        }
+
         // Found an in-progress cook — build structured response.
         let started_at = json
             .get("createdTimestamp")
@@ -795,20 +1098,31 @@ pub async fn fetch_current_cook(
             .unwrap_or("")
             .to_string();
 
-        let recipe_id = json
-            .get("recipeRef")
-            .and_then(|v| v.as_str())
-            .and_then(|r| r.rsplit('/').next())
-            .filter(|s| !s.is_empty())
-            .map(String::from);
+        let identity_candidates = extract_recipe_identity_candidates(&json);
+        let (recipe_ref, recipe_id) = choose_recipe_ref_and_id(&identity_candidates);
 
-        // Resolve recipe title.
-        let recipe_title = if let Some(ref id) = recipe_id {
-            let titles = fetch_recipe_titles(client, session, &[id.clone()]).await;
-            titles.get(id).cloned().unwrap_or_else(|| "[custom]".into())
+        // Resolve recipe title using recipeRef when possible, then fall back to
+        // title-like fields embedded in the cook document itself.
+        let title_from_ref = if let Some(reference) = recipe_ref.as_deref() {
+            fetch_recipe_title_from_reference(client, session, reference).await
+        } else if let Some(ref id) = recipe_id {
+            // Backward-compatible fallback if only an ID-like value is available.
+            let titles = fetch_recipe_titles(client, session, std::slice::from_ref(id)).await;
+            titles.get(id).cloned()
         } else {
-            "[custom]".into()
+            None
         };
+        let recipe_title = title_from_ref
+            .or_else(|| extract_cook_title(&json))
+            .unwrap_or_else(|| "[custom]".into());
+
+        if recipe_title == "[custom]" {
+            let candidate_titles = cook_title_candidates_for_log(&json);
+            eprintln!(
+                "[current-cook] unresolved recipe title (recipeRef={:?}, recipeId={:?}, titleCandidates={:?}, identityCandidates={:?})",
+                recipe_ref, recipe_id, candidate_titles, identity_candidates
+            );
+        }
 
         let raw_stages: Vec<JsonValue> = json
             .get("stages")
