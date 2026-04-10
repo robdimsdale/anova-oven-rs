@@ -13,7 +13,7 @@ use defmt::{info, warn};
 use embassy_executor::Spawner;
 use embassy_net::{Config, StackResources};
 use embassy_rp::bind_interrupts;
-use embassy_rp::gpio::{Level, Output};
+use embassy_rp::gpio::{Input, Level, Output, Pull};
 use embassy_rp::peripherals::{DMA_CH0, PIO0};
 use embassy_rp::pio::Pio;
 use embassy_time::{Delay, Duration, Timer};
@@ -53,6 +53,7 @@ static NVRAM: &cyw43::Aligned<cyw43::A4, [u8]> =
 static CLM: &[u8] = include_bytes!("../firmware/43439A0_clm.bin");
 
 static mut HTTP_RX_BUF: [u8; 8192] = [0u8; 8192];
+static mut STOP_RX_BUF: [u8; 1024] = [0u8; 1024];
 
 #[embassy_executor::task]
 async fn cyw43_task(
@@ -64,6 +65,24 @@ async fn cyw43_task(
 #[embassy_executor::task]
 async fn net_task(mut runner: embassy_net::Runner<'static, cyw43::NetDriver<'static>>) -> ! {
     runner.run().await
+}
+
+#[embassy_executor::task]
+async fn stop_button_task(
+    stack: embassy_net::Stack<'static>,
+    mut button: Input<'static>,
+) -> ! {
+    loop {
+        button.wait_for_falling_edge().await;
+        info!("Stop button pressed — sending POST /stop");
+
+        #[allow(static_mut_refs)]
+        let rx_buf = unsafe { &mut STOP_RX_BUF };
+        send_stop(stack, rx_buf).await;
+
+        // Debounce: ignore further presses for 500ms.
+        Timer::after(Duration::from_millis(500)).await;
+    }
 }
 
 #[embassy_executor::main]
@@ -175,6 +194,11 @@ async fn main(spawner: Spawner) {
     if let Some(config) = stack.config_v4() {
         info!("IP address: {}", config.address);
     }
+
+    // --- Stop button setup (GPIO 15, physical pin 20, pull-up, active low) ---
+    let stop_button = Input::new(p.PIN_15, Pull::Up);
+    spawner.spawn(stop_button_task(stack, stop_button).unwrap());
+    info!("Stop button task spawned on GPIO 15");
 
     // Fetch recipes once on startup.
     #[allow(static_mut_refs)]
@@ -381,6 +405,45 @@ async fn fetch_current_cook(
             warn!("GET /current-cook: failed to parse JSON");
             None
         }
+    }
+}
+
+async fn send_stop(
+    stack: embassy_net::Stack<'static>,
+    rx_buf: &mut [u8],
+) {
+    use embassy_net::dns::DnsSocket;
+    use embassy_net::tcp::client::{TcpClient, TcpClientState};
+    use reqwless::client::HttpClient;
+    use reqwless::request::Method;
+
+    let client_state = TcpClientState::<1, 1024, 1024>::new();
+    let tcp = TcpClient::new(stack, &client_state);
+    let dns = DnsSocket::new(stack);
+    let mut client = HttpClient::new(&tcp, &dns);
+
+    let server = normalize_server_url(SERVER_URL);
+    let url = alloc::format!("{server}/stop");
+    let mut request = match client.request(Method::POST, &url).await {
+        Ok(r) => r,
+        Err(_) => {
+            warn!("POST /stop: connection failed");
+            return;
+        }
+    };
+
+    let response = match request.send(rx_buf).await {
+        Ok(r) => r,
+        Err(_) => {
+            warn!("POST /stop: send failed");
+            return;
+        }
+    };
+
+    if response.status.0 >= 200 && response.status.0 < 300 {
+        info!("POST /stop: success (HTTP {})", response.status.0);
+    } else {
+        warn!("POST /stop: HTTP {}", response.status.0);
     }
 }
 
