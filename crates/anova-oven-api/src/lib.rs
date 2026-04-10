@@ -103,13 +103,46 @@ pub struct Stage {
     pub kind: String,
     /// Target temperature in Celsius.
     pub temperature_c: f32,
+    /// Temperature bulb mode: `"dry"` or `"wet"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature_bulbs_mode: Option<String>,
     /// Duration in seconds, if a timed stage.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_secs: Option<u64>,
+    /// Whether a timer is active for this stage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timer_added: Option<bool>,
+    /// Whether a probe target is set for this stage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probe_added: Option<bool>,
+    /// Probe target temperature in Celsius, if probe-based.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probe_target_c: Option<f32>,
     /// Steam percentage (0–100).
     pub steam_pct: f32,
     /// Fan speed (0–100).
     pub fan_speed: u8,
+    /// Whether user must manually advance to this stage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_action_required: Option<bool>,
+    /// Rack position (1–5), counted from bottom.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rack_position: Option<u8>,
+    /// Top heating element on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heating_element_top: Option<bool>,
+    /// Rear heating element on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heating_element_rear: Option<bool>,
+    /// Bottom heating element on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heating_element_bottom: Option<bool>,
+    /// Vent open.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vent_open: Option<bool>,
+    /// Stage title, if set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 /// A cook history entry, as served by `GET /history`.
@@ -121,6 +154,24 @@ pub struct HistoryEntry {
     pub ended_at: String,
     /// Number of cook stages in the completed cook.
     pub stage_count: usize,
+}
+
+/// An in-progress cook, as served by `GET /current-cook`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CurrentCook {
+    /// Resolved recipe title, or `"[custom]"` if no recipe reference.
+    pub recipe_title: String,
+    /// Firestore recipe document ID, if this cook came from a recipe.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recipe_id: Option<String>,
+    /// ISO 8601 timestamp when the cook was created.
+    pub started_at: String,
+    /// Cook stages (same format as recipe stages).
+    pub stages: Vec<Stage>,
+    /// Number of cook stages (excludes preheat).
+    pub cook_stage_count: usize,
+    /// Total number of stages (including preheat).
+    pub total_stage_count: usize,
 }
 
 #[cfg(test)]
@@ -184,16 +235,38 @@ mod tests {
                 Stage {
                     kind: "preheat".into(),
                     temperature_c: 220.0,
+                    temperature_bulbs_mode: Some("dry".into()),
                     duration_secs: None,
+                    timer_added: None,
+                    probe_added: None,
+                    probe_target_c: None,
                     steam_pct: 0.0,
                     fan_speed: 100,
+                    user_action_required: None,
+                    rack_position: None,
+                    heating_element_top: None,
+                    heating_element_rear: None,
+                    heating_element_bottom: None,
+                    vent_open: None,
+                    title: None,
                 },
                 Stage {
                     kind: "cook".into(),
                     temperature_c: 190.0,
+                    temperature_bulbs_mode: Some("dry".into()),
                     duration_secs: Some(3600),
+                    timer_added: Some(true),
+                    probe_added: None,
+                    probe_target_c: None,
                     steam_pct: 30.0,
                     fan_speed: 80,
+                    user_action_required: None,
+                    rack_position: None,
+                    heating_element_top: None,
+                    heating_element_rear: None,
+                    heating_element_bottom: None,
+                    vent_open: None,
+                    title: None,
                 },
             ],
         };

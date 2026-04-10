@@ -10,9 +10,11 @@
 //! - `ANOVA_PASSWORD` — Firebase password
 //!
 //! # Endpoints
-//! - `GET /status`  — current oven state
-//! - `GET /recipes` — user's saved recipes
-//! - `GET /history` — cook history (last 50 cooks)
+//! - `GET /status`       — current oven state
+//! - `GET /recipes`      — user's saved recipes
+//! - `GET /history`      — cook history (last 50 cooks)
+//! - `GET /current-cook` — in-progress cook (diagnostic)
+//! - `POST /stop`        — stop the current cook
 
 mod firestore;
 mod protocol;
@@ -92,6 +94,7 @@ async fn main() {
         .route("/recipes", axum::routing::get(handle_recipes))
         .route("/history", axum::routing::get(handle_history))
         .route("/stop", axum::routing::post(handle_stop))
+        .route("/current-cook", axum::routing::get(handle_current_cook))
         .with_state(state);
 
     let addr = std::env::var("ANOVA_BIND").unwrap_or_else(|_| "0.0.0.0:8080".into());
@@ -291,4 +294,20 @@ async fn handle_history(State(state): State<Arc<AppState>>) -> impl IntoResponse
 
 fn celcius_to_fahrenheit(c: f32) -> f32 {
     c * 9.0 / 5.0 + 32.0
+}
+
+async fn handle_current_cook(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let session = state.session.lock().await.clone();
+    match firestore::fetch_current_cook(&state.http, &session).await {
+        Ok(Some(cook)) => Json(cook).into_response(),
+        Ok(None) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
+            eprintln!("[current-cook] Fetch error: {e}");
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to fetch current cook: {e}"),
+            )
+                .into_response()
+        }
+    }
 }

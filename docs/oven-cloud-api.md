@@ -236,11 +236,17 @@ query(
 
 ```typescript
 interface OvenCook {
-  stages: Stage[];               // What was cooked (same stage format)
-  endedTimestamp: Timestamp;
-  // Additional fields TBD
+  id: string;                        // Same as Firestore document ID
+  createdTimestamp: Timestamp;       // When the cook was started
+  endedTimestamp?: Timestamp;        // When the cook ended (absent while in-progress)
+  recipeRef: DocumentReference;      // ref to oven-recipes/{recipeId}
+  stages: Stage[];                   // What was cooked (same stage format)
 }
 ```
+
+**In-progress detection:** documents without `endedTimestamp` represent active cooks.
+The `orderBy("endedTimestamp")` query excludes these documents; use
+`orderBy("createdTimestamp", "desc")` to find them.
 
 ### `users/{uid}` (top-level document)
 
@@ -356,8 +362,8 @@ Algolia credentials (from APK — public search-only key):
    than 10 recipes, the app likely uses `startAfter()` cursor-based pagination on the
    `createdTimestamp`. The exact mechanism hasn't been confirmed.
 
-6. **`oven-cooks` full document schema** — we confirmed 100 documents exist and the
-   `endedTimestamp` + `stages` fields, but the complete field list hasn't been dumped.
+6. **`oven-cooks` full document schema** — confirmed: `id`, `createdTimestamp`,
+   `endedTimestamp` (absent when in-progress), `recipeRef`, `stages`.
 
 7. **Firestore real-time listeners** — the app uses snapshot listeners
    (`updateOnRecipeSnapshot`, `useOnUserCookRecipeSnapshotListener`). For a CLI that
