@@ -95,6 +95,7 @@ pub struct Nodes {
     pub fan: Fan,
     pub steam_generators: SteamGenerators,
     pub temperature_bulbs: TemperatureBulbs,
+    pub temperature_probe: Option<TemperatureProbe>,
     pub timer: Timer,
     pub water_tank: WaterTank,
 }
@@ -118,6 +119,7 @@ pub struct SteamGenerators {
 #[derive(Debug, Deserialize)]
 pub struct RelativeHumidity {
     pub current: f64,
+    pub setpoint: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -137,6 +139,12 @@ pub struct Temperature {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct TemperatureProbe {
+    pub connected: bool,
+    pub current: Option<Temperature>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct Timer {
     pub current: u64,
     pub initial: u64,
@@ -151,6 +159,12 @@ pub struct WaterTank {
 /// Convert a parsed `ApoStatePayload` into the simplified `OvenStatus` type.
 pub fn to_oven_status(payload: &ApoStatePayload) -> anova_oven_api::OvenStatus {
     let nodes = &payload.state.nodes;
+    let probe_temperature_c = nodes
+        .temperature_probe
+        .as_ref()
+        .filter(|p| p.connected)
+        .and_then(|p| p.current.as_ref())
+        .map(|t| t.celsius as f32);
     anova_oven_api::OvenStatus {
         mode: payload.state.state.mode.clone(),
         temperature_c: nodes.temperature_bulbs.dry.current.celsius as f32,
@@ -163,6 +177,12 @@ pub fn to_oven_status(payload: &ApoStatePayload) -> anova_oven_api::OvenStatus {
         timer_current_secs: nodes.timer.current,
         timer_total_secs: nodes.timer.initial,
         steam_pct: nodes.steam_generators.relative_humidity.current as f32,
+        steam_target_pct: nodes
+            .steam_generators
+            .relative_humidity
+            .setpoint
+            .map(|s| s as f32),
+        probe_temperature_c,
         door_open: !nodes.door.closed,
         water_tank_empty: nodes.water_tank.empty,
     }
