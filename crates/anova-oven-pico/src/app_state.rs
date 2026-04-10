@@ -10,10 +10,17 @@ use crate::events::{handle_input_event, InputEvent, UIState};
 use crate::logic::{is_active_cook, should_dim_backlight};
 
 const MENU_INACTIVITY_TIMEOUT_SECS: u64 = 15;
+const STOP_CONFIRM_TIMEOUT_SECS: u64 = 5;
 const LED_DIM_TIMER_SECS: u64 = 5;
 const COOK_POLL_INTERVAL: u64 = 10;
 const SERVER_RETRY_LOG_INTERVAL: u64 = 5;
 const API_CALL_TIMEOUT_SECS: u64 = 3;
+const POST_ACTION_COOK_REFRESH_DELAY_SECS: u64 = 1;
+
+enum PendingApiAction {
+    Stop,
+    Start { recipe_id: alloc::string::String },
+}
 
 pub(crate) struct AppState<DB, MM, CH>
 where
@@ -30,6 +37,8 @@ where
     pub(crate) recipes: alloc::vec::Vec<anova_oven_api::Recipe>,
     pub(crate) server_online: bool,
     pub(crate) server_fail_count: u64,
+    pending_api_action: Option<PendingApiAction>,
+    queued_refresh_at: Option<Instant>,
 
     backlight_controller: BacklightController,
     lcd_controller: LcdController<DB, MM, CH>,
@@ -55,6 +64,8 @@ where
             recipes: alloc::vec::Vec::new(),
             server_online: true,
             server_fail_count: 0,
+            pending_api_action: None,
+            queued_refresh_at: None,
             backlight_controller,
             lcd_controller,
         }
@@ -118,6 +129,16 @@ where
     }
 
     pub(crate) fn update_inactivity_timeout(&mut self) {
+        if let UIState::ConfirmStopCooking { last_input_at } = self.ui_state {
+            if last_input_at.elapsed() >= Duration::from_secs(STOP_CONFIRM_TIMEOUT_SECS) {
+                info!("Stop-confirm timeout: reverting to ShowStatus");
+                self.ui_state = UIState::ShowStatus;
+                self.baseline_reentered_at = Some(Instant::now());
+                self.last_input_at = None;
+            }
+            return;
+        }
+
         if let Some(t) = self.last_input_at {
             if t.elapsed() >= Duration::from_secs(MENU_INACTIVITY_TIMEOUT_SECS) {
                 if !matches!(self.ui_state, UIState::ShowStatus) {
@@ -130,47 +151,91 @@ where
         }
     }
 
-    pub(crate) async fn handle_user_activity(
-        &mut self,
-        event: InputEvent,
-        stack: embassy_net::Stack<'static>,
-    ) {
-        self.last_input_at = Some(Instant::now());
+    pub(crate) async fn handle_user_activity(&mut self, event: InputEvent) {
+        let now = Instant::now();
+
+        self.last_input_at = Some(now);
         self.baseline_reentered_at = None;
 
         debug!("Setting backlight to full: (input activity)");
         self.backlight_controller.set_full();
 
+        let active_cook = is_active_cook(
+            self.current_cook.is_some(),
+            self.latest_status
+                .as_ref()
+                .map(|status| status.mode.as_str()),
+        );
+
+        if let UIState::ConfirmStopCooking { .. } = self.ui_state {
+            match event {
+                InputEvent::EncoderCCW => {
+                    self.ui_state = UIState::ConfirmStopCooking { last_input_at: now };
+                    return;
+                }
+                InputEvent::EncoderCW => {
+                    info!("Exiting stop-confirm mode: encoder CW");
+                    self.ui_state = UIState::ShowStatus;
+                    self.baseline_reentered_at = Some(now);
+                    self.last_input_at = None;
+                    return;
+                }
+                InputEvent::EncoderButton => {
+                    info!("Sending POST /stop (confirm-stop mode)");
+                    self.apply_optimistic_stop_state();
+                    self.queue_stop_action(now);
+
+                    self.ui_state = UIState::ShowStatus;
+                    self.baseline_reentered_at = Some(now);
+                    self.last_input_at = None;
+                    return;
+                }
+                InputEvent::StopButton => {
+                    info!("Sending POST /stop");
+                    self.apply_optimistic_stop_state();
+                    self.queue_stop_action(now);
+                    return;
+                }
+            }
+        }
+
+        if active_cook && matches!(self.ui_state, UIState::ShowStatus) {
+            match event {
+                InputEvent::EncoderCCW => {
+                    info!("Entering stop-confirm mode: encoder CCW");
+                    self.ui_state = UIState::ConfirmStopCooking { last_input_at: now };
+                    return;
+                }
+                InputEvent::EncoderCW => {
+                    // Explicit no-op while cooking to keep this branch ready for future behavior.
+                    debug!("Ignoring encoder CW while active cook status is shown");
+                    return;
+                }
+                InputEvent::EncoderButton => {
+                    return;
+                }
+                InputEvent::StopButton => {
+                    info!("Sending POST /stop");
+                    self.apply_optimistic_stop_state();
+                    self.queue_stop_action(now);
+                    return;
+                }
+            }
+        }
+
         if matches!(event, InputEvent::StopButton) {
             info!("Sending POST /stop");
-            #[allow(static_mut_refs)]
-            let rx_buf = unsafe { &mut crate::HTTP_RX_BUF };
-            if with_timeout(
-                Duration::from_secs(API_CALL_TIMEOUT_SECS),
-                send_stop(stack, rx_buf),
-            )
-            .await
-            .is_err()
-            {
-                warn!("POST /stop: timed out");
-            }
+            self.apply_optimistic_stop_state();
+            self.queue_stop_action(now);
         }
 
         if matches!(event, InputEvent::EncoderButton) {
             if let UIState::BrowseRecipes { index } = self.ui_state {
-                if let Some(recipe) = self.recipes.get(index) {
-                    info!("Sending POST /start with recipe: {}", recipe.title.as_str());
-                    #[allow(static_mut_refs)]
-                    let rx_buf = unsafe { &mut crate::HTTP_RX_BUF };
-                    if with_timeout(
-                        Duration::from_secs(API_CALL_TIMEOUT_SECS),
-                        send_start(stack, rx_buf, recipe.id.as_str()),
-                    )
-                    .await
-                    .is_err()
-                    {
-                        warn!("POST /start: timed out");
-                    }
+                if let Some(recipe) = self.recipes.get(index).cloned() {
+                    self.apply_optimistic_start_state(&recipe, now);
+                    self.queue_start_action(recipe.id.clone(), now);
+
+                    return;
                 }
             }
         }
@@ -179,6 +244,11 @@ where
     }
 
     pub(crate) async fn poll_status_if_due(&mut self, stack: embassy_net::Stack<'static>) {
+        if self.pending_api_action.is_some() || self.queued_refresh_at.is_some() {
+            self.tick += 1;
+            return;
+        }
+
         if self.tick % COOK_POLL_INTERVAL == 0 {
             #[allow(static_mut_refs)]
             let rx_buf = unsafe { &mut crate::HTTP_RX_BUF };
@@ -274,6 +344,67 @@ where
                     .render_recipe_browser(&self.recipes, *index, self.tick)
                     .await;
             }
+            UIState::ConfirmStopCooking { .. } => {
+                self.lcd_controller
+                    .render_stop_confirmation(
+                        self.tick,
+                        self.latest_status.as_ref(),
+                        self.current_cook.as_ref(),
+                    )
+                    .await;
+            }
+        }
+    }
+
+    pub(crate) async fn process_pending_api_action(&mut self, stack: embassy_net::Stack<'static>) {
+        let Some(action) = self.pending_api_action.take() else {
+            return;
+        };
+
+        #[allow(static_mut_refs)]
+        let rx_buf = unsafe { &mut crate::HTTP_RX_BUF };
+
+        match action {
+            PendingApiAction::Stop => {
+                if with_timeout(
+                    Duration::from_secs(API_CALL_TIMEOUT_SECS),
+                    send_stop(stack, rx_buf),
+                )
+                .await
+                .is_err()
+                {
+                    warn!("POST /stop: timed out");
+                }
+            }
+            PendingApiAction::Start { recipe_id } => {
+                info!("Sending POST /start with recipe id: {}", recipe_id.as_str());
+                if with_timeout(
+                    Duration::from_secs(API_CALL_TIMEOUT_SECS),
+                    send_start(stack, rx_buf, recipe_id.as_str()),
+                )
+                .await
+                .is_err()
+                {
+                    warn!("POST /start: timed out");
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn process_queued_refresh_if_due(
+        &mut self,
+        stack: embassy_net::Stack<'static>,
+    ) {
+        if self.pending_api_action.is_some() {
+            return;
+        }
+
+        if self
+            .queued_refresh_at
+            .is_some_and(|due_at| Instant::now() >= due_at)
+        {
+            self.queued_refresh_at = None;
+            self.refresh_current_cook_and_status_now(stack).await;
         }
     }
 
@@ -318,6 +449,92 @@ where
 
         if let Some(recipe) = self.recipes.iter().find(|recipe| recipe.id == recipe_id) {
             cook.recipe_title = recipe.title.clone();
+        }
+    }
+
+    fn apply_optimistic_stop_state(&mut self) {
+        self.current_cook = None;
+
+        if let Some(status) = self.latest_status.as_mut() {
+            status.mode = alloc::string::String::from("idle");
+            status.timer_mode = alloc::string::String::from("idle");
+            status.timer_current_secs = 0;
+            status.target_temperature_c = None;
+            status.steam_target_pct = None;
+        }
+    }
+
+    fn apply_optimistic_start_state(&mut self, recipe: &anova_oven_api::Recipe, now: Instant) {
+        let cook_stage_count = recipe
+            .stages
+            .iter()
+            .filter(|stage| stage.kind.as_str() == "cook")
+            .count();
+
+        self.current_cook = Some(anova_oven_api::CurrentCook {
+            recipe_title: recipe.title.clone(),
+            recipe_id: Some(recipe.id.clone()),
+            started_at: alloc::string::String::from("pending"),
+            stages: recipe.stages.clone(),
+            cook_stage_count,
+            total_stage_count: recipe.stages.len(),
+        });
+
+        self.ui_state = UIState::ShowStatus;
+        self.baseline_reentered_at = Some(now);
+    }
+
+    fn queue_stop_action(&mut self, now: Instant) {
+        self.pending_api_action = Some(PendingApiAction::Stop);
+        self.queued_refresh_at =
+            Some(now + Duration::from_secs(POST_ACTION_COOK_REFRESH_DELAY_SECS));
+    }
+
+    fn queue_start_action(&mut self, recipe_id: alloc::string::String, now: Instant) {
+        self.pending_api_action = Some(PendingApiAction::Start { recipe_id });
+        self.queued_refresh_at =
+            Some(now + Duration::from_secs(POST_ACTION_COOK_REFRESH_DELAY_SECS));
+    }
+
+    async fn refresh_current_cook_and_status_now(&mut self, stack: embassy_net::Stack<'static>) {
+        #[allow(static_mut_refs)]
+        let rx_buf = unsafe { &mut crate::HTTP_RX_BUF };
+
+        match with_timeout(
+            Duration::from_secs(API_CALL_TIMEOUT_SECS),
+            fetch_current_cook(stack, rx_buf),
+        )
+        .await
+        {
+            Ok(cook) => {
+                self.current_cook = cook;
+                self.reconcile_current_cook_recipe_title();
+            }
+            Err(_) => {
+                warn!("GET /current-cook: timed out after action");
+            }
+        }
+
+        match with_timeout(
+            Duration::from_secs(API_CALL_TIMEOUT_SECS),
+            fetch_and_log_status(stack, rx_buf),
+        )
+        .await
+        {
+            Ok(Some(status)) => {
+                if !self.server_online {
+                    info!("Server communication restored");
+                }
+                self.server_online = true;
+                self.server_fail_count = 0;
+                self.latest_status = Some(status);
+            }
+            Ok(None) => {
+                warn!("GET /status: failed after action");
+            }
+            Err(_) => {
+                warn!("GET /status: timed out after action");
+            }
         }
     }
 }

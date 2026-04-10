@@ -241,6 +241,23 @@ where
         self.write_row(1, &recipes[index].title, tick).await;
     }
 
+    pub(crate) async fn render_stop_confirmation(
+        &mut self,
+        tick: u64,
+        status: Option<&anova_oven_api::OvenStatus>,
+        current_cook: Option<&anova_oven_api::CurrentCook>,
+    ) {
+        if let Some(cook) = current_cook {
+            self.write_row(0, cook.display_name(), tick).await;
+        } else if let Some(status) = status {
+            self.write_row(0, status.phase(), tick).await;
+        } else {
+            self.write_row(0, "Active cook", tick).await;
+        }
+
+        self.write_row(1, "Stop cooking?", tick).await;
+    }
+
     async fn write_row(&mut self, row: u8, text: &str, _tick: u64) {
         let now = Instant::now();
         let row_state = self.row_scroll_state_mut(row);

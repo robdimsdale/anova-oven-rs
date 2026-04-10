@@ -218,9 +218,16 @@ async fn main(spawner: Spawner) {
                 // independent of status polling or user input. The display task will run at the end of the loop unconditionally, so no action is needed here.
             }
             embassy_futures::select::Either::Second(event) => {
-                app.handle_user_activity(event, stack).await;
+                app.handle_user_activity(event).await;
             }
         }
+
+        // Render first so optimistic UI transitions are visible immediately.
+        app.render_current_view().await;
+
+        // TODO: can we split out the status update API call into the same queue? Should we?
+        app.process_pending_api_action(stack).await;
+        app.process_queued_refresh_if_due(stack).await;
 
         if Instant::now() >= next_poll_at {
             app.poll_status_if_due(stack).await;
