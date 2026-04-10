@@ -1,11 +1,11 @@
 #![no_std]
 #![allow(async_fn_in_trait)]
 
-//! Embedded integration for the firestore recipe fetch.
+//! Embedded integration for the Firestore recipe fetch.
 //!
-//! The Pico W doesn't yet have the TLS/HTTPS layer needed to actually send
-//! these requests, but this module demonstrates the intended integration
-//! pattern using the `anova-oven-firestore` crate:
+//! This module is transport-agnostic. The concrete transport
+//! (`reqwless` + `embedded-tls` over embassy-net) lives in `http.rs`.
+//! The pattern:
 //!
 //! 1. Build a query with one of the `queries::` helpers.
 //! 2. POST the JSON body to the REST URL, with the Firebase ID token as a
