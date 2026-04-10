@@ -1,3 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["crates/anova-oven-protocol", "crates/anova-oven-firestore", "crates/anova-oven-cli"]
+members = [
+  "crates/anova-oven-api",
+  "crates/anova-oven-server",
+  "crates/anova-oven-cli",
+]
