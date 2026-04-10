@@ -11,6 +11,8 @@ edition = "2021"
 
 [dependencies]
 anova-oven-protocol = { path = "../anova-oven-protocol", default-features = false }
+anova-oven-firestore = { path = "../anova-oven-firestore", default-features = false }
+serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
 
 embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread", "defmt"] }
 embassy-rp = { version = "0.10.0", features = ["defmt", "time-driver", "critical-section-impl", "rp2040"] }
