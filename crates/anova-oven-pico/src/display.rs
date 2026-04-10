@@ -87,11 +87,9 @@ where
             return;
         };
 
-        let is_cooking = current_cook.is_some() && status.is_cooking();
+        let is_cooking = current_cook.is_some() || status.is_cooking();
 
-        if is_cooking {
-            let cook = current_cook.expect("current cook should exist when is_cooking is true");
-
+        if let Some(cook) = current_cook {
             let name = cook.display_name();
             self.write_row(0, name, tick).await;
 
@@ -176,6 +174,15 @@ where
                 }
                 _ => {}
             }
+        } else if is_cooking {
+            self.write_row(0, "Custom cook", tick).await;
+
+            let row1 = if let Some(steam) = status.steam_target_pct {
+                alloc::format!("{} S:{:.0}%", status.phase(), steam)
+            } else {
+                alloc::string::String::from(status.phase())
+            };
+            self.write_row(1, &row1, tick).await;
         } else {
             self.lcd.set_cursor_xy((0, 0), &mut self.delay).await.ok();
             let temp_str = alloc::format!(

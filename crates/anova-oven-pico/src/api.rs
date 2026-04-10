@@ -2,7 +2,8 @@ use defmt::{info, warn};
 use embassy_net::dns::DnsSocket;
 use embassy_net::tcp::client::{TcpClient, TcpClientState};
 use reqwless::client::HttpClient;
-use reqwless::request::Method;
+use reqwless::headers::ContentType;
+use reqwless::request::{Method, RequestBuilder};
 
 use crate::display::celcius_to_fahrenheit;
 use crate::SERVER_URL;
@@ -166,11 +167,7 @@ pub async fn send_stop(stack: embassy_net::Stack<'static>, rx_buf: &mut [u8]) {
     }
 }
 
-pub async fn send_start(
-    stack: embassy_net::Stack<'static>,
-    rx_buf: &mut [u8],
-    recipe_id: &str,
-) {
+pub async fn send_start(stack: embassy_net::Stack<'static>, rx_buf: &mut [u8], recipe_id: &str) {
     let client_state = TcpClientState::<1, 1024, 1024>::new();
     let tcp = TcpClient::new(stack, &client_state);
     let dns = DnsSocket::new(stack);
@@ -178,7 +175,7 @@ pub async fn send_start(
 
     let server = normalize_server_url(SERVER_URL);
     let url = alloc::format!("{server}/start");
-    let mut request = match client.request(Method::POST, &url).await {
+    let request = match client.request(Method::POST, &url).await {
         Ok(r) => r,
         Err(_) => {
             warn!("POST /start: connection failed");
@@ -188,7 +185,9 @@ pub async fn send_start(
 
     // Build JSON body: {"recipe_id": "..."}
     let body = alloc::format!(r#"{{"recipe_id":"{}"}}"#, recipe_id);
-    request.write_all(body.as_bytes()).await.ok();
+    let mut request = request
+        .body(body.as_bytes())
+        .content_type(ContentType::ApplicationJson);
 
     let response = match request.send(rx_buf).await {
         Ok(r) => r,
@@ -246,7 +245,11 @@ pub async fn fetch_and_log_recipes(
     };
 
     match serde_json::from_slice::<alloc::vec::Vec<anova_oven_api::Recipe>>(body) {
-        Ok(recipes) => {
+        Ok(mut recipes) => {
+            // Normalize all recipes for Anova compatibility
+            for recipe in &mut recipes {
+                recipe.normalize();
+            }
             info!("Recipes: {} found", recipes.len());
             for recipe in &recipes {
                 info!(
