@@ -11,7 +11,6 @@ pub enum InputEvent {
     EncoderCW,
     EncoderCCW,
     EncoderButton,
-    StopButton,
 }
 
 pub enum UIState {
@@ -21,17 +20,6 @@ pub enum UIState {
 }
 
 pub static EVENT_CHANNEL: Channel<CriticalSectionRawMutex, InputEvent, 4> = Channel::new();
-
-#[embassy_executor::task]
-pub async fn stop_button_task(mut button: Input<'static>) -> ! {
-    loop {
-        button.wait_for_falling_edge().await;
-        info!("Stop button pressed");
-        EVENT_CHANNEL.send(InputEvent::StopButton).await;
-
-        Timer::after(Duration::from_millis(500)).await;
-    }
-}
 
 #[embassy_executor::task]
 pub async fn rot_enc_button_task(mut button: Input<'static>) -> ! {
@@ -120,7 +108,7 @@ pub fn handle_input_event(event: InputEvent, ui_state: &mut UIState, recipes: &[
                 }
             }
         }
-        InputEvent::EncoderButton | InputEvent::StopButton => {
+        InputEvent::EncoderButton => {
             // Caller handles inactivity timer reset.
         }
     }
