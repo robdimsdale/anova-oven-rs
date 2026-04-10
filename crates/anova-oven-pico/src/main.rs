@@ -207,6 +207,7 @@ async fn main(spawner: Spawner) {
 
     // Poll status every tick, current-cook every COOK_POLL_INTERVAL ticks.
     const COOK_POLL_INTERVAL: u64 = 10;
+    const ROTATION_PERIOD: u64 = 3; // seconds per rotation item
     let mut tick: u64 = 0;
     let mut current_cook: Option<anova_oven_api::CurrentCook> = None;
 
@@ -222,61 +223,183 @@ async fn main(spawner: Spawner) {
         let rx_buf = unsafe { &mut HTTP_RX_BUF };
         match fetch_and_log_status(stack, rx_buf).await {
             Some(status) => {
-                // Row 0: oven temp + optional probe temp, padded to 16 chars.
-                lcd.set_cursor_xy((0, 0), &mut delay).await.ok();
-                let temp_str = alloc::format!("{:.0}", celcius_to_fahrenheit(status.temperature_c));
-                let mut row0_len = temp_str.len() + 2; // ° + F
-                lcd.write_str(&temp_str, &mut delay).await.ok();
-                lcd.write_byte(0xDF, &mut delay).await.ok();
-                lcd.write_str("F", &mut delay).await.ok();
-                if let Some(probe_c) = status.probe_temperature_c {
-                    let probe_str = alloc::format!(" P:{:.0}", celcius_to_fahrenheit(probe_c));
-                    row0_len += probe_str.len() + 2; // ° + F
-                    lcd.write_str(&probe_str, &mut delay).await.ok();
+                let is_cooking = current_cook.is_some() && status.mode != "idle";
+
+                if is_cooking {
+                    let cook = current_cook.as_ref().unwrap();
+
+                    // Row 0: recipe name (or "Manual cook")
+                    let name = if cook.recipe_title == "[custom]" {
+                        "Manual cook"
+                    } else {
+                        &cook.recipe_title
+                    };
+                    lcd_write_row(&mut lcd, &mut delay, 0, name).await;
+
+                    // Row 1: rotating display
+                    // Determine rotation items: 3 during preheat, 4 during cook
+                    let has_timer_or_probe = status.timer_mode == "running"
+                        || status.probe_temperature_c.is_some();
+                    let num_items: u64 = if has_timer_or_probe { 4 } else { 3 };
+                    let slot = (tick / ROTATION_PERIOD) % num_items;
+
+                    let stage_kind = infer_stage_kind(&status);
+                    let phase = infer_phase(&status);
+
+                    match slot {
+                        0 => {
+                            // Stage name
+                            let stage = find_current_stage(cook, stage_kind);
+                            let row1 = match stage.and_then(|s| s.title.as_deref()) {
+                                Some(t) => alloc::string::String::from(t),
+                                None if cook.recipe_title == "[custom]" => {
+                                    alloc::string::String::from("Manual stage")
+                                }
+                                None => {
+                                    alloc::format!("Stage: {phase}")
+                                }
+                            };
+                            lcd_write_row(&mut lcd, &mut delay, 1, &row1).await;
+                        }
+                        1 => {
+                            // Current temp → target temp (needs degree symbol)
+                            lcd.set_cursor_xy((0, 1), &mut delay).await.ok();
+                            let current_f = celcius_to_fahrenheit(status.temperature_c);
+                            let s = alloc::format!("{:.0}", current_f);
+                            let mut len = s.len() + 2; // °F
+                            lcd.write_str(&s, &mut delay).await.ok();
+                            lcd.write_byte(0xDF, &mut delay).await.ok();
+                            lcd.write_str("F", &mut delay).await.ok();
+                            if let Some(target_c) = status.target_temperature_c {
+                                let target_f = celcius_to_fahrenheit(target_c);
+                                let t = alloc::format!(">{:.0}", target_f);
+                                len += t.len() + 2; // °F
+                                lcd.write_str(&t, &mut delay).await.ok();
+                                lcd.write_byte(0xDF, &mut delay).await.ok();
+                                lcd.write_str("F", &mut delay).await.ok();
+                            }
+                            for _ in len..16 {
+                                lcd.write_byte(b' ', &mut delay).await.ok();
+                            }
+                        }
+                        2 => {
+                            // Preheating or Cooking
+                            lcd_write_row(&mut lcd, &mut delay, 1, phase).await;
+                        }
+                        3 => {
+                            // Timer or probe
+                            if status.timer_mode == "running" && status.timer_total_secs > 0 {
+                                let remaining = status
+                                    .timer_total_secs
+                                    .saturating_sub(status.timer_current_secs);
+                                let h = remaining / 3600;
+                                let m = (remaining % 3600) / 60;
+                                let s = remaining % 60;
+                                let row1 = if h > 0 {
+                                    alloc::format!("Timer: {h}:{m:02}:{s:02}")
+                                } else {
+                                    alloc::format!("Timer: {m:02}:{s:02}")
+                                };
+                                lcd_write_row(&mut lcd, &mut delay, 1, &row1).await;
+                            } else if let Some(probe_c) = status.probe_temperature_c {
+                                // Probe current → target (needs degree symbol)
+                                lcd.set_cursor_xy((0, 1), &mut delay).await.ok();
+                                let probe_f = celcius_to_fahrenheit(probe_c);
+                                let s = alloc::format!("P:{:.0}", probe_f);
+                                let mut len = s.len() + 2; // °F
+                                lcd.write_str(&s, &mut delay).await.ok();
+                                lcd.write_byte(0xDF, &mut delay).await.ok();
+                                lcd.write_str("F", &mut delay).await.ok();
+                                let stage = find_current_stage(cook, stage_kind);
+                                if let Some(target_c) = stage.and_then(|st| st.probe_target_c) {
+                                    let target_f = celcius_to_fahrenheit(target_c);
+                                    let t = alloc::format!(">{:.0}", target_f);
+                                    len += t.len() + 2;
+                                    lcd.write_str(&t, &mut delay).await.ok();
+                                    lcd.write_byte(0xDF, &mut delay).await.ok();
+                                    lcd.write_str("F", &mut delay).await.ok();
+                                }
+                                for _ in len..16 {
+                                    lcd.write_byte(b' ', &mut delay).await.ok();
+                                }
+                            } else {
+                                lcd_write_row(&mut lcd, &mut delay, 1, "--").await;
+                            }
+                        }
+                        _ => {}
+                    }
+                } else {
+                    // No active cook — show temperature and mode/steam.
+                    // Row 0: oven temp + optional probe temp.
+                    lcd.set_cursor_xy((0, 0), &mut delay).await.ok();
+                    let temp_str =
+                        alloc::format!("{:.0}", celcius_to_fahrenheit(status.temperature_c));
+                    let mut row0_len = temp_str.len() + 2; // ° + F
+                    lcd.write_str(&temp_str, &mut delay).await.ok();
                     lcd.write_byte(0xDF, &mut delay).await.ok();
                     lcd.write_str("F", &mut delay).await.ok();
-                }
-                for _ in row0_len..16 {
-                    lcd.write_byte(b' ', &mut delay).await.ok();
+                    if let Some(probe_c) = status.probe_temperature_c {
+                        let probe_str =
+                            alloc::format!(" P:{:.0}", celcius_to_fahrenheit(probe_c));
+                        row0_len += probe_str.len() + 2;
+                        lcd.write_str(&probe_str, &mut delay).await.ok();
+                        lcd.write_byte(0xDF, &mut delay).await.ok();
+                        lcd.write_str("F", &mut delay).await.ok();
+                    }
+                    for _ in row0_len..16 {
+                        lcd.write_byte(b' ', &mut delay).await.ok();
+                    }
+
+                    // Row 1: mode + optional steam target.
+                    let row1 = if let Some(steam) = status.steam_target_pct {
+                        alloc::format!("{} S:{:.0}%", status.mode, steam)
+                    } else {
+                        status.mode.clone()
+                    };
+                    lcd_write_row(&mut lcd, &mut delay, 1, &row1).await;
                 }
 
-                // Row 1: if cook active, show recipe name; otherwise mode + steam.
-                lcd.set_cursor_xy((0, 1), &mut delay).await.ok();
-                let row1 = if let Some(ref cook) = current_cook {
-                    if status.mode == "idle" {
-                        // Oven says idle but Firestore hasn't caught up yet —
-                        // show standard idle display.
-                        status.mode.clone()
-                    } else {
-                        // Truncate recipe title to 16 chars for the LCD.
-                        let title = &cook.recipe_title;
-                        if title.len() > 16 {
-                            alloc::format!("{}", &title[..16])
-                        } else {
-                            title.clone()
-                        }
-                    }
-                } else if let Some(steam) = status.steam_target_pct {
-                    alloc::format!("{} S:{:.0}%", status.mode, steam)
-                } else {
-                    status.mode.clone()
-                };
-                lcd.write_str(&row1, &mut delay).await.ok();
-                for _ in row1.len()..16 {
-                    lcd.write_byte(b' ', &mut delay).await.ok();
+                // Clear current_cook if oven is idle (cook ended).
+                if status.mode == "idle" && current_cook.is_some() {
+                    current_cook = None;
                 }
             }
             None => {
-                lcd.set_cursor_xy((0, 0), &mut delay).await.ok();
-                lcd.write_str("                ", &mut delay).await.ok();
-                lcd.set_cursor_xy((0, 1), &mut delay).await.ok();
-                lcd.write_str("Status: N/A     ", &mut delay).await.ok();
+                lcd_write_row(&mut lcd, &mut delay, 0, "").await;
+                lcd_write_row(&mut lcd, &mut delay, 1, "Status: N/A").await;
             }
         }
 
         tick += 1;
         Timer::after(Duration::from_secs(POLL_INTERVAL_SECS)).await;
     }
+}
+
+/// Write a string to an LCD row, padding or truncating to 16 characters.
+async fn lcd_write_row<
+    B: hd44780_driver::non_blocking::bus::DataBus,
+    M: hd44780_driver::memory_map::DisplayMemoryMap,
+    C: hd44780_driver::charset::CharsetWithFallback,
+>(
+    lcd: &mut HD44780<B, M, C>,
+    delay: &mut Delay,
+    row: u8,
+    text: &str,
+) {
+    lcd.set_cursor_xy((0, row), delay).await.ok();
+    let len = text.len().min(16);
+    lcd.write_str(&text[..len], delay).await.ok();
+    for _ in len..16 {
+        lcd.write_byte(b' ', delay).await.ok();
+    }
+}
+
+/// Find the cook stage matching the oven's current mode.
+fn find_current_stage<'a>(
+    cook: &'a anova_oven_api::CurrentCook,
+    oven_mode: &str,
+) -> Option<&'a anova_oven_api::Stage> {
+    cook.stages.iter().find(|s| s.kind == oven_mode)
 }
 
 async fn fetch_and_log_status(
@@ -507,4 +630,25 @@ async fn fetch_and_log_recipes(
 
 fn celcius_to_fahrenheit(c: f32) -> f32 {
     c * 1.8 + 32.0
+}
+
+/// Infer the human-readable phase label from oven status.
+///
+/// The WebSocket `state.mode` reports `"cook"` for both preheat and cook stages.
+/// During preheat, the timer is idle and hasn't started.
+fn infer_phase(s: &anova_oven_api::OvenStatus) -> &'static str {
+    match s.mode.as_str() {
+        "idle" => "Idle",
+        "cook" if s.timer_mode == "idle" && s.timer_current_secs == 0 => "Preheating",
+        "cook" => "Cooking",
+        _ => "Unknown",
+    }
+}
+
+/// Map oven status to the stage `kind` ("preheat" or "cook") for stage matching.
+fn infer_stage_kind(s: &anova_oven_api::OvenStatus) -> &'static str {
+    match s.mode.as_str() {
+        "cook" if s.timer_mode == "idle" && s.timer_current_secs == 0 => "preheat",
+        _ => "cook",
+    }
 }
