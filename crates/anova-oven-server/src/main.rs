@@ -535,6 +535,76 @@ async fn maybe_refresh_session(
     }
 }
 
+fn approx_eq_f32(a: f32, b: f32, tolerance: f32) -> bool {
+    (a - b).abs() <= tolerance
+}
+
+fn stage_semantically_matches(a: &anova_oven_api::Stage, b: &anova_oven_api::Stage) -> bool {
+    a.kind == b.kind
+        && approx_eq_f32(a.temperature_c, b.temperature_c, 1.0)
+        && approx_eq_f32(a.steam_pct, b.steam_pct, 2.0)
+        && a.duration_secs == b.duration_secs
+        && match (a.probe_target_c, b.probe_target_c) {
+            (Some(x), Some(y)) => approx_eq_f32(x, y, 1.0),
+            (None, None) => true,
+            _ => false,
+        }
+}
+
+fn cook_matches_recipe(
+    cook: &anova_oven_api::CurrentCook,
+    recipe: &anova_oven_api::Recipe,
+) -> bool {
+    cook.stages.len() == recipe.stages.len()
+        && cook
+            .stages
+            .iter()
+            .zip(recipe.stages.iter())
+            .all(|(c, r)| stage_semantically_matches(c, r))
+}
+
+fn resolve_title_from_recipes(
+    cook: &anova_oven_api::CurrentCook,
+    recipes: &[anova_oven_api::Recipe],
+) -> Option<(String, String)> {
+    if let Some(ref recipe_id) = cook.recipe_id {
+        if let Some(recipe) = recipes.iter().find(|r| r.id == *recipe_id) {
+            return Some((recipe.title.clone(), recipe.id.clone()));
+        }
+    }
+
+    let mut matches = recipes.iter().filter(|r| cook_matches_recipe(cook, r));
+    let first = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some((first.title.clone(), first.id.clone()))
+}
+
+async fn recipes_for_resolution(state: &AppState) -> Result<Vec<anova_oven_api::Recipe>, String> {
+    {
+        let cache = state.recipes.lock().await;
+        if let Some(ref recipes) = *cache {
+            return Ok(recipes.clone());
+        }
+    }
+
+    let session = state.session.lock().await.clone();
+    let fetched = match firestore::fetch_recipes(&state.http, &session).await {
+        Ok(v) => Ok(v),
+        Err(err) => match maybe_refresh_session(state, err).await {
+            Ok(fresh) => firestore::fetch_recipes(&state.http, &fresh)
+                .await
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e),
+        },
+    }?;
+
+    let mut cache = state.recipes.lock().await;
+    *cache = Some(fetched.clone());
+    Ok(fetched)
+}
+
 async fn handle_current_cook(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let session = state.session.lock().await.clone();
     let result = match firestore::fetch_current_cook(&state.http, &session).await {
@@ -548,7 +618,29 @@ async fn handle_current_cook(State(state): State<Arc<AppState>>) -> impl IntoRes
     };
 
     match result {
-        Ok(Some(cook)) => Json(cook).into_response(),
+        Ok(Some(mut cook)) => {
+            if cook.recipe_title == "[custom]" {
+                match recipes_for_resolution(&state).await {
+                    Ok(recipes) => {
+                        if let Some((title, id)) = resolve_title_from_recipes(&cook, &recipes) {
+                            eprintln!(
+                                "[current-cook] resolved title from recipe stage match: '{}' ({})",
+                                title, id
+                            );
+                            cook.recipe_title = title;
+                            if cook.recipe_id.is_none() {
+                                cook.recipe_id = Some(id);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[current-cook] recipe resolution skipped: {e}");
+                    }
+                }
+            }
+
+            Json(cook).into_response()
+        }
         Ok(None) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
             eprintln!("[current-cook] Fetch error: {e}");

@@ -21,6 +21,7 @@ where
     row1_scroll_state: Option<RowScrollState>,
     row0_last_rendered: Option<String>,
     row1_last_rendered: Option<String>,
+    row1_slot: Option<u64>,
 }
 
 struct RowScrollState {
@@ -44,6 +45,7 @@ where
             row1_scroll_state: None,
             row0_last_rendered: None,
             row1_last_rendered: None,
+            row1_slot: None,
         }
     }
 
@@ -63,6 +65,14 @@ where
         self.lcd.clear(&mut self.delay).await.ok();
     }
 
+    fn reset_row1_if_slot_changed(&mut self, slot: u64) {
+        if self.row1_slot != Some(slot) {
+            self.row1_slot = Some(slot);
+            self.row1_scroll_state = None;
+            self.row1_last_rendered = None;
+        }
+    }
+
     pub(crate) async fn render_wifi_init(&mut self) {
         self.write_row(0, "Anova Oven", 0).await;
         self.write_row(1, "Init: WIFI...", 0).await;
@@ -71,6 +81,11 @@ where
     pub(crate) async fn render_dhcp_init(&mut self) {
         self.write_row(0, "Anova Oven", 0).await;
         self.write_row(1, "Init: DHCP...", 0).await;
+    }
+
+    pub(crate) async fn render_server_offline(&mut self, tick: u64) {
+        self.write_row(0, "Server Offline", tick).await;
+        self.write_row(1, "Check backend", tick).await;
     }
 
     pub(crate) async fn render_status_display(
@@ -93,36 +108,80 @@ where
             let name = cook.display_name();
             self.write_row(0, name, tick).await;
 
+            let current_stage = cook.current_stage(status);
+            let phase = status.phase();
+            let stage_title = current_stage.and_then(|s| s.title.as_deref());
+            let show_phase = stage_title.is_some_and(|title| !title.eq_ignore_ascii_case(phase));
             let has_timer_or_probe =
                 status.timer_remaining_secs().is_some() || status.probe_temperature_c.is_some();
-            let num_items: u64 = if has_timer_or_probe { 4 } else { 3 };
+
+            let num_items: u64 = 2 + u64::from(show_phase) + u64::from(has_timer_or_probe);
             let slot = (tick / ROTATION_PERIOD) % num_items;
+            self.reset_row1_if_slot_changed(slot);
+            let mut slot_idx = 0;
 
-            let phase = status.phase();
+            if slot == slot_idx {
+                let row1 = match stage_title {
+                    Some(title) => alloc::format!("Stage: {title}"),
+                    None if cook.recipe_title == "[custom]" => {
+                        alloc::string::String::from("Custom stage")
+                    }
+                    None => alloc::format!("Stage: {phase}"),
+                };
+                self.write_row(1, &row1, tick).await;
+            }
+            slot_idx += 1;
 
-            match slot {
-                0 => {
-                    let stage = cook.current_stage(status);
-                    let row1 = match stage.and_then(|s| s.title.as_deref()) {
-                        Some(t) => alloc::string::String::from(t),
-                        None if cook.recipe_title == "[custom]" => {
-                            alloc::string::String::from("Manual stage")
-                        }
-                        None => {
-                            alloc::format!("Stage: {phase}")
-                        }
-                    };
+            if slot == slot_idx {
+                self.lcd.set_cursor_xy((0, 1), &mut self.delay).await.ok();
+                let current_f = celcius_to_fahrenheit(status.current_temperature_c());
+                let s = alloc::format!("{:.0}", current_f);
+                let mut len = s.len() + 2;
+                self.lcd.write_str(&s, &mut self.delay).await.ok();
+                self.lcd.write_byte(0xDF, &mut self.delay).await.ok();
+                self.lcd.write_str("F", &mut self.delay).await.ok();
+                if let Some(target_c) = status.target_temperature_c {
+                    let target_f = celcius_to_fahrenheit(target_c);
+                    let t = alloc::format!(">{:.0}", target_f);
+                    len += t.len() + 2;
+                    self.lcd.write_str(&t, &mut self.delay).await.ok();
+                    self.lcd.write_byte(0xDF, &mut self.delay).await.ok();
+                    self.lcd.write_str("F", &mut self.delay).await.ok();
+                }
+                for _ in len..LCD_WIDTH {
+                    self.lcd.write_byte(b' ', &mut self.delay).await.ok();
+                }
+            }
+            slot_idx += 1;
+
+            if show_phase {
+                if slot == slot_idx {
+                    let row1 = alloc::format!("Phase: {phase}");
                     self.write_row(1, &row1, tick).await;
                 }
-                1 => {
+                slot_idx += 1;
+            }
+
+            if has_timer_or_probe && slot == slot_idx {
+                if let Some(remaining) = status.timer_remaining_secs() {
+                    let h = remaining / 3600;
+                    let m = (remaining % 3600) / 60;
+                    let s = remaining % 60;
+                    let row1 = if h > 0 {
+                        alloc::format!("Timer: {h}:{m:02}:{s:02}")
+                    } else {
+                        alloc::format!("Timer: {m:02}:{s:02}")
+                    };
+                    self.write_row(1, &row1, tick).await;
+                } else if let Some(probe_c) = status.probe_temperature_c {
                     self.lcd.set_cursor_xy((0, 1), &mut self.delay).await.ok();
-                    let current_f = celcius_to_fahrenheit(status.current_temperature_c());
-                    let s = alloc::format!("{:.0}", current_f);
+                    let probe_f = celcius_to_fahrenheit(probe_c);
+                    let s = alloc::format!("P:{:.0}", probe_f);
                     let mut len = s.len() + 2;
                     self.lcd.write_str(&s, &mut self.delay).await.ok();
                     self.lcd.write_byte(0xDF, &mut self.delay).await.ok();
                     self.lcd.write_str("F", &mut self.delay).await.ok();
-                    if let Some(target_c) = status.target_temperature_c {
+                    if let Some(target_c) = current_stage.and_then(|st| st.probe_target_c) {
                         let target_f = celcius_to_fahrenheit(target_c);
                         let t = alloc::format!(">{:.0}", target_f);
                         len += t.len() + 2;
@@ -134,45 +193,6 @@ where
                         self.lcd.write_byte(b' ', &mut self.delay).await.ok();
                     }
                 }
-                2 => {
-                    self.write_row(1, phase, tick).await;
-                }
-                3 => {
-                    if let Some(remaining) = status.timer_remaining_secs() {
-                        let h = remaining / 3600;
-                        let m = (remaining % 3600) / 60;
-                        let s = remaining % 60;
-                        let row1 = if h > 0 {
-                            alloc::format!("Timer: {h}:{m:02}:{s:02}")
-                        } else {
-                            alloc::format!("Timer: {m:02}:{s:02}")
-                        };
-                        self.write_row(1, &row1, tick).await;
-                    } else if let Some(probe_c) = status.probe_temperature_c {
-                        self.lcd.set_cursor_xy((0, 1), &mut self.delay).await.ok();
-                        let probe_f = celcius_to_fahrenheit(probe_c);
-                        let s = alloc::format!("P:{:.0}", probe_f);
-                        let mut len = s.len() + 2;
-                        self.lcd.write_str(&s, &mut self.delay).await.ok();
-                        self.lcd.write_byte(0xDF, &mut self.delay).await.ok();
-                        self.lcd.write_str("F", &mut self.delay).await.ok();
-                        let stage = cook.current_stage(status);
-                        if let Some(target_c) = stage.and_then(|st| st.probe_target_c) {
-                            let target_f = celcius_to_fahrenheit(target_c);
-                            let t = alloc::format!(">{:.0}", target_f);
-                            len += t.len() + 2;
-                            self.lcd.write_str(&t, &mut self.delay).await.ok();
-                            self.lcd.write_byte(0xDF, &mut self.delay).await.ok();
-                            self.lcd.write_str("F", &mut self.delay).await.ok();
-                        }
-                        for _ in len..LCD_WIDTH {
-                            self.lcd.write_byte(b' ', &mut self.delay).await.ok();
-                        }
-                    } else {
-                        self.write_row(1, "--", tick).await;
-                    }
-                }
-                _ => {}
             }
         } else if is_cooking {
             self.write_row(0, "Custom cook", tick).await;
