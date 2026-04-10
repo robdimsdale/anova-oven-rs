@@ -1,0 +1,34 @@
+# Standalone workspace — this crate targets thumbv6m-none-eabi (Cortex-M0+)
+# and cannot share a workspace with host-target crates due to conflicting
+# critical-section features. Build from this directory:
+#   cargo build --release
+[workspace]
+
+[package]
+name = "anova-oven-pico"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anova-oven-protocol = { path = "../anova-oven-protocol", default-features = false }
+
+embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread", "defmt"] }
+embassy-rp = { version = "0.10.0", features = ["defmt", "time-driver", "critical-section-impl", "rp2040"] }
+embassy-net = { version = "0.9.0", features = ["defmt", "tcp", "dhcpv4", "dns", "medium-ethernet", "proto-ipv4"] }
+embassy-time = "0.5"
+
+cyw43 = { version = "0.7.0", features = ["defmt", "firmware-logs"] }
+cyw43-pio = { version = "0.10.0", features = ["defmt"] }
+
+portable-atomic = { version = "1", features = ["critical-section"] }
+cortex-m = "0.7"
+cortex-m-rt = "0.7"
+defmt = "1.0"
+defmt-rtt = "1.1"
+panic-probe = { version = "1.0", features = ["print-defmt"] }
+static_cell = "2"
+
+[profile.release]
+opt-level = "s"
+debug = 2
+lto = true
