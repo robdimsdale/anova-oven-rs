@@ -8,6 +8,8 @@ const LCD_WIDTH: usize = 16;
 const SCROLL_STEP_MS: u64 = 350;
 const CHAR_SCROLL_COUNT: usize = 3;
 const END_PAUSE_MS: u64 = 1200;
+// Minimum time to display a slot whose content fits on-screen without scrolling.
+const MIN_SLOT_HOLD_MS: u64 = 3000;
 
 pub(crate) struct LcdController<B, M, C>
 where
@@ -29,6 +31,8 @@ struct RowScrollState {
     offset: usize,
     last_step_at: Instant,
     pause_until: Instant,
+    shown_at: Instant,
+    cycle_complete: bool,
 }
 
 impl<B, M, C> LcdController<B, M, C>
@@ -65,12 +69,13 @@ where
         self.lcd.clear(&mut self.delay).await.ok();
     }
 
-    fn reset_row1_if_slot_changed(&mut self, slot: u64) {
-        if self.row1_slot != Some(slot) {
-            self.row1_slot = Some(slot);
-            self.row1_scroll_state = None;
-            self.row1_last_rendered = None;
-        }
+    /// Returns true when the current row-1 slot has finished displaying:
+    /// long text: after completing one full scroll AND the end-pause has elapsed;
+    /// short text: after MIN_SLOT_HOLD_MS has elapsed.
+    fn row1_animation_done(&self) -> bool {
+        self.row1_scroll_state.as_ref().map_or(false, |s| {
+            s.cycle_complete && Instant::now() >= s.pause_until
+        })
     }
 
     pub(crate) async fn render_wifi_init(&mut self) {
@@ -94,8 +99,6 @@ where
         status: Option<&anova_oven_api::OvenStatus>,
         current_cook: Option<&anova_oven_api::CurrentCook>,
     ) {
-        const ROTATION_PERIOD: u64 = 3;
-
         let Some(status) = status else {
             self.write_row(0, "", tick).await;
             self.write_row(1, "Status: N/A", tick).await;
@@ -116,8 +119,18 @@ where
                 status.timer_remaining_secs().is_some() || status.probe_temperature_c.is_some();
 
             let num_items: u64 = 2 + u64::from(show_phase) + u64::from(has_timer_or_probe);
-            let slot = (tick / ROTATION_PERIOD) % num_items;
-            self.reset_row1_if_slot_changed(slot);
+
+            // Advance slot only after the current slot's animation is done.
+            if self.row1_animation_done() {
+                let current = self.row1_slot.unwrap_or(0);
+                let next = (current + 1) % num_items;
+                self.row1_slot = Some(next);
+                self.row1_scroll_state = None;
+                self.row1_last_rendered = None;
+            } else if self.row1_slot.is_none() {
+                self.row1_slot = Some(0);
+            }
+            let slot = self.row1_slot.unwrap_or(0).min(num_items - 1);
             let mut slot_idx = 0;
 
             if slot == slot_idx {
@@ -133,24 +146,13 @@ where
             slot_idx += 1;
 
             if slot == slot_idx {
-                self.lcd.set_cursor_xy((0, 1), &mut self.delay).await.ok();
                 let current_f = celcius_to_fahrenheit(status.current_temperature_c());
-                let s = alloc::format!("{:.0}", current_f);
-                let mut len = s.len() + 2;
-                self.lcd.write_str(&s, &mut self.delay).await.ok();
-                self.lcd.write_byte(0xDF, &mut self.delay).await.ok();
-                self.lcd.write_str("F", &mut self.delay).await.ok();
+                let mut row1 = alloc::format!("{:.0}F", current_f);
                 if let Some(target_c) = status.target_temperature_c {
                     let target_f = celcius_to_fahrenheit(target_c);
-                    let t = alloc::format!(">{:.0}", target_f);
-                    len += t.len() + 2;
-                    self.lcd.write_str(&t, &mut self.delay).await.ok();
-                    self.lcd.write_byte(0xDF, &mut self.delay).await.ok();
-                    self.lcd.write_str("F", &mut self.delay).await.ok();
+                    row1.push_str(&alloc::format!(">{:.0}F", target_f));
                 }
-                for _ in len..LCD_WIDTH {
-                    self.lcd.write_byte(b' ', &mut self.delay).await.ok();
-                }
+                self.write_row(1, &row1, tick).await;
             }
             slot_idx += 1;
 
@@ -174,24 +176,13 @@ where
                     };
                     self.write_row(1, &row1, tick).await;
                 } else if let Some(probe_c) = status.probe_temperature_c {
-                    self.lcd.set_cursor_xy((0, 1), &mut self.delay).await.ok();
                     let probe_f = celcius_to_fahrenheit(probe_c);
-                    let s = alloc::format!("P:{:.0}", probe_f);
-                    let mut len = s.len() + 2;
-                    self.lcd.write_str(&s, &mut self.delay).await.ok();
-                    self.lcd.write_byte(0xDF, &mut self.delay).await.ok();
-                    self.lcd.write_str("F", &mut self.delay).await.ok();
+                    let mut row1 = alloc::format!("P:{:.0}F", probe_f);
                     if let Some(target_c) = current_stage.and_then(|st| st.probe_target_c) {
                         let target_f = celcius_to_fahrenheit(target_c);
-                        let t = alloc::format!(">{:.0}", target_f);
-                        len += t.len() + 2;
-                        self.lcd.write_str(&t, &mut self.delay).await.ok();
-                        self.lcd.write_byte(0xDF, &mut self.delay).await.ok();
-                        self.lcd.write_str("F", &mut self.delay).await.ok();
+                        row1.push_str(&alloc::format!(">{:.0}F", target_f));
                     }
-                    for _ in len..LCD_WIDTH {
-                        self.lcd.write_byte(b' ', &mut self.delay).await.ok();
-                    }
+                    self.write_row(1, &row1, tick).await;
                 }
             }
         } else if is_cooking {
@@ -264,6 +255,8 @@ where
                 offset: 0,
                 last_step_at: now,
                 pause_until: now + Duration::from_millis(END_PAUSE_MS),
+                shown_at: now,
+                cycle_complete: false,
             });
         }
 
@@ -278,6 +271,8 @@ where
                     offset: 0,
                     last_step_at: now,
                     pause_until: now,
+                    shown_at: now,
+                    cycle_complete: false,
                 },
                 now,
             )
@@ -317,6 +312,9 @@ where
             state.offset = 0;
             state.last_step_at = now;
             state.pause_until = now;
+            if now.duration_since(state.shown_at).as_millis() >= MIN_SLOT_HOLD_MS {
+                state.cycle_complete = true;
+            }
             return (text.into(), true);
         }
 
@@ -335,6 +333,8 @@ where
                     state.offset = overflow;
                     // Pause at the right edge before wrapping to the start.
                     state.pause_until = now + Duration::from_millis(END_PAUSE_MS);
+                    // Signal done; slot advancement waits for pause_until to elapse.
+                    state.cycle_complete = true;
                 }
             } else {
                 state.offset = 0;
