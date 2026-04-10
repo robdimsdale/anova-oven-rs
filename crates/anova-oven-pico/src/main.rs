@@ -51,6 +51,33 @@ const INACTIVITY_TIMEOUT_SECS: u64 = 5;
 const LED_DIM_TIMER_SECS: u64 = 5;
 const COOK_POLL_INTERVAL: u64 = 10;
 
+struct AppState {
+    tick: u64,
+    ui_state: UIState,
+    last_input_at: Option<Instant>,
+    baseline_reentered_at: Option<Instant>,
+    backlight_dimmed: bool,
+    current_cook: Option<anova_oven_api::CurrentCook>,
+    latest_status: Option<anova_oven_api::OvenStatus>,
+}
+
+impl AppState {
+    fn new(
+        current_cook: Option<anova_oven_api::CurrentCook>,
+        latest_status: Option<anova_oven_api::OvenStatus>,
+    ) -> Self {
+        Self {
+            tick: 0,
+            ui_state: UIState::ShowStatus,
+            last_input_at: None,
+            baseline_reentered_at: Some(Instant::now()),
+            backlight_dimmed: true,
+            current_cook,
+            latest_status,
+        }
+    }
+}
+
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO0>;
     DMA_IRQ_0 => embassy_rp::dma::InterruptHandler<DMA_CH0>;
@@ -172,6 +199,129 @@ async fn fetch_initial_data(
     (recipes, current_cook, latest_status)
 }
 
+fn update_inactivity_timeout(app: &mut AppState) {
+    if let Some(t) = app.last_input_at {
+        if t.elapsed() >= Duration::from_secs(INACTIVITY_TIMEOUT_SECS) {
+            if !matches!(app.ui_state, UIState::ShowStatus) {
+                info!("Inactivity timeout: reverting to ShowStatus");
+                app.ui_state = UIState::ShowStatus;
+                app.baseline_reentered_at = Some(Instant::now());
+            }
+            app.last_input_at = None;
+        }
+    }
+}
+
+fn handle_user_activity(
+    app: &mut AppState,
+    event: crate::events::InputEvent,
+    recipes: &[anova_oven_api::Recipe],
+    pwm_red_green: &mut Pwm<'_>,
+    pwm_blue: &mut Pwm<'_>,
+) {
+    app.last_input_at = Some(Instant::now());
+    app.baseline_reentered_at = None;
+
+    if app.backlight_dimmed {
+        set_backlight_rgb(
+            pwm_red_green,
+            pwm_blue,
+            BACKLIGHT_FULL_LEVEL,
+            BACKLIGHT_FULL_LEVEL,
+            BACKLIGHT_FULL_LEVEL,
+        );
+        app.backlight_dimmed = false;
+        info!("Backlight: 100% (input activity)");
+    }
+
+    handle_input_event(event, &mut app.ui_state, recipes);
+}
+
+async fn poll_status_if_due(app: &mut AppState, stack: embassy_net::Stack<'static>) {
+    if app.tick % COOK_POLL_INTERVAL == 0 {
+        #[allow(static_mut_refs)]
+        let rx_buf = unsafe { &mut HTTP_RX_BUF };
+        app.current_cook = fetch_current_cook(stack, rx_buf).await;
+    }
+
+    #[allow(static_mut_refs)]
+    let rx_buf = unsafe { &mut HTTP_RX_BUF };
+    if let Some(status) = fetch_and_log_status(stack, rx_buf).await {
+        if status.mode == "idle" && app.current_cook.is_some() {
+            app.current_cook = None;
+        }
+        app.latest_status = Some(status);
+    }
+
+    app.tick += 1;
+}
+
+fn apply_backlight_policy(app: &mut AppState, pwm_red_green: &mut Pwm<'_>, pwm_blue: &mut Pwm<'_>) {
+    let active_cook = is_active_cook(
+        app.current_cook.is_some(),
+        app.latest_status
+            .as_ref()
+            .map(|status| status.mode.as_str()),
+    );
+    let baseline_elapsed_secs = app.baseline_reentered_at.map(|t| t.elapsed().as_secs());
+    let should_dim = should_dim_backlight(
+        matches!(app.ui_state, UIState::ShowStatus),
+        baseline_elapsed_secs,
+        active_cook,
+        LED_DIM_TIMER_SECS,
+    );
+
+    if should_dim && !app.backlight_dimmed {
+        set_backlight_rgb(
+            pwm_red_green,
+            pwm_blue,
+            BACKLIGHT_DIM_LEVEL,
+            BACKLIGHT_DIM_LEVEL,
+            BACKLIGHT_DIM_LEVEL,
+        );
+        app.backlight_dimmed = true;
+        info!("Backlight: dim (idle baseline)");
+    } else if (active_cook || !matches!(app.ui_state, UIState::ShowStatus)) && app.backlight_dimmed
+    {
+        set_backlight_rgb(
+            pwm_red_green,
+            pwm_blue,
+            BACKLIGHT_FULL_LEVEL,
+            BACKLIGHT_FULL_LEVEL,
+            BACKLIGHT_FULL_LEVEL,
+        );
+        app.backlight_dimmed = false;
+        info!("Backlight: full (active state)");
+    }
+}
+
+async fn render_current_view(
+    app: &AppState,
+    lcd: &mut HD44780<
+        impl hd44780_driver::non_blocking::bus::DataBus,
+        impl hd44780_driver::memory_map::DisplayMemoryMap,
+        impl hd44780_driver::charset::CharsetWithFallback,
+    >,
+    delay: &mut Delay,
+    recipes: &[anova_oven_api::Recipe],
+) {
+    match &app.ui_state {
+        UIState::ShowStatus => {
+            render_status_display(
+                lcd,
+                delay,
+                app.tick,
+                app.latest_status.as_ref(),
+                app.current_cook.as_ref(),
+            )
+            .await;
+        }
+        UIState::BrowseRecipes { index } => {
+            render_recipe_browser(lcd, delay, recipes, *index).await;
+        }
+    }
+}
+
 #[embassy_executor::task]
 async fn cyw43_task(
     runner: cyw43::Runner<'static, cyw43::SpiBus<Output<'static>, PioSpi<'static, PIO0, 0>>>,
@@ -190,7 +340,7 @@ async fn main(spawner: Spawner) {
 
     let p = embassy_rp::init(Default::default());
     let mut delay = Delay;
-    
+
     let mut lcd = match HD44780::new(
         DisplayOptions4Bit::new(MemoryMap1602::new()).with_pins(FourBitBusPins {
             rs: Output::new(p.PIN_17, Level::Low),
@@ -268,15 +418,10 @@ async fn main(spawner: Spawner) {
 
     spawn_input_tasks(&spawner, stack, p.PIN_15, p.PIN_11, p.PIN_9, p.PIN_10);
 
-    let (recipes, mut current_cook, mut latest_status) = fetch_initial_data(stack).await;
-
-    let mut tick: u64 = 0;
-    let mut ui_state = UIState::ShowStatus;
-    let mut last_input_at: Option<Instant> = None;
-    let mut baseline_reentered_at: Option<Instant> = Some(Instant::now());
+    let (recipes, current_cook, latest_status) = fetch_initial_data(stack).await;
+    let mut app = AppState::new(current_cook, latest_status);
 
     info!("Init complete, dimming backlight and entering main loop");
-    let mut backlight_dimmed = true;
     set_backlight_rgb(
         &mut pwm_red_green,
         &mut pwm_blue,
@@ -288,25 +433,15 @@ async fn main(spawner: Spawner) {
     render_status_display(
         &mut lcd,
         &mut delay,
-        tick,
-        latest_status.as_ref(),
-        current_cook.as_ref(),
+        app.tick,
+        app.latest_status.as_ref(),
+        app.current_cook.as_ref(),
     )
     .await;
 
     loop {
-        debug!("--- Main loop tick {} ---", tick);
-
-        if let Some(t) = last_input_at {
-            if t.elapsed() >= Duration::from_secs(INACTIVITY_TIMEOUT_SECS) {
-                if !matches!(ui_state, UIState::ShowStatus) {
-                    info!("Inactivity timeout: reverting to ShowStatus");
-                    ui_state = UIState::ShowStatus;
-                    baseline_reentered_at = Some(Instant::now());
-                }
-                last_input_at = None;
-            }
-        }
+        debug!("--- Main loop tick {} ---", app.tick);
+        update_inactivity_timeout(&mut app);
 
         let poll_timer = Timer::after(Duration::from_secs(POLL_INTERVAL_SECS));
         let event_recv = EVENT_CHANNEL.receive();
@@ -314,91 +449,15 @@ async fn main(spawner: Spawner) {
         let do_poll = match embassy_futures::select::select(poll_timer, event_recv).await {
             embassy_futures::select::Either::First(()) => true,
             embassy_futures::select::Either::Second(event) => {
-                last_input_at = Some(Instant::now());
-                baseline_reentered_at = None;
-                if backlight_dimmed {
-                    set_backlight_rgb(
-                        &mut pwm_red_green,
-                        &mut pwm_blue,
-                        BACKLIGHT_FULL_LEVEL,
-                        BACKLIGHT_FULL_LEVEL,
-                        BACKLIGHT_FULL_LEVEL,
-                    );
-                    backlight_dimmed = false;
-                    info!("Backlight: 100% (input activity)");
-                }
-                handle_input_event(event, &mut ui_state, &recipes);
+                handle_user_activity(&mut app, event, &recipes, &mut pwm_red_green, &mut pwm_blue);
                 false
             }
         };
 
         if do_poll {
-            if tick % COOK_POLL_INTERVAL == 0 {
-                #[allow(static_mut_refs)]
-                let rx_buf = unsafe { &mut HTTP_RX_BUF };
-                current_cook = fetch_current_cook(stack, rx_buf).await;
-            }
-
-            #[allow(static_mut_refs)]
-            let rx_buf = unsafe { &mut HTTP_RX_BUF };
-            if let Some(status) = fetch_and_log_status(stack, rx_buf).await {
-                if status.mode == "idle" && current_cook.is_some() {
-                    current_cook = None;
-                }
-                latest_status = Some(status);
-            }
-
-            tick += 1;
+            poll_status_if_due(&mut app, stack).await;
         }
-
-        let active_cook = is_active_cook(
-            current_cook.is_some(),
-            latest_status.as_ref().map(|status| status.mode.as_str()),
-        );
-        let baseline_elapsed_secs = baseline_reentered_at.map(|t| t.elapsed().as_secs());
-        let should_dim = should_dim_backlight(
-            matches!(ui_state, UIState::ShowStatus),
-            baseline_elapsed_secs,
-            active_cook,
-            LED_DIM_TIMER_SECS,
-        );
-
-        if should_dim && !backlight_dimmed {
-            set_backlight_rgb(
-                &mut pwm_red_green,
-                &mut pwm_blue,
-                BACKLIGHT_DIM_LEVEL,
-                BACKLIGHT_DIM_LEVEL,
-                BACKLIGHT_DIM_LEVEL,
-            );
-            backlight_dimmed = true;
-            info!("Backlight: dim (idle baseline)");
-        } else if (active_cook || !matches!(ui_state, UIState::ShowStatus)) && backlight_dimmed {
-            set_backlight_rgb(
-                &mut pwm_red_green,
-                &mut pwm_blue,
-                BACKLIGHT_FULL_LEVEL,
-                BACKLIGHT_FULL_LEVEL,
-                BACKLIGHT_FULL_LEVEL,
-            );
-            backlight_dimmed = false;
-            info!("Backlight: full (active state)");
-        }
-
-        match &ui_state {
-            UIState::ShowStatus => {
-                render_status_display(
-                    &mut lcd,
-                    &mut delay,
-                    tick,
-                    latest_status.as_ref(),
-                    current_cook.as_ref(),
-                )
-                .await;
-            }
-            UIState::BrowseRecipes { index } => {
-                render_recipe_browser(&mut lcd, &mut delay, &recipes, *index).await;
-            }
-        }
+        apply_backlight_policy(&mut app, &mut pwm_red_green, &mut pwm_blue);
+        render_current_view(&app, &mut lcd, &mut delay, &recipes).await;
     }
 }
