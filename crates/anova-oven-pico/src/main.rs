@@ -181,8 +181,19 @@ async fn main(spawner: Spawner) {
     let rx_buf = unsafe { &mut HTTP_RX_BUF };
     fetch_and_log_recipes(stack, rx_buf).await;
 
-    // Poll status on a timer.
+    // Poll status every tick, current-cook every COOK_POLL_INTERVAL ticks.
+    const COOK_POLL_INTERVAL: u64 = 10;
+    let mut tick: u64 = 0;
+    let mut current_cook: Option<anova_oven_api::CurrentCook> = None;
+
     loop {
+        // Poll current cook periodically.
+        if tick % COOK_POLL_INTERVAL == 0 {
+            #[allow(static_mut_refs)]
+            let rx_buf = unsafe { &mut HTTP_RX_BUF };
+            current_cook = fetch_current_cook(stack, rx_buf).await;
+        }
+
         #[allow(static_mut_refs)]
         let rx_buf = unsafe { &mut HTTP_RX_BUF };
         match fetch_and_log_status(stack, rx_buf).await {
@@ -205,9 +216,23 @@ async fn main(spawner: Spawner) {
                     lcd.write_byte(b' ', &mut delay).await.ok();
                 }
 
-                // Row 1: mode + optional steam target, padded to 16 chars.
+                // Row 1: if cook active, show recipe name; otherwise mode + steam.
                 lcd.set_cursor_xy((0, 1), &mut delay).await.ok();
-                let row1 = if let Some(steam) = status.steam_target_pct {
+                let row1 = if let Some(ref cook) = current_cook {
+                    if status.mode == "idle" {
+                        // Oven says idle but Firestore hasn't caught up yet —
+                        // show standard idle display.
+                        status.mode.clone()
+                    } else {
+                        // Truncate recipe title to 16 chars for the LCD.
+                        let title = &cook.recipe_title;
+                        if title.len() > 16 {
+                            alloc::format!("{}", &title[..16])
+                        } else {
+                            title.clone()
+                        }
+                    }
+                } else if let Some(steam) = status.steam_target_pct {
                     alloc::format!("{} S:{:.0}%", status.mode, steam)
                 } else {
                     status.mode.clone()
@@ -225,6 +250,7 @@ async fn main(spawner: Spawner) {
             }
         }
 
+        tick += 1;
         Timer::after(Duration::from_secs(POLL_INTERVAL_SECS)).await;
     }
 }
@@ -289,6 +315,70 @@ async fn fetch_and_log_status(
         }
         Err(_) => {
             warn!("GET /status: failed to parse JSON");
+            None
+        }
+    }
+}
+
+async fn fetch_current_cook(
+    stack: embassy_net::Stack<'static>,
+    rx_buf: &mut [u8],
+) -> Option<anova_oven_api::CurrentCook> {
+    use embassy_net::dns::DnsSocket;
+    use embassy_net::tcp::client::{TcpClient, TcpClientState};
+    use reqwless::client::HttpClient;
+    use reqwless::request::Method;
+
+    let client_state = TcpClientState::<1, 1024, 1024>::new();
+    let tcp = TcpClient::new(stack, &client_state);
+    let dns = DnsSocket::new(stack);
+    let mut client = HttpClient::new(&tcp, &dns);
+
+    let server = normalize_server_url(SERVER_URL);
+    let url = alloc::format!("{server}/current-cook");
+    let mut request = match client.request(Method::GET, &url).await {
+        Ok(r) => r,
+        Err(_) => {
+            warn!("GET /current-cook: connection failed");
+            return None;
+        }
+    };
+
+    let response = match request.send(rx_buf).await {
+        Ok(r) => r,
+        Err(_) => {
+            warn!("GET /current-cook: send failed");
+            return None;
+        }
+    };
+
+    if response.status.0 == 204 {
+        return None; // No active cook.
+    }
+    if response.status.0 != 200 {
+        warn!("GET /current-cook: HTTP {}", response.status.0);
+        return None;
+    }
+
+    let body = match response.body().read_to_end().await {
+        Ok(b) => b,
+        Err(_) => {
+            warn!("GET /current-cook: failed to read body");
+            return None;
+        }
+    };
+
+    match serde_json::from_slice::<anova_oven_api::CurrentCook>(body) {
+        Ok(cook) => {
+            info!(
+                "Current cook: {} ({} stages)",
+                cook.recipe_title.as_str(),
+                cook.total_stage_count,
+            );
+            Some(cook)
+        }
+        Err(_) => {
+            warn!("GET /current-cook: failed to parse JSON");
             None
         }
     }

@@ -10,7 +10,7 @@
 //! anova-oven-cli history
 //! ```
 
-use anova_oven_api::{HistoryEntry, OvenStatus, Recipe};
+use anova_oven_api::{CurrentCook, HistoryEntry, OvenStatus, Recipe};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -32,6 +32,8 @@ enum Command {
     Recipes,
     /// Show recent cook history
     History,
+    /// Show the current in-progress cook
+    CurrentCook,
     /// Stop the current cook
     Stop,
 }
@@ -105,6 +107,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 print_history_entry(entry);
             }
         }
+
+        Command::CurrentCook => {
+            let url = format!("{server}/current-cook");
+            let resp = client.get(&url).send().await?;
+            if resp.status() == reqwest::StatusCode::NO_CONTENT {
+                println!("No active cook.");
+            } else if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(format!("Server returned {status}: {body}").into());
+            } else {
+                let cook: CurrentCook = resp.json().await?;
+                print_current_cook(&cook);
+            }
+        }
     }
 
     Ok(())
@@ -136,18 +153,7 @@ fn print_recipe(r: &Recipe) {
     println!("  ID:     {}", r.id);
     println!("  Stages: {}", r.stage_count);
     for (i, stage) in r.stages.iter().enumerate() {
-        let duration = stage
-            .duration_secs
-            .map(|s| format!(" for {:02}:{:02}", s / 60, s % 60))
-            .unwrap_or_default();
-        println!(
-            "    {}: {} at {:.0}°C{duration}, steam {:.0}%, fan {}%",
-            i + 1,
-            stage.kind,
-            stage.temperature_c,
-            stage.steam_pct,
-            stage.fan_speed,
-        );
+        print_stage(i, stage);
     }
     println!();
 }
@@ -157,4 +163,39 @@ fn print_history_entry(e: &HistoryEntry) {
     println!("  Ended:  {}", e.ended_at);
     println!("  Stages: {}", e.stage_count);
     println!();
+}
+
+fn print_current_cook(c: &CurrentCook) {
+    println!("Recipe:  {}", c.recipe_title);
+    println!("Started: {}", c.started_at);
+    println!(
+        "Stages:  {} cook / {} total",
+        c.cook_stage_count, c.total_stage_count
+    );
+    for (i, stage) in c.stages.iter().enumerate() {
+        print_stage(i, stage);
+    }
+}
+
+fn print_stage(index: usize, stage: &anova_oven_api::Stage) {
+    let duration = stage
+        .duration_secs
+        .map(|s| format!(" for {:02}:{:02}", s / 60, s % 60))
+        .unwrap_or_default();
+    let probe = stage
+        .probe_target_c
+        .map(|c| format!(" probe→{:.0}°C", c))
+        .unwrap_or_default();
+    let mode = stage
+        .temperature_bulbs_mode
+        .as_deref()
+        .unwrap_or("dry");
+    println!(
+        "    {}: {} at {:.0}°C ({mode}){duration}{probe}, steam {:.0}%, fan {}%",
+        index + 1,
+        stage.kind,
+        stage.temperature_c,
+        stage.steam_pct,
+        stage.fan_speed,
+    );
 }

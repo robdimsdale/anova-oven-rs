@@ -391,6 +391,10 @@ fn favorites_query(limit: u32) -> RunQueryRequest {
 }
 
 fn oven_cooks_query(limit: u32) -> RunQueryRequest {
+    oven_cooks_query_by("endedTimestamp", limit)
+}
+
+fn oven_cooks_query_by(order_field: &str, limit: u32) -> RunQueryRequest {
     RunQueryRequest {
         structured_query: StructuredQuery {
             from: vec![CollectionSelector {
@@ -399,7 +403,7 @@ fn oven_cooks_query(limit: u32) -> RunQueryRequest {
             where_: None,
             order_by: vec![Order {
                 field: FieldReference {
-                    field_path: "endedTimestamp".into(),
+                    field_path: order_field.into(),
                 },
                 direction: "DESCENDING",
             }],
@@ -480,8 +484,7 @@ pub async fn fetch_recipes(
             eprintln!("[recipes] Failed to fetch bookmarks: {e}");
             Vec::new()
         });
-    let own_ids: std::collections::HashSet<String> =
-        recipes.iter().map(|r| r.id.clone()).collect();
+    let own_ids: std::collections::HashSet<String> = recipes.iter().map(|r| r.id.clone()).collect();
     for recipe in bookmarked {
         if !own_ids.contains(&recipe.id) {
             recipes.push(recipe);
@@ -530,12 +533,7 @@ async fn fetch_bookmarked_recipes(
     let mut recipes = Vec::new();
     for id in &recipe_ids {
         let url = get_document_url(&format!("oven-recipes/{id}"));
-        let Ok(resp) = client
-            .get(&url)
-            .bearer_auth(&session.id_token)
-            .send()
-            .await
-        else {
+        let Ok(resp) = client.get(&url).bearer_auth(&session.id_token).send().await else {
             continue;
         };
         if !resp.status().is_success() {
@@ -662,12 +660,7 @@ async fn fetch_recipe_titles(
     let mut map = HashMap::new();
     for id in ids {
         let url = get_document_url(&format!("oven-recipes/{id}"));
-        let Ok(resp) = client
-            .get(&url)
-            .bearer_auth(&session.id_token)
-            .send()
-            .await
-        else {
+        let Ok(resp) = client.get(&url).bearer_auth(&session.id_token).send().await else {
             continue;
         };
         if !resp.status().is_success() {
@@ -686,6 +679,100 @@ async fn fetch_recipe_titles(
     map
 }
 
+/// Fetch the most recent in-progress cook from Firestore, if any.
+///
+/// Queries `oven-cooks` ordered by `createdTimestamp DESC` to find documents
+/// that lack `endedTimestamp` (indicating an in-progress cook). Resolves the
+/// recipe title from the `recipeRef` field if present.
+pub async fn fetch_current_cook(
+    client: &reqwest::Client,
+    session: &FirebaseSession,
+) -> Result<Option<anova_oven_api::CurrentCook>, Box<dyn std::error::Error + Send + Sync>> {
+    let parent_path = format!("users/{}", session.uid);
+    let url = run_query_url(&parent_path);
+
+    // Order by createdTimestamp to include in-progress cooks (which lack
+    // endedTimestamp and would be excluded by orderBy endedTimestamp).
+    let query = oven_cooks_query_by("createdTimestamp", 5);
+    let resp = client
+        .post(&url)
+        .bearer_auth(&session.id_token)
+        .json(&query)
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(
+            format!("Firestore runQuery (current-cook) failed ({status}): {body}").into(),
+        );
+    }
+
+    let items: Vec<RunQueryItem> = resp.json().await?;
+
+    // Look for a document that lacks endedTimestamp, indicating in-progress.
+    for item in &items {
+        let Some(doc) = &item.document else { continue };
+        let json = doc.to_json();
+        let has_ended = json
+            .get("endedTimestamp")
+            .map(|v| !v.is_null())
+            .unwrap_or(false);
+        if has_ended {
+            continue;
+        }
+
+        // Found an in-progress cook — build structured response.
+        let started_at = json
+            .get("createdTimestamp")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let recipe_id = json
+            .get("recipeRef")
+            .and_then(|v| v.as_str())
+            .and_then(|r| r.rsplit('/').next())
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+
+        // Resolve recipe title.
+        let recipe_title = if let Some(ref id) = recipe_id {
+            let titles = fetch_recipe_titles(client, session, &[id.clone()]).await;
+            titles
+                .get(id)
+                .cloned()
+                .unwrap_or_else(|| "[custom]".into())
+        } else {
+            "[custom]".into()
+        };
+
+        let raw_stages: Vec<JsonValue> = json
+            .get("stages")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        let stages: Vec<anova_oven_api::Stage> =
+            raw_stages.iter().map(|s| stage_from_json(s)).collect();
+
+        let cook_stage_count = stages.iter().filter(|s| s.kind == "cook").count();
+        let total_stage_count = stages.len();
+
+        return Ok(Some(anova_oven_api::CurrentCook {
+            recipe_title,
+            recipe_id,
+            started_at,
+            stages,
+            cook_stage_count,
+            total_stage_count,
+        }));
+    }
+
+    Ok(None)
+}
+
 /// Convert a raw Firestore stage JSON object into [`anova_oven_api::Stage`].
 fn stage_from_json(s: &JsonValue) -> anova_oven_api::Stage {
     let kind = s
@@ -693,6 +780,12 @@ fn stage_from_json(s: &JsonValue) -> anova_oven_api::Stage {
         .and_then(|v| v.as_str())
         .unwrap_or("cook")
         .to_string();
+
+    let temperature_bulbs_mode = s
+        .get("temperatureBulbs")
+        .and_then(|tb| tb.get("mode"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
 
     let temperature_c = s
         .get("temperatureBulbs")
@@ -707,19 +800,28 @@ fn stage_from_json(s: &JsonValue) -> anova_oven_api::Stage {
         .and_then(|t| t.get("initial"))
         .and_then(|t| t.as_u64());
 
+    let timer_added = s
+        .get("timerAdded")
+        .and_then(|v| v.as_bool());
+
+    let probe_added = s
+        .get("probeAdded")
+        .and_then(|v| v.as_bool());
+
+    let probe_target_c = s
+        .get("temperatureProbe")
+        .and_then(|tp| tp.get("setpoint"))
+        .and_then(|sp| sp.get("celsius"))
+        .and_then(|v| v.as_f64())
+        .map(|v| v as f32);
+
     let steam_pct = s
         .get("steamGenerators")
         .and_then(|sg| {
             let mode = sg.get("mode")?.as_str()?;
             match mode {
-                "steam-percentage" => sg
-                    .get("steamPercentage")?
-                    .get("setpoint")?
-                    .as_f64(),
-                "relative-humidity" => sg
-                    .get("relativeHumidity")?
-                    .get("setpoint")?
-                    .as_f64(),
+                "steam-percentage" => sg.get("steamPercentage")?.get("setpoint")?.as_f64(),
+                "relative-humidity" => sg.get("relativeHumidity")?.get("setpoint")?.as_f64(),
                 _ => None,
             }
         })
@@ -731,11 +833,60 @@ fn stage_from_json(s: &JsonValue) -> anova_oven_api::Stage {
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as u8;
 
+    let user_action_required = s
+        .get("userActionRequired")
+        .and_then(|v| v.as_bool());
+
+    let rack_position = s
+        .get("rackPosition")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u8);
+
+    let heating_element_top = s
+        .get("heatingElements")
+        .and_then(|he| he.get("top"))
+        .and_then(|t| t.get("on"))
+        .and_then(|v| v.as_bool());
+
+    let heating_element_rear = s
+        .get("heatingElements")
+        .and_then(|he| he.get("rear"))
+        .and_then(|r| r.get("on"))
+        .and_then(|v| v.as_bool());
+
+    let heating_element_bottom = s
+        .get("heatingElements")
+        .and_then(|he| he.get("bottom"))
+        .and_then(|b| b.get("on"))
+        .and_then(|v| v.as_bool());
+
+    let vent_open = s
+        .get("vent")
+        .and_then(|v| v.get("open"))
+        .and_then(|v| v.as_bool());
+
+    let title = s
+        .get("title")
+        .and_then(|v| v.as_str())
+        .filter(|t| !t.is_empty())
+        .map(String::from);
+
     anova_oven_api::Stage {
         kind,
         temperature_c,
+        temperature_bulbs_mode,
         duration_secs,
+        timer_added,
+        probe_added,
+        probe_target_c,
         steam_pct,
         fan_speed,
+        user_action_required,
+        rack_position,
+        heating_element_top,
+        heating_element_rear,
+        heating_element_bottom,
+        vent_open,
+        title,
     }
 }
