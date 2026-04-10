@@ -1,5 +1,44 @@
 use embassy_rp::pwm::{Config as PwmConfig, Pwm};
 
+const DEFAULT_FULL_LEVEL: u8 = 255;
+const DEFAULT_DIM_LEVEL: u8 = 64;
+
+pub(crate) struct BacklightController {
+    pwm_red_green: Pwm<'static>,
+    pwm_blue: Pwm<'static>,
+    full_level: u8,
+    dim_level: u8,
+}
+
+impl BacklightController {
+    pub(crate) fn new(pwm_red_green: Pwm<'static>, pwm_blue: Pwm<'static>) -> Self {
+        Self {
+            pwm_red_green,
+            pwm_blue,
+            full_level: DEFAULT_FULL_LEVEL,
+            dim_level: DEFAULT_DIM_LEVEL,
+        }
+    }
+
+    pub(crate) fn set_full(&mut self) {
+        self.set_gray(self.full_level);
+    }
+
+    pub(crate) fn set_dim(&mut self) {
+        self.set_gray(self.dim_level);
+    }
+
+    fn set_gray(&mut self, level: u8) {
+        set_backlight_rgb(
+            &mut self.pwm_red_green,
+            &mut self.pwm_blue,
+            level,
+            level,
+            level,
+        );
+    }
+}
+
 pub fn set_backlight_rgb(pwm_red_green: &mut Pwm<'_>, pwm_blue: &mut Pwm<'_>, r: u8, g: u8, b: u8) {
     let top = 0x8000u16;
 
