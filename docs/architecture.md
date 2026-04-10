@@ -27,22 +27,22 @@ Target capabilities:
 │  ├── persistent WebSocket → devices.anovaculinary.io │
 │  │     (TLS 1.2 via tokio-websockets + native-tls)   │
 │  └── Firestore client (reqwest) → Firebase           │
-└──────────┬───────────────────────────────────────────┘
-           │ plain HTTP, local network (no TLS)
-  ┌────────┴────────┐         ┌─────────────────────┐
-  │  anova-oven-    │         │  anova-oven-cli      │
-  │  pico           │         │                      │
-  │                 │         │  Desktop binary.     │
-  │  Pico W target. │         │  Prototypes the      │
-  │  Connects to    │         │  embedded UI/UX      │
-  │  server over    │         │  against the same    │
-  │  plain HTTP     │         │  server API.         │
-  │  (embassy-net,  │         │  Uses the same       │
-  │  no TLS).       │         │  anova-oven-api      │
-  │  Uses defmt to  │         │  types.              │
-  │  log state.     │         │                      │
+└───────┬────────────────────────────────────┬─────────┘
+        │ plain HTTP, local network (no TLS) │
+  ┌─────┴───────────┐         ┌──────────────┴──────┐
+  │  anova-oven-    │         │  anova-oven-cli     │
+  │  pico           │         │                     │
+  │                 │         │  Desktop binary.    │
+  │  Pico W target. │         │  Prototypes the     │
+  │  Connects to    │         │  embedded UI/UX     │
+  │  server over    │         │  against the same   │
+  │  plain HTTP     │         │  server API.        │
+  │  (embassy-net,  │         │  Uses the same      │
+  │  no TLS).       │         │  anova-oven-api     │
+  │  Uses defmt to  │         │  types.             │
+  │  log state.     │         │                     │
   └─────────────────┘         └─────────────────────┘
-           │                           │
+           │     crate dependency      │
            └──────────┬────────────────┘
                       │
            ┌──────────▼──────────┐

@@ -372,6 +372,24 @@ fn user_recipes_query(uid: &str, limit: u32) -> RunQueryRequest {
     }
 }
 
+fn favorites_query(limit: u32) -> RunQueryRequest {
+    RunQueryRequest {
+        structured_query: StructuredQuery {
+            from: vec![CollectionSelector {
+                collection_id: "favorite-oven-recipes".into(),
+            }],
+            where_: None,
+            order_by: vec![Order {
+                field: FieldReference {
+                    field_path: "addedTimestamp".into(),
+                },
+                direction: "DESCENDING",
+            }],
+            limit: Some(limit),
+        },
+    }
+}
+
 fn oven_cooks_query(limit: u32) -> RunQueryRequest {
     RunQueryRequest {
         structured_query: StructuredQuery {
@@ -392,7 +410,44 @@ fn oven_cooks_query(limit: u32) -> RunQueryRequest {
 
 // ─── High-level fetch functions ────────────────────────────────────────────────
 
+fn parse_recipe_doc(doc: Document) -> anova_oven_api::Recipe {
+    let id = doc.id().to_string();
+    let json = doc.to_json();
+
+    let title = json
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let steps: Vec<JsonValue> = json
+        .get("steps")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let stages: Vec<anova_oven_api::Stage> = steps
+        .iter()
+        .filter(|s| {
+            s.get("stepType")
+                .and_then(|v| v.as_str())
+                .map(|t| t == "stage")
+                .unwrap_or(false)
+        })
+        .map(|s| stage_from_json(s))
+        .collect();
+    let stage_count = stages.len();
+
+    anova_oven_api::Recipe {
+        id,
+        title,
+        stage_count,
+        stages,
+    }
+}
+
 /// Fetch user's non-draft recipes from Firestore, converted to [`anova_oven_api::Recipe`].
+/// Also fetches bookmarked recipes and merges them into a single deduplicated list.
 pub async fn fetch_recipes(
     client: &reqwest::Client,
     session: &FirebaseSession,
@@ -412,44 +467,84 @@ pub async fn fetch_recipes(
     }
     let items: Vec<RunQueryItem> = resp.json().await?;
 
-    let mut recipes = Vec::new();
-    for item in items {
-        let Some(doc) = item.document else { continue };
-        let id = doc.id().to_string();
-        let json = doc.to_json();
+    let mut recipes: Vec<anova_oven_api::Recipe> = items
+        .into_iter()
+        .filter_map(|item| item.document)
+        .map(parse_recipe_doc)
+        .collect();
 
-        let title = json
-            .get("title")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        let steps: Vec<JsonValue> = json
-            .get("steps")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-
-        let cook_stages: Vec<&JsonValue> = steps
-            .iter()
-            .filter(|s| {
-                s.get("stepType")
-                    .and_then(|v| v.as_str())
-                    .map(|t| t == "stage")
-                    .unwrap_or(false)
-            })
-            .collect();
-
-        let stages: Vec<anova_oven_api::Stage> =
-            cook_stages.iter().map(|s| stage_from_json(s)).collect();
-        let stage_count = stages.len();
-
-        recipes.push(anova_oven_api::Recipe {
-            id,
-            title,
-            stage_count,
-            stages,
+    // Merge in bookmarked recipes, skipping any already present by ID.
+    let bookmarked = fetch_bookmarked_recipes(client, session)
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("[recipes] Failed to fetch bookmarks: {e}");
+            Vec::new()
         });
+    let own_ids: std::collections::HashSet<String> =
+        recipes.iter().map(|r| r.id.clone()).collect();
+    for recipe in bookmarked {
+        if !own_ids.contains(&recipe.id) {
+            recipes.push(recipe);
+        }
+    }
+
+    Ok(recipes)
+}
+
+/// Fetch bookmarked recipes for the user from `users/{uid}/favorite-oven-recipes`.
+async fn fetch_bookmarked_recipes(
+    client: &reqwest::Client,
+    session: &FirebaseSession,
+) -> Result<Vec<anova_oven_api::Recipe>, Box<dyn std::error::Error + Send + Sync>> {
+    let query = favorites_query(100);
+    let parent_path = format!("users/{}", session.uid);
+    let url = run_query_url(&parent_path);
+    let resp = client
+        .post(&url)
+        .bearer_auth(&session.id_token)
+        .json(&query)
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Firestore runQuery (bookmarks) failed ({status}): {body}").into());
+    }
+    let items: Vec<RunQueryItem> = resp.json().await?;
+
+    // Extract recipe IDs from recipeRef fields.
+    let recipe_ids: Vec<String> = items
+        .into_iter()
+        .filter_map(|item| item.document)
+        .filter_map(|doc| {
+            let json = doc.to_json();
+            json.get("recipeRef")
+                .and_then(|v| v.as_str())
+                .and_then(|r| r.rsplit('/').next())
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+        })
+        .collect();
+
+    // Fetch each referenced recipe document individually.
+    let mut recipes = Vec::new();
+    for id in &recipe_ids {
+        let url = get_document_url(&format!("oven-recipes/{id}"));
+        let Ok(resp) = client
+            .get(&url)
+            .bearer_auth(&session.id_token)
+            .send()
+            .await
+        else {
+            continue;
+        };
+        if !resp.status().is_success() {
+            continue;
+        }
+        let Ok(doc): Result<Document, _> = resp.json().await else {
+            continue;
+        };
+        recipes.push(parse_recipe_doc(doc));
     }
 
     Ok(recipes)
