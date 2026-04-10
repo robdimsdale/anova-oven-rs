@@ -3,6 +3,7 @@ use defmt::info;
 use embassy_rp::gpio::Input;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
+use embassy_time::Instant;
 use embassy_time::{Duration, Timer};
 
 #[derive(Clone, Copy, defmt::Format)]
@@ -16,6 +17,7 @@ pub enum InputEvent {
 pub enum UIState {
     ShowStatus,
     BrowseRecipes { index: usize },
+    ConfirmStopCooking { last_input_at: Instant },
 }
 
 pub static EVENT_CHANNEL: Channel<CriticalSectionRawMutex, InputEvent, 4> = Channel::new();
@@ -45,6 +47,8 @@ pub async fn rot_enc_button_task(mut button: Input<'static>) -> ! {
 #[embassy_executor::task]
 pub async fn rotary_encoder_task(mut pin_a: Input<'static>, mut pin_b: Input<'static>) -> ! {
     const QEM: [i8; 16] = [0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0];
+    // This encoder produces a full 4-transition quadrature cycle per tactile detent.
+    const TRANSITIONS_PER_DETENT: i8 = 4;
 
     let mut prev = ((pin_a.is_low() as u8) << 1) | (pin_b.is_low() as u8);
     let mut accum: i8 = 0;
@@ -56,13 +60,23 @@ pub async fn rotary_encoder_task(mut pin_a: Input<'static>, mut pin_b: Input<'st
         let curr = ((pin_a.is_low() as u8) << 1) | (pin_b.is_low() as u8);
         let dir = QEM[((prev << 2) | curr) as usize];
         prev = curr;
+
+        if dir == 0 {
+            continue;
+        }
+
+        // Avoid carrying stale half-steps across a direction reversal.
+        if (accum > 0 && dir < 0) || (accum < 0 && dir > 0) {
+            accum = 0;
+        }
+
         accum += dir;
 
-        if accum >= 4 {
+        if accum >= TRANSITIONS_PER_DETENT {
             info!("Rotary encoder: CW");
             EVENT_CHANNEL.send(InputEvent::EncoderCW).await;
             accum = 0;
-        } else if accum <= -4 {
+        } else if accum <= -TRANSITIONS_PER_DETENT {
             info!("Rotary encoder: CCW");
             EVENT_CHANNEL.send(InputEvent::EncoderCCW).await;
             accum = 0;
@@ -83,6 +97,9 @@ pub fn handle_input_event(event: InputEvent, ui_state: &mut UIState, recipes: &[
                 UIState::BrowseRecipes { index } => {
                     *index = (*index + 1) % recipes.len();
                 }
+                UIState::ConfirmStopCooking { .. } => {
+                    // Caller owns confirm-stop transition logic.
+                }
             }
         }
         InputEvent::EncoderCCW => {
@@ -97,6 +114,9 @@ pub fn handle_input_event(event: InputEvent, ui_state: &mut UIState, recipes: &[
                 }
                 UIState::BrowseRecipes { index } => {
                     *index = (*index + recipes.len() - 1) % recipes.len();
+                }
+                UIState::ConfirmStopCooking { .. } => {
+                    // Caller owns confirm-stop transition logic.
                 }
             }
         }
