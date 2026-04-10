@@ -191,9 +191,7 @@ fn print_current_cook(c: &CurrentCook, status: Option<&OvenStatus>) {
             println!("Timer:   {}", format_duration(remaining));
         }
         if let Some(probe_c) = s.probe_temperature_c {
-            let probe_target = c
-                .current_stage(s)
-                .and_then(|stage| stage.probe_target_c);
+            let probe_target = c.current_stage(s).and_then(|stage| stage.probe_target_c);
             if let Some(target) = probe_target {
                 println!(
                     "Probe:   {:.0}°F → {:.0}°F",

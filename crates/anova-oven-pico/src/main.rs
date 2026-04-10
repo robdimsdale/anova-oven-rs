@@ -223,33 +223,28 @@ async fn main(spawner: Spawner) {
         let rx_buf = unsafe { &mut HTTP_RX_BUF };
         match fetch_and_log_status(stack, rx_buf).await {
             Some(status) => {
-                let is_cooking = current_cook.is_some() && status.mode != "idle";
+                let is_cooking = current_cook.is_some() && status.is_cooking();
 
                 if is_cooking {
                     let cook = current_cook.as_ref().unwrap();
 
                     // Row 0: recipe name (or "Manual cook")
-                    let name = if cook.recipe_title == "[custom]" {
-                        "Manual cook"
-                    } else {
-                        &cook.recipe_title
-                    };
+                    let name = cook.display_name();
                     lcd_write_row(&mut lcd, &mut delay, 0, name).await;
 
                     // Row 1: rotating display
                     // Determine rotation items: 3 during preheat, 4 during cook
-                    let has_timer_or_probe = status.timer_mode == "running"
+                    let has_timer_or_probe = status.timer_remaining_secs().is_some()
                         || status.probe_temperature_c.is_some();
                     let num_items: u64 = if has_timer_or_probe { 4 } else { 3 };
                     let slot = (tick / ROTATION_PERIOD) % num_items;
 
-                    let stage_kind = infer_stage_kind(&status);
-                    let phase = infer_phase(&status);
+                    let phase = status.phase();
 
                     match slot {
                         0 => {
                             // Stage name
-                            let stage = find_current_stage(cook, stage_kind);
+                            let stage = cook.current_stage(&status);
                             let row1 = match stage.and_then(|s| s.title.as_deref()) {
                                 Some(t) => alloc::string::String::from(t),
                                 None if cook.recipe_title == "[custom]" => {
@@ -264,7 +259,7 @@ async fn main(spawner: Spawner) {
                         1 => {
                             // Current temp → target temp (needs degree symbol)
                             lcd.set_cursor_xy((0, 1), &mut delay).await.ok();
-                            let current_f = celcius_to_fahrenheit(status.temperature_c);
+                            let current_f = celcius_to_fahrenheit(status.current_temperature_c());
                             let s = alloc::format!("{:.0}", current_f);
                             let mut len = s.len() + 2; // °F
                             lcd.write_str(&s, &mut delay).await.ok();
@@ -288,10 +283,7 @@ async fn main(spawner: Spawner) {
                         }
                         3 => {
                             // Timer or probe
-                            if status.timer_mode == "running" && status.timer_total_secs > 0 {
-                                let remaining = status
-                                    .timer_total_secs
-                                    .saturating_sub(status.timer_current_secs);
+                            if let Some(remaining) = status.timer_remaining_secs() {
                                 let h = remaining / 3600;
                                 let m = (remaining % 3600) / 60;
                                 let s = remaining % 60;
@@ -310,7 +302,7 @@ async fn main(spawner: Spawner) {
                                 lcd.write_str(&s, &mut delay).await.ok();
                                 lcd.write_byte(0xDF, &mut delay).await.ok();
                                 lcd.write_str("F", &mut delay).await.ok();
-                                let stage = find_current_stage(cook, stage_kind);
+                                let stage = cook.current_stage(&status);
                                 if let Some(target_c) = stage.and_then(|st| st.probe_target_c) {
                                     let target_f = celcius_to_fahrenheit(target_c);
                                     let t = alloc::format!(">{:.0}", target_f);
@@ -333,7 +325,7 @@ async fn main(spawner: Spawner) {
                     // Row 0: oven temp + optional probe temp.
                     lcd.set_cursor_xy((0, 0), &mut delay).await.ok();
                     let temp_str =
-                        alloc::format!("{:.0}", celcius_to_fahrenheit(status.temperature_c));
+                        alloc::format!("{:.0}", celcius_to_fahrenheit(status.current_temperature_c()));
                     let mut row0_len = temp_str.len() + 2; // ° + F
                     lcd.write_str(&temp_str, &mut delay).await.ok();
                     lcd.write_byte(0xDF, &mut delay).await.ok();
@@ -394,14 +386,6 @@ async fn lcd_write_row<
     }
 }
 
-/// Find the cook stage matching the oven's current mode.
-fn find_current_stage<'a>(
-    cook: &'a anova_oven_api::CurrentCook,
-    oven_mode: &str,
-) -> Option<&'a anova_oven_api::Stage> {
-    cook.stages.iter().find(|s| s.kind == oven_mode)
-}
-
 async fn fetch_and_log_status(
     stack: embassy_net::Stack<'static>,
     rx_buf: &mut [u8],
@@ -452,7 +436,7 @@ async fn fetch_and_log_status(
             info!(
                 "Status: mode={} temp={}F target={}F steam={}% door={} water={}",
                 status.mode.as_str(),
-                celcius_to_fahrenheit(status.temperature_c),
+                celcius_to_fahrenheit(status.current_temperature_c()),
                 celcius_to_fahrenheit(status.target_temperature_c.unwrap_or(0.0)),
                 status.steam_pct,
                 status.door_open,
@@ -630,25 +614,4 @@ async fn fetch_and_log_recipes(
 
 fn celcius_to_fahrenheit(c: f32) -> f32 {
     c * 1.8 + 32.0
-}
-
-/// Infer the human-readable phase label from oven status.
-///
-/// The WebSocket `state.mode` reports `"cook"` for both preheat and cook stages.
-/// During preheat, the timer is idle and hasn't started.
-fn infer_phase(s: &anova_oven_api::OvenStatus) -> &'static str {
-    match s.mode.as_str() {
-        "idle" => "Idle",
-        "cook" if s.timer_mode == "idle" && s.timer_current_secs == 0 => "Preheating",
-        "cook" => "Cooking",
-        _ => "Unknown",
-    }
-}
-
-/// Map oven status to the stage `kind` ("preheat" or "cook") for stage matching.
-fn infer_stage_kind(s: &anova_oven_api::OvenStatus) -> &'static str {
-    match s.mode.as_str() {
-        "cook" if s.timer_mode == "idle" && s.timer_current_secs == 0 => "preheat",
-        _ => "cook",
-    }
 }

@@ -129,7 +129,10 @@ impl OvenStatus {
     /// Timer remaining in seconds, if a timer is running.
     pub fn timer_remaining_secs(&self) -> Option<u64> {
         if self.timer_mode == "running" && self.timer_total_secs > 0 {
-            Some(self.timer_total_secs.saturating_sub(self.timer_current_secs))
+            Some(
+                self.timer_total_secs
+                    .saturating_sub(self.timer_current_secs),
+            )
         } else {
             None
         }
