@@ -15,13 +15,14 @@ Target capabilities:
 
 ## Current State
 
-The repo is a Cargo workspace with two member crates, plus a standalone
+The repo is a Cargo workspace with three member crates, plus a standalone
 embedded crate:
 
 ```
 crates/
   anova-oven-protocol/   # no_std + alloc — shared types + WebSocket event parsing
-  anova-oven-cli/        # std — CLI binary (tokio, WebSocket, clap)
+  anova-oven-firestore/  # no_std + alloc — Firebase auth + Firestore queries + recipe types
+  anova-oven-cli/        # std — CLI binary (tokio, WebSocket, reqwest, clap)
   anova-oven-pico/       # no_std, no_main — Pico W firmware (standalone workspace)
 ```
 
@@ -31,19 +32,26 @@ crates/
 - **WebSocket connection** to `wss://devices.anovaculinary.io/`
 - **`status`** subcommand — one-shot oven state with human-readable display
 - **`watch`** subcommand — continuous state stream
-- **`programs`** subcommand — lists local program files from `~/.anova-programs/*.json`
-- **Recipe fetching** via Node.js scripts in `../anova-oven-exploration/`
-  (outputs JSON to `~/.anova-programs/`)
+- **`programs`** subcommand — lists cached recipes from `~/.anova-programs/*.json`
+- **`fetch-recipes`** subcommand — authenticates via Firebase email/password
+  (or cached refresh token), queries Firestore for the user's recipes, and
+  writes JSON to `~/.anova-programs/`. Optional `--bookmarks` flag fetches
+  bookmarked community recipes too. Refresh token is cached at
+  `~/.anova-firebase-refresh-token` for future runs.
+- **Pico W library target** (`src/lib.rs`) — demonstrates the same Firestore
+  code paths (auth + recipe fetch) behind an `HttpClient` trait stub. Compiles
+  for `thumbv6m-none-eabi`.
 
 ### What's not implemented
 
 - Command serialization (`Serialize` derives) — the protocol crate is read-only
 - Sending cook commands (`CMD_APO_START`, `CMD_APO_STOP`, etc.)
 - `start` / `stop` / `update` subcommands
-- Native Rust Firestore recipe fetch (currently requires Node.js)
 - WebSocket reconnection / backoff
 - Graceful SIGINT shutdown
-- Pico W: TLS, WebSocket upgrade, and protocol integration (WiFi + TCP works)
+- Pico W binary: pre-existing embassy API drift (see Phase 4), TLS, WebSocket
+  upgrade, and protocol integration. WiFi + TCP scaffolding exists but does not
+  compile with current embassy 0.10 / cyw43 0.7.
 
 ---
 
@@ -68,44 +76,64 @@ on the WebSocket `command` field.
   in the CLI
 - No recipe/program types
 
-### Planned: `anova-oven-firestore` (no_std + alloc)
+### Current: `anova-oven-firestore` (no_std + alloc)
 
-New crate for Firebase auth and Firestore query/response types. Handles
-recipe fetching, bookmarks, and cook history.
+Transport-agnostic Firebase Auth + Firestore client for the Anova Oven app's
+backend. Same `no_std` / `std` feature pattern as `anova-oven-protocol`.
 
-**Design:** transport-agnostic. The crate constructs HTTP request bodies and parses
-response bodies as pure `serde` operations. The caller provides the actual HTTP
-transport:
-- CLI injects `reqwest`
-- Pico W injects `embassy-net` + TLS
+**Modules:**
+- `auth` — Firebase Identity Toolkit sign-in (`signInWithPassword`) and Secure
+  Token Service refresh. Builds request bodies and parses responses as pure
+  serde operations. The caller provides the actual HTTP transport.
+- `firestore` — Firestore REST `runQuery` structured query builder (including
+  `DocumentReference` field values, composite filters, ordering, and limits),
+  plus document and response types. `Document::to_json()` unwraps the verbose
+  Firestore Value type tags into plain JSON.
+- `value` — `FirestoreValue` type representing the Firestore REST wire format
+  (`stringValue`, `booleanValue`, `referenceValue`, `mapValue`, etc.) with
+  conversion to `serde_json::Value`.
+- `queries` — Pre-built query constructors matching the exact shapes required
+  by Anova's Firestore security rules: `user_recipes`, `user_draft_recipes`,
+  `published_recipes`, `favorite_recipes`, `oven_cooks`.
+- `recipe` — High-level document types: `OvenRecipe`, `FavoriteOvenRecipe`,
+  `OvenCook`, `Ingredient`, `Step`. Each has `from_document(&Document)` for
+  ergonomic deserialization from Firestore responses.
 
-This mirrors how `anova-oven-protocol` handles WebSocket messages — it parses
-and builds payloads without owning the connection.
+**Constants:** `ANOVA_PROJECT_ID`, `ANOVA_OVEN_API_KEY`, `ANOVA_GENERAL_API_KEY`.
 
-**Responsibilities:**
-- Firebase auth: construct token exchange request, parse ID token response
-- Firestore queries: build structured query JSON (including `DocumentReference`
-  field values), parse query response into recipe types
-- Recipe, bookmark, and cook history types
+**Tests:** `tests/parse.rs` covers response parsing, query shape validation,
+single-document parsing, and refresh token URL encoding.
 
 ### Current: `anova-oven-cli` (std)
 
-CLI binary. Uses `tokio` + `tokio-websockets` for WebSocket, `clap` for args.
-Depends on `anova-oven-protocol` with default (std) features.
+CLI binary. Uses `tokio` + `tokio-websockets` for WebSocket, `reqwest` for
+Firestore REST + Firebase auth, `clap` for args.
 
-Has `futures-util` with `sink` feature but does not yet send WebSocket messages.
+**Subcommands:**
+- `status` — one-shot oven state
+- `watch` — continuous state stream
+- `programs` — lists cached recipes from `~/.anova-programs/`
+- `fetch-recipes` — authenticates with Firebase, fetches user recipes from
+  Firestore, writes JSON to `~/.anova-programs/`. Supports `--email`,
+  `--password`, `--bookmarks` flags plus `ANOVA_EMAIL` / `ANOVA_PASSWORD` env
+  vars. Caches the refresh token at `~/.anova-firebase-refresh-token`.
 
 ### Current: `anova-oven-pico` (no_std, standalone workspace)
 
 Pico W embedded firmware. Separate workspace to avoid `critical-section` feature
-conflicts. Depends on `anova-oven-protocol` with `default-features = false`.
+conflicts. Depends on `anova-oven-protocol` and `anova-oven-firestore` with
+`default-features = false`.
 
-**Working:** WiFi init, WPA2 connect, DHCP, DNS, raw TCP to port 443.
-**Stubbed:** TLS, WebSocket upgrade, protocol message loop.
+**Library target** (`src/lib.rs`): Demonstrates the Firestore integration code
+path for embedded — defines an `HttpClient` trait with `post_json` / `post_form`
+methods for the caller to implement over `embassy-net` + TLS. Provides
+`sign_in()` and `fetch_user_recipes()` functions that compose the firestore
+crate's query builders into a complete recipe-fetch flow. Compiles clean for
+`thumbv6m-none-eabi`.
 
-Since the Pico W has full networking (WiFi + TCP + DNS), it can potentially
-talk to both the WebSocket API and Firestore directly. Both need TLS — solving
-it once (e.g., with `embedded-tls`) enables both.
+**Binary target** (`src/main.rs`): WiFi init, WPA2 connect, DHCP, DNS, raw TCP
+scaffold. **Does not currently compile** due to embassy 0.10 / cyw43 0.7 API
+drift (see Phase 4). Stubbed: TLS, WebSocket upgrade, protocol message loop.
 
 ### Dependency Graph
 
@@ -114,72 +142,49 @@ anova-oven-protocol     (no_std + alloc)
   ├── serde, serde_json
   └── types: OvenState, CookStage, Temperature, etc.
 
-anova-oven-firestore    (no_std + alloc)  ← NEW
+anova-oven-firestore    (no_std + alloc)
   ├── serde, serde_json
-  ├── anova-oven-protocol (for shared CookStage/Temperature types)
-  └── types: OvenRecipe, FirebaseAuth, FirestoreQuery, etc.
+  └── types: OvenRecipe, SignInRequest/Response, RunQueryRequest, etc.
 
 anova-oven-cli          (std)
   ├── anova-oven-protocol (std features)
   ├── anova-oven-firestore (std features)
-  ├── tokio, tokio-websockets, reqwest, clap
+  ├── tokio, tokio-websockets, reqwest, clap, rpassword
   └── provides HTTP + WebSocket transports
 
 anova-oven-pico         (no_std, standalone workspace)
   ├── anova-oven-protocol (no_std)
-  ├── anova-oven-firestore (no_std)  ← future
+  ├── anova-oven-firestore (no_std)
+  ├── serde_json (no_std, alloc)
   ├── embassy-*, cyw43, cyw43-pio
-  └── provides embassy-net transports
+  └── defines HttpClient trait for embassy-net transports
 ```
 
 ---
 
 ## Implementation Plan
 
-### Phase 1: Native Firestore Recipe Fetch
+### Phase 1: Native Firestore Recipe Fetch — COMPLETE
 
-This is the highest-priority new work — it replaces the Node.js dependency
-and enables the Pico W to fetch recipes directly.
+The `anova-oven-firestore` crate and `fetch-recipes` CLI subcommand are
+implemented and working. The Node.js scripts in `../anova-oven-exploration/`
+are no longer needed for recipe fetching.
 
-1. **Create `anova-oven-firestore` crate** — `no_std + alloc`, same feature
-   pattern as `anova-oven-protocol`.
+**What was built:**
+- `anova-oven-firestore` crate — Firebase auth (sign-in + refresh token) and
+  Firestore structured query builder/parser. Transport-agnostic (pure serde).
+  Compiles for both std and `thumbv6m-none-eabi` (no_std + alloc).
+- `fetch-recipes` CLI subcommand — authenticates via email/password or cached
+  refresh token, runs the exact `runQuery` shape Firestore security rules
+  require, writes JSON to `~/.anova-programs/`. Optional `--bookmarks` flag.
+- Pico W library target — same code paths behind an `HttpClient` trait,
+  compiles for the embedded target.
+- Integration tests for response parsing and query shape validation.
 
-   Types to define:
-   - `FirebaseAuthRequest` / `FirebaseAuthResponse` — for token exchange via
-     `POST https://securetoken.googleapis.com/v1/token?key=<API_KEY>`
-   - `FirestoreQuery` / `FirestoreQueryResponse` — structured query request/response
-   - `OvenRecipe` — full recipe document (see [Cloud API](oven-cloud-api.md))
-   - `FavoriteOvenRecipe` — bookmark document
-   - `OvenCook` — cook history document
-
-   Transport trait (sketch):
-   ```rust
-   pub trait HttpTransport {
-       type Error;
-       async fn post(&self, url: &str, body: &[u8], headers: &[(&str, &str)])
-           -> Result<Vec<u8>, Self::Error>;
-   }
-   ```
-
-   The crate provides a `FirestoreClient<T: HttpTransport>` that builds the
-   correct Firestore REST API request bodies (including `DocumentReference`
-   values) and parses responses.
-
-   > **Critical:** The Firestore security rules require the exact query shape:
-   > `where("userProfileRef", "==", <DocumentReference>)` combined with
-   > `where("draft", "==", false)`. See [Cloud API — Security Rules](oven-cloud-api.md#firestore-security-rules).
-
-2. **Add `CookStage` type to `anova-oven-protocol`** — shared between
-   WebSocket commands and Firestore recipe steps. Add `Serialize` derives
-   to the types that need to be sent (stages, commands).
-
-3. **Add `fetch-recipes` subcommand to CLI** — authenticates via email/password
-   or refresh token, queries Firestore, writes JSON to `~/.anova-programs/`.
-   Provide a `reqwest`-based `HttpTransport` implementation.
-
-4. **Bookmarks and cook history** — extend the CLI to also fetch:
-   - `users/{uid}/favorite-oven-recipes` (ordered by `addedTimestamp`)
-   - `users/{uid}/oven-cooks` (ordered by `endedTimestamp`)
+**What was NOT done in Phase 1:**
+- `CookStage` type in protocol crate — stages remain `serde_json::Value`
+- Pico W binary does not compile (pre-existing embassy API drift, Phase 4)
+- Cook history fetch not wired into CLI (queries module is ready)
 
 ### Phase 2: Cook Commands
 
@@ -230,29 +235,27 @@ and enables the Pico W to fetch recipes directly.
 
 ## Key Dependencies
 
-**Protocol crate (current):**
+**Protocol crate:**
 - `serde` 1.0 (default-features=false, features: derive, alloc)
 - `serde_json` 1.0 (default-features=false, features: alloc)
 
-**Firestore crate (planned):**
+**Firestore crate:**
 - `serde`, `serde_json` (same as above)
-- `anova-oven-protocol` (path dep)
 
-**CLI (current):**
+**CLI:**
 - `clap` 4 (derive, env)
 - `tokio` 1 (full)
 - `tokio-websockets` 0.13 (client, native-tls, fastrand, openssl)
 - `futures-util` 0.3 (sink)
+- `reqwest` 0.12 (json, rustls-tls)
+- `rpassword` 7
 - `serde`, `serde_json` 1.0
 
-**CLI (planned additions):**
-- `reqwest` — HTTP for Firebase auth + Firestore REST
-- `uuid` — generating `requestId` and `cookId` values
-
-**Pico W (current):**
-- `embassy-executor`, `embassy-rp`, `embassy-net`, `embassy-time`
-- `cyw43`, `cyw43-pio`
+**Pico W:**
+- `embassy-executor` 0.10, `embassy-rp` 0.10, `embassy-net` 0.9, `embassy-time` 0.5
+- `cyw43` 0.7, `cyw43-pio` 0.10
 - `cortex-m`, `cortex-m-rt`, `defmt`, `panic-probe`
+- `serde_json` 1.0 (no_std, alloc)
 
 **Pico W (planned additions):**
 - `embedded-tls` — TLS over TCP (unlocks both WSS and HTTPS)
@@ -273,10 +276,12 @@ Recipes are cached as JSON files in `~/.anova-programs/`:
   _bookmarks.json         # bookmarked community recipes
 ```
 
-The format is the raw Firestore `oven-recipes` document. Each file's `steps`
-array contains both `"stage"` entries (oven stages) and `"direction"` entries
-(text instructions). Filter to `stepType == "stage"` before sending to
-`CMD_APO_START`.
+The format matches the Firestore `oven-recipes` document, unwrapped from
+Firestore's verbose Value type tags into plain JSON (e.g. timestamps become
+ISO 8601 strings, document references become their full path strings, integers
+are plain numbers). Each file's `steps` array contains both `"stage"` entries
+(oven stages) and `"direction"` entries (text instructions). Filter to
+`stepType == "stage"` before sending to `CMD_APO_START`.
 
 ---
 

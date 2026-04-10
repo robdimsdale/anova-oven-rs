@@ -21,9 +21,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "anova-oven-firestore"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "anova-oven-pico"
 version = "0.1.0"
 dependencies = [
+ "anova-oven-firestore",
  "anova-oven-protocol",
  "cortex-m",
  "cortex-m-rt",
@@ -37,6 +46,7 @@ dependencies = [
  "embassy-time",
  "panic-probe",
  "portable-atomic",
+ "serde_json",
  "static_cell",
 ]
 
