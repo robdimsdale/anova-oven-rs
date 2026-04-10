@@ -25,9 +25,7 @@ use embassy_rp::pio::Pio;
 use embassy_rp::pwm::{Config as PwmConfig, Pwm};
 use embassy_time::{Delay, Duration, Instant, Timer};
 use hd44780_driver::{
-    bus::FourBitBusPins,
-    memory_map::MemoryMap1602,
-    non_blocking::{Cursor, CursorBlink, Display, DisplayMode, HD44780},
+    bus::FourBitBusPins, memory_map::MemoryMap1602, non_blocking::HD44780,
     setup::DisplayOptions4Bit,
 };
 use static_cell::StaticCell;
@@ -35,7 +33,7 @@ use {defmt_rtt as _, panic_probe as _};
 
 use crate::api::{fetch_and_log_recipes, fetch_and_log_status, fetch_current_cook};
 use crate::backlight::set_backlight_rgb;
-use crate::display::{render_recipe_browser, render_status_display};
+use crate::display::{configure_lcd_display, render_recipe_browser, render_status_display};
 use crate::events::{
     handle_input_event, rot_enc_button_task, rotary_encoder_task, stop_button_task, UIState,
     EVENT_CHANNEL,
@@ -66,6 +64,114 @@ static CLM: &[u8] = include_bytes!("../firmware/43439A0_clm.bin");
 
 static mut HTTP_RX_BUF: [u8; 16384] = [0u8; 16384];
 
+fn init_heap() {
+    use core::mem::MaybeUninit;
+
+    const HEAP_SIZE: usize = 32768;
+    static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP_SIZE];
+
+    #[allow(static_mut_refs)]
+    unsafe {
+        HEAP.init(HEAP_MEM.as_ptr() as usize, HEAP_SIZE);
+    }
+}
+
+fn init_backlight_pwm(
+    pwm_slice3: embassy_rp::Peri<'static, embassy_rp::peripherals::PWM_SLICE3>,
+    pin6: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_6>,
+    pin7: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_7>,
+    pwm_slice4: embassy_rp::Peri<'static, embassy_rp::peripherals::PWM_SLICE4>,
+    pin8: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_8>,
+) -> (Pwm<'static>, Pwm<'static>) {
+    let mut backlight_cfg = PwmConfig::default();
+    backlight_cfg.top = 0x8000;
+    backlight_cfg.invert_a = true;
+    backlight_cfg.invert_b = true;
+    backlight_cfg.compare_b = 0;
+
+    let pwm_red_green = Pwm::new_output_ab(pwm_slice3, pin6, pin7, backlight_cfg.clone());
+
+    backlight_cfg.compare_a = 0;
+    backlight_cfg.compare_b = 0;
+    let pwm_blue = Pwm::new_output_a(pwm_slice4, pin8, backlight_cfg);
+
+    (pwm_red_green, pwm_blue)
+}
+
+async fn connect_wifi(control: &mut cyw43::Control<'static>) {
+    info!("Connecting to WiFi: {}", WIFI_SSID);
+    loop {
+        match control
+            .join(WIFI_SSID, cyw43::JoinOptions::new(WIFI_PASSWORD.as_bytes()))
+            .await
+        {
+            Ok(_) => {
+                info!("WiFi connected");
+                break;
+            }
+            Err(e) => {
+                warn!("WiFi join failed: {}", e);
+                Timer::after(Duration::from_secs(1)).await;
+            }
+        }
+    }
+}
+
+async fn wait_for_dhcp(stack: embassy_net::Stack<'static>) {
+    info!("Waiting for DHCP...");
+    while !stack.is_config_up() {
+        Timer::after(Duration::from_millis(100)).await;
+    }
+    info!("Network is up");
+    if let Some(config) = stack.config_v4() {
+        info!("IP address: {}", config.address);
+    }
+}
+
+fn spawn_input_tasks(
+    spawner: &Spawner,
+    stack: embassy_net::Stack<'static>,
+    stop_button_pin: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_15>,
+    rot_enc_button_pin: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_11>,
+    enc_a_pin: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_9>,
+    enc_b_pin: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_10>,
+) {
+    let stop_button = Input::new(stop_button_pin, Pull::Up);
+    spawner.spawn(stop_button_task(stack, stop_button).unwrap());
+    info!("Stop button task spawned on GPIO 15");
+
+    let rot_enc_button = Input::new(rot_enc_button_pin, Pull::Up);
+    spawner.spawn(rot_enc_button_task(rot_enc_button).unwrap());
+    info!("Rotary encoder button task spawned on GPIO 11");
+
+    let enc_a = Input::new(enc_a_pin, Pull::Up);
+    let enc_b = Input::new(enc_b_pin, Pull::Up);
+    spawner.spawn(rotary_encoder_task(enc_a, enc_b).unwrap());
+    info!("Rotary encoder task spawned on GPIO 9/10");
+}
+
+async fn fetch_initial_data(
+    stack: embassy_net::Stack<'static>,
+) -> (
+    alloc::vec::Vec<anova_oven_api::Recipe>,
+    Option<anova_oven_api::CurrentCook>,
+    Option<anova_oven_api::OvenStatus>,
+) {
+    #[allow(static_mut_refs)]
+    let rx_buf = unsafe { &mut HTTP_RX_BUF };
+    let recipes = fetch_and_log_recipes(stack, rx_buf).await;
+
+    #[allow(static_mut_refs)]
+    let rx_buf = unsafe { &mut HTTP_RX_BUF };
+    let current_cook = fetch_current_cook(stack, rx_buf).await;
+
+    #[allow(static_mut_refs)]
+    let rx_buf = unsafe { &mut HTTP_RX_BUF };
+    let latest_status = fetch_and_log_status(stack, rx_buf).await;
+
+    (recipes, current_cook, latest_status)
+}
+
 #[embassy_executor::task]
 async fn cyw43_task(
     runner: cyw43::Runner<'static, cyw43::SpiBus<Output<'static>, PioSpi<'static, PIO0, 0>>>,
@@ -80,55 +186,31 @@ async fn net_task(mut runner: embassy_net::Runner<'static, cyw43::NetDriver<'sta
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    {
-        use core::mem::MaybeUninit;
-        const HEAP_SIZE: usize = 32768;
-        static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP_SIZE];
-        #[allow(static_mut_refs)]
-        unsafe {
-            HEAP.init(HEAP_MEM.as_ptr() as usize, HEAP_SIZE);
-        }
-    }
+    init_heap();
 
     let p = embassy_rp::init(Default::default());
-
-    let pins = FourBitBusPins {
-        rs: Output::new(p.PIN_17, Level::Low),
-        en: Output::new(p.PIN_16, Level::Low),
-        d4: Output::new(p.PIN_21, Level::Low),
-        d5: Output::new(p.PIN_20, Level::Low),
-        d6: Output::new(p.PIN_19, Level::Low),
-        d7: Output::new(p.PIN_18, Level::Low),
-    };
     let mut delay = Delay;
-    let options = DisplayOptions4Bit::new(MemoryMap1602::new()).with_pins(pins);
-    let mut lcd = match HD44780::new(options, &mut delay).await {
-        Ok(lcd) => lcd,
-        Err(_) => panic!("LCD init failed"),
-    };
-    lcd.set_display_mode(
-        DisplayMode {
-            cursor_visibility: Cursor::Invisible,
-            cursor_blink: CursorBlink::Off,
-            display: Display::On,
-        },
+    
+    let mut lcd = match HD44780::new(
+        DisplayOptions4Bit::new(MemoryMap1602::new()).with_pins(FourBitBusPins {
+            rs: Output::new(p.PIN_17, Level::Low),
+            en: Output::new(p.PIN_16, Level::Low),
+            d4: Output::new(p.PIN_21, Level::Low),
+            d5: Output::new(p.PIN_20, Level::Low),
+            d6: Output::new(p.PIN_19, Level::Low),
+            d7: Output::new(p.PIN_18, Level::Low),
+        }),
         &mut delay,
     )
     .await
-    .ok();
-    lcd.reset(&mut delay).await.ok();
-    lcd.clear(&mut delay).await.ok();
+    {
+        Ok(lcd) => lcd,
+        Err(_) => panic!("LCD init failed"),
+    };
+    configure_lcd_display(&mut lcd, &mut delay).await;
 
-    let mut backlight_cfg = PwmConfig::default();
-    backlight_cfg.top = 0x8000;
-    backlight_cfg.invert_a = true;
-    backlight_cfg.invert_b = true;
-    backlight_cfg.compare_b = 0;
-    let mut pwm_red_green =
-        Pwm::new_output_ab(p.PWM_SLICE3, p.PIN_6, p.PIN_7, backlight_cfg.clone());
-    backlight_cfg.compare_a = 0;
-    backlight_cfg.compare_b = 0;
-    let mut pwm_blue = Pwm::new_output_a(p.PWM_SLICE4, p.PIN_8, backlight_cfg);
+    let (mut pwm_red_green, mut pwm_blue) =
+        init_backlight_pwm(p.PWM_SLICE3, p.PIN_6, p.PIN_7, p.PWM_SLICE4, p.PIN_8);
     set_backlight_rgb(
         &mut pwm_red_green,
         &mut pwm_blue,
@@ -177,59 +259,16 @@ async fn main(spawner: Spawner) {
     );
     spawner.spawn(net_task(runner).unwrap());
 
-    info!("Connecting to WiFi: {}", WIFI_SSID);
-    loop {
-        match control
-            .join(WIFI_SSID, cyw43::JoinOptions::new(WIFI_PASSWORD.as_bytes()))
-            .await
-        {
-            Ok(_) => {
-                info!("WiFi connected");
-                break;
-            }
-            Err(e) => {
-                warn!("WiFi join failed: {}", e);
-                Timer::after(Duration::from_secs(1)).await;
-            }
-        }
-    }
+    connect_wifi(&mut control).await;
 
     lcd.set_cursor_xy((0, 1), &mut delay).await.ok();
     lcd.write_str("Init: DHCP...", &mut delay).await.ok();
 
-    info!("Waiting for DHCP...");
-    while !stack.is_config_up() {
-        Timer::after(Duration::from_millis(100)).await;
-    }
-    info!("Network is up");
-    if let Some(config) = stack.config_v4() {
-        info!("IP address: {}", config.address);
-    }
+    wait_for_dhcp(stack).await;
 
-    let stop_button = Input::new(p.PIN_15, Pull::Up);
-    spawner.spawn(stop_button_task(stack, stop_button).unwrap());
-    info!("Stop button task spawned on GPIO 15");
+    spawn_input_tasks(&spawner, stack, p.PIN_15, p.PIN_11, p.PIN_9, p.PIN_10);
 
-    let rot_enc_button = Input::new(p.PIN_11, Pull::Up);
-    spawner.spawn(rot_enc_button_task(rot_enc_button).unwrap());
-    info!("Rotary encoder button task spawned on GPIO 11");
-
-    let enc_a = Input::new(p.PIN_9, Pull::Up);
-    let enc_b = Input::new(p.PIN_10, Pull::Up);
-    spawner.spawn(rotary_encoder_task(enc_a, enc_b).unwrap());
-    info!("Rotary encoder task spawned on GPIO 9/10");
-
-    #[allow(static_mut_refs)]
-    let rx_buf = unsafe { &mut HTTP_RX_BUF };
-    let recipes = fetch_and_log_recipes(stack, rx_buf).await;
-
-    #[allow(static_mut_refs)]
-    let rx_buf = unsafe { &mut HTTP_RX_BUF };
-    let mut current_cook: Option<anova_oven_api::CurrentCook> = fetch_current_cook(stack, rx_buf).await;
-
-    #[allow(static_mut_refs)]
-    let rx_buf = unsafe { &mut HTTP_RX_BUF };
-    let mut latest_status: Option<anova_oven_api::OvenStatus> = fetch_and_log_status(stack, rx_buf).await;
+    let (recipes, mut current_cook, mut latest_status) = fetch_initial_data(stack).await;
 
     let mut tick: u64 = 0;
     let mut ui_state = UIState::ShowStatus;
