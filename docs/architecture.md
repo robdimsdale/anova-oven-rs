@@ -21,7 +21,8 @@ Target capabilities:
 │  axum HTTP API  (plain HTTP, local network)          │
 │  ├── GET  /status     → simplified oven state JSON   │
 │  ├── GET  /recipes    → simplified recipe list JSON  │
-│  └── GET  /history    → simplified cook history JSON │
+│  ├── GET  /history    → simplified cook history JSON │
+│  └── POST /stop       → send CMD_APO_STOP            │
 │                                                      │
 │  Internal (hidden from clients):                     │
 │  ├── persistent WebSocket → devices.anovaculinary.io │
@@ -169,9 +170,19 @@ cargo run -p anova-oven-server
 
 **Internal state:**
 - A background tokio task maintains a persistent WebSocket connection to
-  `wss://devices.anovaculinary.io/` and caches the latest `EVENT_APO_STATE`
-  payload in a `tokio::sync::watch` channel. On disconnect it sleeps 5 s
-  and reconnects indefinitely.
+  `wss://devices.anovaculinary.io/`. It is split into read and write halves
+  (via `futures_util::StreamExt::split`) so that `tokio::select!` can
+  concurrently receive incoming events and dispatch outgoing commands.
+- On connect the server receives `EVENT_APO_WIFI_LIST` and caches the cooker
+  ID in a `tokio::sync::watch` channel. This ID is required to address any
+  outbound command frame. Commands issued before the first `EVENT_APO_WIFI_LIST`
+  is received return HTTP 503.
+- Outgoing commands are queued via a `tokio::sync::mpsc` channel
+  (`capacity = 8`) from the HTTP handlers into the WebSocket task. The task
+  reads commands in the same `select!` loop as incoming events, so command
+  latency is bounded only by how long the current `stream.next()` poll takes
+  (≤ 2 s during a cook, ≤ 30 s idle).
+- On disconnect the task sleeps 5 s and reconnects indefinitely.
 - A `reqwest` client handles Firebase sign-in and Firestore `runQuery`
   requests. The Firebase session (ID token + refresh token) is cached in
   memory (not on disk).
@@ -181,23 +192,34 @@ cargo run -p anova-oven-server
 **Endpoints:**
 - `GET /status`  — reads from the `watch` channel, maps to `OvenStatus`.
   Returns HTTP 503 while the WebSocket connection is still establishing.
-- `GET /recipes` — queries Firestore `oven-recipes` (user's non-draft
-  recipes only), maps to `Vec<Recipe>`.
+- `GET /recipes` — queries Firestore `oven-recipes` for the user's non-draft
+  recipes, then also fetches bookmarked recipes from
+  `users/{uid}/favorite-oven-recipes` and merges the two lists into a single
+  `Vec<Recipe>`, deduplicated by ID (own recipes take precedence). Returns the
+  combined list — clients see one flat list with no bookmark/own distinction.
 - `GET /history` — queries `users/{uid}/oven-cooks`, resolves recipe
   titles via individual document GETs, maps to `Vec<HistoryEntry>`.
+- `POST /stop`   — enqueues a `CMD_APO_STOP` onto the WebSocket task's command
+  channel. Fire-and-forget: returns `204 No Content` once queued, or `503` if
+  the cooker ID is not yet known. Clients should poll `GET /status` to confirm
+  the oven reached mode `"idle"`.
 
 **Module layout:**
-- `src/main.rs`     — entry point, `AppState`, axum setup, WebSocket task,
-                      route handlers
+- `src/main.rs`     — entry point, `AppState`, axum setup, WebSocket task
+                      (including `WsCommand` enum, mpsc/watch channels,
+                      `stop_command_json`), route handlers
 - `src/protocol.rs` — Anova WebSocket message parsing (`EVENT_APO_STATE` →
-                      `OvenStatus`); absorbed from old `anova-oven-protocol`
+                      `OvenStatus`, `EVENT_APO_WIFI_LIST` → cooker ID);
+                      absorbed from old `anova-oven-protocol`
 - `src/firestore.rs`— Firebase auth (sign-in, token refresh), Firestore
                       `runQuery` + document GET, Firestore Value unwrapping,
                       mapping to `anova-oven-api` types; absorbed from old
                       `anova-oven-firestore`
 
-**Dependencies:** axum 0.7, tokio 1 (full), reqwest 0.12 (rustls-tls),
-tokio-websockets 0.13 (native-tls), futures-util, serde_json, `anova-oven-api`.
+**Dependencies:** axum 0.8, tokio 1 (full), reqwest 0.13 (rustls),
+tokio-websockets 0.13 (native-tls, fastrand, openssl),
+futures-util 0.3 (**sink feature required** for `SinkExt` + `split()`),
+serde, serde_json 1.0, http 1, uuid 1 (v4 + serde), `anova-oven-api`.
 
 ### `anova-oven-cli`
 
@@ -206,8 +228,9 @@ deserialization. Mirrors the embedded client's data flow to validate UI/UX.
 
 **Subcommands:**
 - `status`  — `GET /status`, prints human-readable oven state
-- `recipes` — `GET /recipes`, lists available recipes
+- `recipes` — `GET /recipes`, lists available recipes (own + bookmarked)
 - `history` — `GET /history`, shows recent cooks
+- `stop`    — `POST /stop`, sends stop command; polls no further (fire-and-forget)
 
 **Server address:** `--server <addr>` flag (default `http://localhost:8080`),
 also `ANOVA_SERVER` env var. A bare `host:port` without `http://` is accepted
@@ -218,9 +241,11 @@ and has the scheme prepended automatically.
 cargo run -p anova-oven-cli -- status
 cargo run -p anova-oven-cli -- --server 10.0.1.42:8080 recipes
 ANOVA_SERVER=10.0.1.42:8080 cargo run -p anova-oven-cli -- history
+cargo run -p anova-oven-cli -- stop
 ```
 
-**Dependencies:** clap 4, reqwest 0.12, tokio 1, serde_json, `anova-oven-api`.
+**Dependencies:** clap 4 (derive, env), reqwest 0.13, tokio 1, serde_json,
+`anova-oven-api`.
 
 ### `anova-oven-pico`
 
@@ -257,7 +282,8 @@ cargo build --release
 
 **Dependencies:** embassy-executor 0.10, embassy-rp 0.10, embassy-net 0.9,
 embassy-time 0.5, cyw43 0.7, cyw43-pio 0.10, cortex-m, cortex-m-rt, defmt,
-panic-probe, embedded-alloc 0.6, reqwless 0.14 (plain HTTP, no TLS),
+panic-probe, embedded-alloc 0.6, embedded-io-async 0.7,
+reqwless 0.14 (plain HTTP, no TLS feature),
 serde_json 1.0 (no_std + alloc), `anova-oven-api` (no_std).
 
 ---
@@ -292,23 +318,20 @@ All five steps are done and compiling:
 - ✅ **Step 5:** `anova-oven-protocol` and `anova-oven-firestore` deleted from
   workspace
 
-### Phase 3 — Cook Commands
+### Phase 3 — Cook Commands (partially complete)
 
-Once the server can receive and send commands over the WebSocket, add write
-endpoints:
+- ✅ **`POST /stop`** — implemented. `CMD_APO_STOP` is sent fire-and-forget
+  over the WebSocket. CLI `stop` subcommand added. Pico support deferred
+  (UI/UX not yet decided).
+- ⬜ **`POST /start`** — not yet implemented. Requires a request body
+  `{ "recipe_id": "..." }`, fetching the full recipe stages from the Firestore
+  cache, and building a `CMD_APO_START` frame. Firestore recipe data is already
+  in memory after the first `GET /recipes` call, so no additional fetch is
+  needed if the cache is warm.
 
-- `POST /start` with body `{ "recipe_id": "..." }` → `CMD_APO_START`
-- `POST /stop` → `CMD_APO_STOP`
-
-Server side:
-- The watch-channel pattern already handles state; commands need a separate
-  `mpsc` channel from the HTTP handlers into the WebSocket task.
-- The WebSocket task sends the command frame and waits for a `RESPONSE` event
-  with matching `requestId`.
-
-CLI side: add `start <recipe-id>` and `stop` subcommands.
-
-Pico side: add button input to trigger HTTP POST to `/start` or `/stop`.
+The mpsc command channel infrastructure from `POST /stop` is already in place;
+`CMD_APO_START` just needs a new `WsCommand::Start { stages: Vec<...> }` variant
+and a corresponding HTTP handler.
 
 ### Phase 4 — Usability
 
@@ -331,18 +354,19 @@ Pico side: add button input to trigger HTTP POST to `/start` or `/stop`.
 - `serde_json` 1.0 (default-features=false, features: alloc)
 
 **`anova-oven-server`:**
-- `axum` 0.7
+- `axum` 0.8
 - `tokio` 1 (full)
-- `reqwest` 0.12 (json, rustls-tls)
+- `reqwest` 0.13 (json, rustls)
 - `tokio-websockets` 0.13 (client, native-tls, fastrand, openssl)
-- `futures-util` 0.3
+- `futures-util` 0.3 (**features = ["sink"]** — required for `SinkExt` and `split()`)
 - `serde`, `serde_json` 1.0
 - `http` 1
+- `uuid` 1 (v4, serde)
 - `anova-oven-api`
 
 **`anova-oven-cli`:**
 - `clap` 4 (derive, env)
-- `reqwest` 0.12 (json, rustls-tls)
+- `reqwest` 0.13 (json, rustls)
 - `tokio` 1 (full)
 - `serde_json` 1.0
 - `anova-oven-api`
@@ -378,13 +402,27 @@ Pico side: add button input to trigger HTTP POST to `/start` or `/stop`.
   5 s. Phase 4 should replace this with exponential backoff (e.g. 1 s → 2 s →
   4 s → … → 60 s cap).
 
-- **Pico hardware not tested end-to-end:** The pico crate cross-compiles
-  cleanly for `thumbv6m-none-eabi` but has not been flashed and tested
-  against real hardware with the new server architecture. The reqwless plain
-  HTTP path should work but deserves a hardware validation pass.
+- **Stop command is fire-and-forget:** `POST /stop` returns 204 as soon as the
+  command is queued; it does not wait for a `RESPONSE` frame from the oven.
+  The oven does send back `RESPONSE { status: "ok" }` with a matching
+  `requestId`, but this is not currently matched or surfaced. For `POST /start`
+  (Phase 3), waiting for the response will be more important since a failed
+  start should surface an error to the caller. The infrastructure for matching
+  responses (a `HashMap<Uuid, oneshot::Sender<String>>` of pending requests)
+  does not exist yet.
 
-- **`ANOVA_BIND` not documented in server:** The server respects an
-  `ANOVA_BIND` env var (default `0.0.0.0:8080`) to change the listen address.
+- **Cooker ID availability:** The cooker ID (needed to address all outbound
+  commands) only arrives in `EVENT_APO_WIFI_LIST`, the first message the server
+  receives after connecting. Until that message is processed, `POST /stop` and
+  any future write endpoints return HTTP 503. In practice this window is very
+  short (< 1 s), but clients should handle 503 and retry.
+
+- **Bookmarked recipes are N+1 fetches:** `GET /recipes` first queries
+  `users/{uid}/favorite-oven-recipes` to get a list of `recipeRef` document
+  references, then issues one individual GET per bookmark to resolve the full
+  recipe. There is no batch GET in the Firestore REST API. For users with many
+  bookmarks this is slow. The results are cached in memory after the first
+  call, so subsequent requests are free.
 
 ---
 

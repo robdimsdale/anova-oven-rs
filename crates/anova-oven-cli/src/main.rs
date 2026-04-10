@@ -32,6 +32,8 @@ enum Command {
     Recipes,
     /// Show recent cook history
     History,
+    /// Stop the current cook
+    Stop,
 }
 
 #[tokio::main]
@@ -72,6 +74,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             for recipe in &recipes {
                 print_recipe(recipe);
+            }
+        }
+
+        Command::Stop => {
+            let url = format!("{server}/stop");
+            let resp = client.post(&url).send().await?;
+            if resp.status() == reqwest::StatusCode::NO_CONTENT {
+                println!("Stop command sent.");
+            } else {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(format!("Server returned {status}: {body}").into());
             }
         }
 

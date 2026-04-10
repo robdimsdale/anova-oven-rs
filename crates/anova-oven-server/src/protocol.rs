@@ -16,7 +16,7 @@ pub fn parse_message(data: &[u8]) -> Result<Event, serde_json::Error> {
         }
         "EVENT_APO_WIFI_LIST" => {
             let v: serde_json::Value = serde_json::from_slice(data)?;
-            let cooker_id = v["payload"]["cookerId"].as_str().map(String::from);
+            let cooker_id = v["payload"][0]["cookerId"].as_str().map(String::from);
             Ok(Event::ApoWifiList { cooker_id })
         }
         "EVENT_USER_STATE" => Ok(Event::UserState),
