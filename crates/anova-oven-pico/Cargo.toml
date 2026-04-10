@@ -41,6 +41,7 @@
     "proto-ipv4",
   ] }
   embassy-futures = "0.1"
+  embassy-sync = "0.8"
   embassy-time = "0.5"
 
   embedded-alloc = "0.7"
