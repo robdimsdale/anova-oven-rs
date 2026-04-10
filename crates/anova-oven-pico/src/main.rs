@@ -9,13 +9,14 @@ use embedded_alloc::LlffHeap as Heap;
 static HEAP: Heap = Heap::empty();
 
 use cyw43_pio::PioSpi;
-use defmt::{info, warn};
+use defmt::{info, warn, debug};
 use embassy_executor::Spawner;
 use embassy_net::{Config, StackResources};
 use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::{Input, Level, Output, Pull};
 use embassy_rp::peripherals::{DMA_CH0, PIO0};
 use embassy_rp::pio::Pio;
+use embassy_rp::pwm::{Config as PwmConfig, Pwm};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_time::{Delay, Duration, Instant, Timer};
@@ -42,6 +43,13 @@ fn normalize_server_url(url: &str) -> alloc::string::String {
 }
 
 const POLL_INTERVAL_SECS: u64 = 1;
+
+const BACKLIGHT_FULL_LEVEL: u8 = 255;
+const BACKLIGHT_DIM_LEVEL: u8 = 64;
+const INACTIVITY_TIMEOUT_SECS: u64 = 5;
+const LED_DIM_TIMER: u8 = 5; // time in seconds to dim the backlight after resetting to the baseline state
+const COOK_POLL_INTERVAL: u64 = 10; // Poll status every tick, current-cook every COOK_POLL_INTERVAL ticks.
+
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO0>;
@@ -162,6 +170,8 @@ async fn main(spawner: Spawner) {
 
     let p = embassy_rp::init(Default::default());
 
+    // Init LCD data
+    //
     //   LCD pins 7-10 (DB0-DB3) unconnected — 4-bit mode only uses DB4-DB7.
     let pins = FourBitBusPins {
         rs: Output::new(p.PIN_17, Level::Low), // pico physical pin 22, LCD pin 4
@@ -189,6 +199,24 @@ async fn main(spawner: Spawner) {
     .ok();
     lcd.reset(&mut delay).await.ok();
     lcd.clear(&mut delay).await.ok();
+
+    // Init LED backlight
+    //
+    // --- RGB Backlight PWM setup (common-anode: inverted polarity) ---
+    // Red:   GPIO 6 (physical pin 9) → PWM slice 3, channel A → LCD pin 16
+    // Green: GPIO 7 (physical pin 10) → PWM slice 3, channel B → LCD pin 17
+    // Blue:  GPIO 8 (physical pin 11) → PWM slice 4, channel A → LCD pin 18
+    let mut backlight_cfg = PwmConfig::default();
+    backlight_cfg.top = 0x8000;
+    backlight_cfg.invert_a = true;
+    backlight_cfg.invert_b = true;
+    backlight_cfg.compare_b = 0;
+    let mut pwm_red_green = Pwm::new_output_ab(p.PWM_SLICE3, p.PIN_6, p.PIN_7, backlight_cfg.clone());
+    backlight_cfg.compare_a = 0;
+    backlight_cfg.compare_b = 0;
+    let mut pwm_blue = Pwm::new_output_a(p.PWM_SLICE4, p.PIN_8, backlight_cfg);
+    // Start with white backlight.
+    set_backlight_rgb(&mut pwm_red_green, &mut pwm_blue, BACKLIGHT_FULL_LEVEL, BACKLIGHT_FULL_LEVEL, BACKLIGHT_FULL_LEVEL);
 
     lcd.write_str("Anova Oven", &mut delay).await.ok();
     lcd.set_cursor_xy((0, 1), &mut delay).await.ok();
@@ -271,32 +299,59 @@ async fn main(spawner: Spawner) {
     spawner.spawn(rot_enc_button_task(rot_enc_button).unwrap());
     info!("Rotary encoder button task spawned on GPIO 11");
 
-    // --- Rotary Encoder rotation setup (GPIO 10/physical pin 14, GPIO 12, physical pin 16, pull-up) ---
-    let enc_a = Input::new(p.PIN_10, Pull::Up);
-    let enc_b = Input::new(p.PIN_12, Pull::Up);
+    // --- Rotary Encoder rotation setup (GPIO9/physical pin 12 and GPIO 10/physical pin 14, both pull-up) ---
+    let enc_a = Input::new(p.PIN_9, Pull::Up);
+    let enc_b = Input::new(p.PIN_10, Pull::Up);
     spawner.spawn(rotary_encoder_task(enc_a, enc_b).unwrap());
-    info!("Rotary encoder task spawned on GPIO 10/12");
+    info!("Rotary encoder task spawned on GPIO 9/10");
 
     // Fetch recipes once on startup.
     #[allow(static_mut_refs)]
     let rx_buf = unsafe { &mut HTTP_RX_BUF };
     let recipes = fetch_and_log_recipes(stack, rx_buf).await;
 
-    // Poll status every tick, current-cook every COOK_POLL_INTERVAL ticks.
-    const COOK_POLL_INTERVAL: u64 = 10;
-    const INACTIVITY_TIMEOUT_SECS: u64 = 5;
+    // Fetch current-cook and status once before entering the main loop so the
+    // baseline render and backlight policy have real data.
+    #[allow(static_mut_refs)]
+    let rx_buf = unsafe { &mut HTTP_RX_BUF };
+    let mut current_cook: Option<anova_oven_api::CurrentCook> = fetch_current_cook(stack, rx_buf).await;
+
+    #[allow(static_mut_refs)]
+    let rx_buf = unsafe { &mut HTTP_RX_BUF };
+    let mut latest_status: Option<anova_oven_api::OvenStatus> = fetch_and_log_status(stack, rx_buf).await;
+
     let mut tick: u64 = 0;
-    let mut current_cook: Option<anova_oven_api::CurrentCook> = None;
-    let mut latest_status: Option<anova_oven_api::OvenStatus> = None;
     let mut ui_state = UIState::ShowStatus;
     let mut last_input_at: Option<Instant> = None;
+    let mut baseline_reentered_at: Option<Instant> = Some(Instant::now());
+
+    info!("Init complete, dimming backlight and entering main loop");
+
+    let mut backlight_dimmed = true;
+    set_backlight_rgb(&mut pwm_red_green, &mut pwm_blue, BACKLIGHT_DIM_LEVEL, BACKLIGHT_DIM_LEVEL, BACKLIGHT_DIM_LEVEL);
+
+    // Render the first frame immediately so we don't wait one poll tick before
+    // replacing the init text with live oven status.
+    render_status_display(
+        &mut lcd,
+        &mut delay,
+        tick,
+        latest_status.as_ref(),
+        current_cook.as_ref(),
+    )
+    .await;
 
     loop {
+        debug!("--- Main loop tick {} ---", tick);
+
         // Check inactivity timeout.
         if let Some(t) = last_input_at {
             if t.elapsed() >= Duration::from_secs(INACTIVITY_TIMEOUT_SECS) {
-                info!("Inactivity timeout: reverting to ShowStatus");
-                ui_state = UIState::ShowStatus;
+                if !matches!(ui_state, UIState::ShowStatus) {
+                    info!("Inactivity timeout: reverting to ShowStatus");
+                    ui_state = UIState::ShowStatus;
+                    baseline_reentered_at = Some(Instant::now());
+                }
                 last_input_at = None;
             }
         }
@@ -309,6 +364,12 @@ async fn main(spawner: Spawner) {
             embassy_futures::select::Either::First(()) => true,
             embassy_futures::select::Either::Second(event) => {
                 last_input_at = Some(Instant::now());
+                baseline_reentered_at = None;
+                if backlight_dimmed {
+                    set_backlight_rgb(&mut pwm_red_green, &mut pwm_blue, BACKLIGHT_FULL_LEVEL, BACKLIGHT_FULL_LEVEL, BACKLIGHT_FULL_LEVEL);
+                    backlight_dimmed = false;
+                    info!("Backlight: 100% (input activity)");
+                }
                 handle_input_event(event, &mut ui_state, &recipes);
                 false
             }
@@ -333,6 +394,25 @@ async fn main(spawner: Spawner) {
             }
 
             tick += 1;
+        }
+
+        let active_cook = current_cook.is_some()
+            || latest_status
+                .as_ref()
+                .is_some_and(|status| status.mode != "idle");
+        let should_dim_backlight = matches!(ui_state, UIState::ShowStatus)
+            && baseline_reentered_at
+                .is_some_and(|t| t.elapsed() >= Duration::from_secs(LED_DIM_TIMER as u64))
+            && !active_cook;
+
+        if should_dim_backlight && !backlight_dimmed {
+            set_backlight_rgb(&mut pwm_red_green, &mut pwm_blue, BACKLIGHT_DIM_LEVEL, BACKLIGHT_DIM_LEVEL, BACKLIGHT_DIM_LEVEL);
+            backlight_dimmed = true;
+            info!("Backlight: dim (idle baseline)");
+        } else if (active_cook || !matches!(ui_state, UIState::ShowStatus)) && backlight_dimmed {
+            set_backlight_rgb(&mut pwm_red_green, &mut pwm_blue, BACKLIGHT_FULL_LEVEL, BACKLIGHT_FULL_LEVEL, BACKLIGHT_FULL_LEVEL);
+            backlight_dimmed = false;
+            info!("Backlight: full (active state)");
         }
 
         // Render LCD based on current UI state.
@@ -805,6 +885,24 @@ async fn fetch_and_log_recipes(
             alloc::vec::Vec::new()
         }
     }
+}
+
+fn set_backlight_rgb(pwm_red_green: &mut Pwm<'_>, pwm_blue: &mut Pwm<'_>, r: u8, g: u8, b: u8) {
+    let top = 0x8000u16;
+
+    let mut rg_cfg = PwmConfig::default();
+    rg_cfg.top = top;
+    rg_cfg.invert_a = true;
+    rg_cfg.invert_b = true;
+    rg_cfg.compare_a = (r as u32 * top as u32 / 255) as u16;
+    rg_cfg.compare_b = (g as u32 * top as u32 / 255) as u16;
+    pwm_red_green.set_config(&rg_cfg);
+
+    let mut b_cfg = PwmConfig::default();
+    b_cfg.top = top;
+    b_cfg.invert_a = true;
+    b_cfg.compare_a = (b as u32 * top as u32 / 255) as u16;
+    pwm_blue.set_config(&b_cfg);
 }
 
 fn celcius_to_fahrenheit(c: f32) -> f32 {
