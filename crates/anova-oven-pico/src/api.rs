@@ -166,6 +166,45 @@ pub async fn send_stop(stack: embassy_net::Stack<'static>, rx_buf: &mut [u8]) {
     }
 }
 
+pub async fn send_start(
+    stack: embassy_net::Stack<'static>,
+    rx_buf: &mut [u8],
+    recipe_id: &str,
+) {
+    let client_state = TcpClientState::<1, 1024, 1024>::new();
+    let tcp = TcpClient::new(stack, &client_state);
+    let dns = DnsSocket::new(stack);
+    let mut client = HttpClient::new(&tcp, &dns);
+
+    let server = normalize_server_url(SERVER_URL);
+    let url = alloc::format!("{server}/start");
+    let mut request = match client.request(Method::POST, &url).await {
+        Ok(r) => r,
+        Err(_) => {
+            warn!("POST /start: connection failed");
+            return;
+        }
+    };
+
+    // Build JSON body: {"recipe_id": "..."}
+    let body = alloc::format!(r#"{{"recipe_id":"{}"}}"#, recipe_id);
+    request.write_all(body.as_bytes()).await.ok();
+
+    let response = match request.send(rx_buf).await {
+        Ok(r) => r,
+        Err(_) => {
+            warn!("POST /start: send failed");
+            return;
+        }
+    };
+
+    if response.status.0 >= 200 && response.status.0 < 300 {
+        info!("POST /start: success (HTTP {})", response.status.0);
+    } else {
+        warn!("POST /start: HTTP {}", response.status.0);
+    }
+}
+
 pub async fn fetch_and_log_recipes(
     stack: embassy_net::Stack<'static>,
     rx_buf: &mut [u8],

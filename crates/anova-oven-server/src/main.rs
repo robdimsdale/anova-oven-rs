@@ -15,6 +15,7 @@
 //! - `GET /history`      — cook history (last 50 cooks)
 //! - `GET /current-cook` — in-progress cook (diagnostic)
 //! - `POST /stop`        — stop the current cook
+//! - `POST /start`       — start a cook with a recipe (recipe ID in JSON body)
 
 mod firestore;
 mod protocol;
@@ -31,11 +32,13 @@ use http::{HeaderName, HeaderValue, Uri};
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio_websockets::{ClientBuilder, Message};
 use uuid::Uuid;
+use serde::{Deserialize, Serialize};
 
 // ─── Shared application state ─────────────────────────────────────────────────
 
 enum WsCommand {
     Stop,
+    Start(Vec<anova_oven_api::Stage>),
 }
 
 struct AppState {
@@ -94,6 +97,7 @@ async fn main() {
         .route("/recipes", axum::routing::get(handle_recipes))
         .route("/history", axum::routing::get(handle_history))
         .route("/stop", axum::routing::post(handle_stop))
+        .route("/start", axum::routing::post(handle_start))
         .route("/current-cook", axum::routing::get(handle_current_cook))
         .with_state(state);
 
@@ -114,6 +118,82 @@ fn stop_command_json(cooker_id: &str) -> String {
         "payload": {
             "type": "CMD_APO_STOP",
             "id": cooker_id
+        },
+        "requestId": request_id
+    })
+    .to_string()
+}
+
+fn start_command_json(cooker_id: &str, stages: &[anova_oven_api::Stage]) -> String {
+    let request_id = Uuid::new_v4();
+    let cook_id = format!("server-{}", Uuid::new_v4());
+    
+    // Convert recipe stages to WebSocket stage format
+    let ws_stages: Vec<serde_json::Value> = stages
+        .iter()
+        .map(|stage| {
+            let stage_id = format!("stage-{}", Uuid::new_v4());
+            
+            // Build the stage object with all fields from the recipe
+            let mut stage_obj = serde_json::json!({
+                "stepType": "stage",
+                "id": stage_id,
+                "title": stage.title.as_deref().unwrap_or(""),
+                "type": stage.kind.as_str(),
+                "userActionRequired": stage.user_action_required.unwrap_or(false),
+                "stageTransitionType": "automatic",
+                "temperatureBulbs": {
+                    "mode": stage.temperature_bulbs_mode.as_deref().unwrap_or("dry"),
+                    "dry": {
+                        "setpoint": {
+                            "celsius": stage.temperature_c,
+                            "fahrenheit": stage.temperature_c * 1.8 + 32.0
+                        }
+                    }
+                },
+                "heatingElements": {
+                    "top": { "on": stage.heating_element_top.unwrap_or(true) },
+                    "rear": { "on": stage.heating_element_rear.unwrap_or(true) },
+                    "bottom": { "on": stage.heating_element_bottom.unwrap_or(true) }
+                },
+                "fan": { "speed": stage.fan_speed },
+                "vent": { "open": stage.vent_open.unwrap_or(false) },
+                "rackPosition": stage.rack_position.unwrap_or(3),
+                "steamGenerators": {
+                    "mode": "steam-percentage",
+                    "steamPercentage": { "setpoint": stage.steam_pct }
+                }
+            });
+            
+            // Add timer or probe based on stage configuration
+            if let Some(duration) = stage.duration_secs {
+                stage_obj["timerAdded"] = serde_json::json!(true);
+                stage_obj["timer"] = serde_json::json!({ "initial": duration });
+                stage_obj["probeAdded"] = serde_json::json!(false);
+            } else if let Some(probe_target_c) = stage.probe_target_c {
+                stage_obj["timerAdded"] = serde_json::json!(false);
+                stage_obj["probeAdded"] = serde_json::json!(true);
+                stage_obj["temperatureProbe"] = serde_json::json!({
+                    "setpoint": {
+                        "celsius": probe_target_c,
+                        "fahrenheit": probe_target_c * 1.8 + 32.0
+                    }
+                });
+            }
+            
+            stage_obj
+        })
+        .collect();
+    
+    serde_json::json!({
+        "command": "CMD_APO_START",
+        "payload": {
+            "type": "CMD_APO_START",
+            "id": cooker_id,
+            "payload": {
+                "cookId": cook_id,
+                "stages": ws_stages
+            }
         },
         "requestId": request_id
     })
@@ -202,6 +282,15 @@ async fn ws_connect_and_run(
                             None => eprintln!("[ws] Stop requested but cooker ID not yet known"),
                         }
                     }
+                    Some(WsCommand::Start(stages)) => {
+                        match &cooker_id {
+                            Some(id) => {
+                                eprintln!("[ws] Sending CMD_APO_START for cooker {id}");
+                                sink.send(Message::text(start_command_json(id, &stages))).await?;
+                            }
+                            None => eprintln!("[ws] Start requested but cooker ID not yet known"),
+                        }
+                    }
                     None => {} // cmd_tx dropped — server shutting down
                 }
             }
@@ -257,6 +346,53 @@ async fn handle_stop(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             .into_response();
     }
     match state.cmd_tx.send(WsCommand::Stop).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "WebSocket task not running",
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct StartRequest {
+    recipe_id: String,
+}
+
+async fn handle_start(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<StartRequest>,
+) -> impl IntoResponse {
+    if state.cooker_id_rx.borrow().is_none() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Cooker ID not yet received — WebSocket may still be connecting",
+        )
+            .into_response();
+    }
+
+    // Fetch the recipe by ID from the cached recipes
+    let recipes = state.recipes.lock().await;
+    let recipe = match &*recipes {
+        Some(recipes) => recipes.iter().find(|r| r.id == req.recipe_id).cloned(),
+        None => None,
+    };
+    
+    drop(recipes);
+
+    let recipe = match recipe {
+        Some(r) => r,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                format!("Recipe with ID '{}' not found", req.recipe_id),
+            )
+                .into_response();
+        }
+    };
+
+    match state.cmd_tx.send(WsCommand::Start(recipe.stages)).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,

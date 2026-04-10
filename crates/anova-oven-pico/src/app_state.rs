@@ -1,7 +1,7 @@
 use defmt::{debug, info};
 use embassy_time::{Duration, Instant};
 
-use crate::api::{fetch_and_log_recipes, fetch_and_log_status, fetch_current_cook, send_stop};
+use crate::api::{fetch_and_log_recipes, fetch_and_log_status, fetch_current_cook, send_stop, send_start};
 use crate::backlight::BacklightController;
 use crate::display::LcdController;
 use crate::events::{handle_input_event, InputEvent, UIState};
@@ -97,6 +97,17 @@ where
             #[allow(static_mut_refs)]
             let rx_buf = unsafe { &mut crate::HTTP_RX_BUF };
             send_stop(stack, rx_buf).await;
+        }
+
+        if matches!(event, InputEvent::EncoderButton) {
+            if let UIState::BrowseRecipes { index } = self.ui_state {
+                if let Some(recipe) = self.recipes.get(index) {
+                    info!("Sending POST /start with recipe: {}", recipe.title.as_str());
+                    #[allow(static_mut_refs)]
+                    let rx_buf = unsafe { &mut crate::HTTP_RX_BUF };
+                    send_start(stack, rx_buf, recipe.id.as_str()).await;
+                }
+            }
         }
 
         handle_input_event(event, &mut self.ui_state, &self.recipes);
