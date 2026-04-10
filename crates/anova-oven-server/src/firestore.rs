@@ -73,6 +73,27 @@ pub struct FirebaseSession {
     pub refresh_token: String,
 }
 
+/// Error returned by Firestore fetch operations.
+#[derive(Debug)]
+pub enum FirestoreError {
+    /// HTTP 401 / UNAUTHENTICATED — the Firebase ID token has expired.
+    /// The caller should call [`refresh_session`] and retry.
+    Unauthorized,
+    /// Any other error.
+    Other(Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl std::fmt::Display for FirestoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FirestoreError::Unauthorized => write!(f, "Unauthorized (Firebase token expired)"),
+            FirestoreError::Other(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for FirestoreError {}
+
 /// Sign in with email + password, returning a [`FirebaseSession`].
 pub async fn sign_in(
     client: &reqwest::Client,
@@ -455,7 +476,7 @@ fn parse_recipe_doc(doc: Document) -> anova_oven_api::Recipe {
 pub async fn fetch_recipes(
     client: &reqwest::Client,
     session: &FirebaseSession,
-) -> Result<Vec<anova_oven_api::Recipe>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Vec<anova_oven_api::Recipe>, FirestoreError> {
     let query = user_recipes_query(&session.uid, 100);
     let url = run_query_url("");
     let resp = client
@@ -463,13 +484,22 @@ pub async fn fetch_recipes(
         .bearer_auth(&session.id_token)
         .json(&query)
         .send()
-        .await?;
+        .await
+        .map_err(|e| FirestoreError::Other(e.into()))?;
     if !resp.status().is_success() {
         let status = resp.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(FirestoreError::Unauthorized);
+        }
         let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Firestore runQuery (recipes) failed ({status}): {body}").into());
+        return Err(FirestoreError::Other(
+            format!("Firestore runQuery (recipes) failed ({status}): {body}").into(),
+        ));
     }
-    let items: Vec<RunQueryItem> = resp.json().await?;
+    let items: Vec<RunQueryItem> = resp
+        .json()
+        .await
+        .map_err(|e| FirestoreError::Other(e.into()))?;
 
     let mut recipes: Vec<anova_oven_api::Recipe> = items
         .into_iter()
@@ -477,16 +507,26 @@ pub async fn fetch_recipes(
         .map(parse_recipe_doc)
         .collect();
 
+    // Normalize all recipes for Anova compatibility (fan speed, etc)
+    for recipe in &mut recipes {
+        recipe.normalize();
+    }
+
     // Merge in bookmarked recipes, skipping any already present by ID.
-    let bookmarked = fetch_bookmarked_recipes(client, session)
-        .await
-        .unwrap_or_else(|e| {
+    // Auth errors from bookmarks are propagated so the caller can refresh;
+    // other errors are swallowed (bookmarks are non-critical).
+    let bookmarked = match fetch_bookmarked_recipes(client, session).await {
+        Ok(b) => b,
+        Err(e @ FirestoreError::Unauthorized) => return Err(e),
+        Err(FirestoreError::Other(e)) => {
             eprintln!("[recipes] Failed to fetch bookmarks: {e}");
             Vec::new()
-        });
+        }
+    };
     let own_ids: std::collections::HashSet<String> = recipes.iter().map(|r| r.id.clone()).collect();
-    for recipe in bookmarked {
+    for mut recipe in bookmarked {
         if !own_ids.contains(&recipe.id) {
+            recipe.normalize();
             recipes.push(recipe);
         }
     }
@@ -498,7 +538,7 @@ pub async fn fetch_recipes(
 async fn fetch_bookmarked_recipes(
     client: &reqwest::Client,
     session: &FirebaseSession,
-) -> Result<Vec<anova_oven_api::Recipe>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Vec<anova_oven_api::Recipe>, FirestoreError> {
     let query = favorites_query(100);
     let parent_path = format!("users/{}", session.uid);
     let url = run_query_url(&parent_path);
@@ -507,13 +547,22 @@ async fn fetch_bookmarked_recipes(
         .bearer_auth(&session.id_token)
         .json(&query)
         .send()
-        .await?;
+        .await
+        .map_err(|e| FirestoreError::Other(e.into()))?;
     if !resp.status().is_success() {
         let status = resp.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(FirestoreError::Unauthorized);
+        }
         let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Firestore runQuery (bookmarks) failed ({status}): {body}").into());
+        return Err(FirestoreError::Other(
+            format!("Firestore runQuery (bookmarks) failed ({status}): {body}").into(),
+        ));
     }
-    let items: Vec<RunQueryItem> = resp.json().await?;
+    let items: Vec<RunQueryItem> = resp
+        .json()
+        .await
+        .map_err(|e| FirestoreError::Other(e.into()))?;
 
     // Extract recipe IDs from recipeRef fields.
     let recipe_ids: Vec<String> = items
@@ -553,7 +602,7 @@ pub async fn fetch_history(
     client: &reqwest::Client,
     session: &FirebaseSession,
     limit: u32,
-) -> Result<Vec<anova_oven_api::HistoryEntry>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Vec<anova_oven_api::HistoryEntry>, FirestoreError> {
     // Fetch oven-cooks subcollection.
     let query = oven_cooks_query(limit);
     let parent_path = format!("users/{}", session.uid);
@@ -563,13 +612,22 @@ pub async fn fetch_history(
         .bearer_auth(&session.id_token)
         .json(&query)
         .send()
-        .await?;
+        .await
+        .map_err(|e| FirestoreError::Other(e.into()))?;
     if !resp.status().is_success() {
         let status = resp.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(FirestoreError::Unauthorized);
+        }
         let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Firestore runQuery (history) failed ({status}): {body}").into());
+        return Err(FirestoreError::Other(
+            format!("Firestore runQuery (history) failed ({status}): {body}").into(),
+        ));
     }
-    let items: Vec<RunQueryItem> = resp.json().await?;
+    let items: Vec<RunQueryItem> = resp
+        .json()
+        .await
+        .map_err(|e| FirestoreError::Other(e.into()))?;
 
     // Collect all unique recipe IDs referenced by cooks.
     struct CookInfo {
@@ -687,7 +745,7 @@ async fn fetch_recipe_titles(
 pub async fn fetch_current_cook(
     client: &reqwest::Client,
     session: &FirebaseSession,
-) -> Result<Option<anova_oven_api::CurrentCook>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Option<anova_oven_api::CurrentCook>, FirestoreError> {
     let parent_path = format!("users/{}", session.uid);
     let url = run_query_url(&parent_path);
 
@@ -699,15 +757,24 @@ pub async fn fetch_current_cook(
         .bearer_auth(&session.id_token)
         .json(&query)
         .send()
-        .await?;
+        .await
+        .map_err(|e| FirestoreError::Other(e.into()))?;
 
     if !resp.status().is_success() {
         let status = resp.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(FirestoreError::Unauthorized);
+        }
         let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Firestore runQuery (current-cook) failed ({status}): {body}").into());
+        return Err(FirestoreError::Other(
+            format!("Firestore runQuery (current-cook) failed ({status}): {body}").into(),
+        ));
     }
 
-    let items: Vec<RunQueryItem> = resp.json().await?;
+    let items: Vec<RunQueryItem> = resp
+        .json()
+        .await
+        .map_err(|e| FirestoreError::Other(e.into()))?;
 
     // Look for a document that lacks endedTimestamp, indicating in-progress.
     for item in &items {

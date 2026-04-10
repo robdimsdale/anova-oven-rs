@@ -1,7 +1,9 @@
 use defmt::{debug, info};
 use embassy_time::{Duration, Instant};
 
-use crate::api::{fetch_and_log_recipes, fetch_and_log_status, fetch_current_cook, send_stop, send_start};
+use crate::api::{
+    fetch_and_log_recipes, fetch_and_log_status, fetch_current_cook, send_start, send_stop,
+};
 use crate::backlight::BacklightController;
 use crate::display::LcdController;
 use crate::events::{handle_input_event, InputEvent, UIState};
@@ -66,6 +68,7 @@ where
         self.current_cook = fetch_current_cook(stack, rx_buf).await;
         self.latest_status = fetch_and_log_status(stack, rx_buf).await;
         self.recipes = fetch_and_log_recipes(stack, rx_buf).await;
+        self.reconcile_current_cook_recipe_title();
     }
 
     pub(crate) fn update_inactivity_timeout(&mut self) {
@@ -118,14 +121,12 @@ where
             #[allow(static_mut_refs)]
             let rx_buf = unsafe { &mut crate::HTTP_RX_BUF };
             self.current_cook = fetch_current_cook(stack, rx_buf).await;
+            self.reconcile_current_cook_recipe_title();
         }
 
         #[allow(static_mut_refs)]
         let rx_buf = unsafe { &mut crate::HTTP_RX_BUF };
         if let Some(status) = fetch_and_log_status(stack, rx_buf).await {
-            if status.mode == "idle" && self.current_cook.is_some() {
-                self.current_cook = None;
-            }
             self.latest_status = Some(status);
         }
 
@@ -173,6 +174,20 @@ where
         } else if active_cook || !matches!(self.ui_state, UIState::ShowStatus) {
             debug!("Setting backlight to full: (active state)");
             self.backlight_controller.set_full();
+        }
+    }
+
+    fn reconcile_current_cook_recipe_title(&mut self) {
+        let Some(cook) = self.current_cook.as_mut() else {
+            return;
+        };
+
+        let Some(recipe_id) = cook.recipe_id.as_deref() else {
+            return;
+        };
+
+        if let Some(recipe) = self.recipes.iter().find(|recipe| recipe.id == recipe_id) {
+            cook.recipe_title = recipe.title.clone();
         }
     }
 }

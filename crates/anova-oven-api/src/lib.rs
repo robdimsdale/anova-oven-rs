@@ -199,6 +199,62 @@ pub struct Stage {
     pub title: Option<String>,
 }
 
+impl Stage {
+    /// Build a websocket-compatible temperature setpoint payload.
+    pub fn websocket_setpoint_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "celsius": self.temperature_c,
+            "fahrenheit": self.temperature_c * 1.8 + 32.0
+        })
+    }
+
+    /// Build websocket `temperatureBulbs` payload for this stage.
+    pub fn websocket_temperature_bulbs_json(&self) -> serde_json::Value {
+        let mode = self.temperature_bulbs_mode.as_deref().unwrap_or("dry");
+        let setpoint = self.websocket_setpoint_json();
+
+        if mode == "wet" {
+            serde_json::json!({
+                "mode": "wet",
+                "wet": { "setpoint": setpoint }
+            })
+        } else {
+            serde_json::json!({
+                "mode": "dry",
+                "dry": { "setpoint": setpoint }
+            })
+        }
+    }
+
+    /// Normalize fan speed for Anova compatibility.
+    ///
+    /// The Anova requires fan speed to be 100% when:
+    /// - Rear heating element is selected, OR
+    /// - Steam is set to any percentage > 0
+    ///
+    /// This method updates the stage in-place to enforce this rule.
+    pub fn normalize_fan_speed(&mut self) {
+        let has_rear_heat = self.heating_element_rear.unwrap_or(false);
+        let has_steam = self.steam_pct > 0.0;
+
+        if has_rear_heat || has_steam {
+            self.fan_speed = 100;
+        }
+    }
+}
+
+impl Recipe {
+    /// Normalize all stages in the recipe for Anova compatibility.
+    ///
+    /// Calls [`Stage::normalize_fan_speed`] on each stage to ensure
+    /// fan speed is set to 100% when rear heat or steam are present.
+    pub fn normalize(&mut self) {
+        for stage in &mut self.stages {
+            stage.normalize_fan_speed();
+        }
+    }
+}
+
 /// A cook history entry, as served by `GET /history`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryEntry {
@@ -229,10 +285,10 @@ pub struct CurrentCook {
 }
 
 impl CurrentCook {
-    /// Display name: recipe title, or "Manual cook" for custom cooks.
+    /// Display name: recipe title, or "Custom cook" for custom cooks.
     pub fn display_name(&self) -> &str {
         if self.recipe_title == "[custom]" {
-            "Manual cook"
+            "Custom cook"
         } else {
             &self.recipe_title
         }

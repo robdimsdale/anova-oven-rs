@@ -29,10 +29,10 @@ use axum::response::IntoResponse;
 use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use http::{HeaderName, HeaderValue, Uri};
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio_websockets::{ClientBuilder, Message};
 use uuid::Uuid;
-use serde::{Deserialize, Serialize};
 
 // ─── Shared application state ─────────────────────────────────────────────────
 
@@ -127,13 +127,38 @@ fn stop_command_json(cooker_id: &str) -> String {
 fn start_command_json(cooker_id: &str, stages: &[anova_oven_api::Stage]) -> String {
     let request_id = Uuid::new_v4();
     let cook_id = format!("server-{}", Uuid::new_v4());
-    
+
     // Convert recipe stages to WebSocket stage format
     let ws_stages: Vec<serde_json::Value> = stages
         .iter()
         .map(|stage| {
             let stage_id = format!("stage-{}", Uuid::new_v4());
-            
+
+            // Apply sensible defaults for fan speed (Anova requires fan to run)
+            let fan_speed = if stage.fan_speed == 0 {
+                75
+            } else {
+                stage.fan_speed
+            };
+
+            let temperature_bulbs_mode = stage.temperature_bulbs_mode.as_deref().unwrap_or("dry");
+            let setpoint = serde_json::json!({
+                "celsius": stage.temperature_c,
+                "fahrenheit": stage.temperature_c * 1.8 + 32.0
+            });
+
+            let temperature_bulbs = if temperature_bulbs_mode == "wet" {
+                serde_json::json!({
+                    "mode": "wet",
+                    "wet": { "setpoint": setpoint }
+                })
+            } else {
+                serde_json::json!({
+                    "mode": "dry",
+                    "dry": { "setpoint": setpoint }
+                })
+            };
+
             // Build the stage object with all fields from the recipe
             let mut stage_obj = serde_json::json!({
                 "stepType": "stage",
@@ -142,29 +167,23 @@ fn start_command_json(cooker_id: &str, stages: &[anova_oven_api::Stage]) -> Stri
                 "type": stage.kind.as_str(),
                 "userActionRequired": stage.user_action_required.unwrap_or(false),
                 "stageTransitionType": "automatic",
-                "temperatureBulbs": {
-                    "mode": stage.temperature_bulbs_mode.as_deref().unwrap_or("dry"),
-                    "dry": {
-                        "setpoint": {
-                            "celsius": stage.temperature_c,
-                            "fahrenheit": stage.temperature_c * 1.8 + 32.0
-                        }
-                    }
-                },
+                "temperatureBulbs": temperature_bulbs,
                 "heatingElements": {
                     "top": { "on": stage.heating_element_top.unwrap_or(true) },
                     "rear": { "on": stage.heating_element_rear.unwrap_or(true) },
                     "bottom": { "on": stage.heating_element_bottom.unwrap_or(true) }
                 },
-                "fan": { "speed": stage.fan_speed },
+                "fan": { "speed": fan_speed },
                 "vent": { "open": stage.vent_open.unwrap_or(false) },
                 "rackPosition": stage.rack_position.unwrap_or(3),
                 "steamGenerators": {
                     "mode": "steam-percentage",
                     "steamPercentage": { "setpoint": stage.steam_pct }
-                }
+                },
+                "timerAdded": false,
+                "probeAdded": false
             });
-            
+
             // Add timer or probe based on stage configuration
             if let Some(duration) = stage.duration_secs {
                 stage_obj["timerAdded"] = serde_json::json!(true);
@@ -180,11 +199,11 @@ fn start_command_json(cooker_id: &str, stages: &[anova_oven_api::Stage]) -> Stri
                     }
                 });
             }
-            
+
             stage_obj
         })
         .collect();
-    
+
     serde_json::json!({
         "command": "CMD_APO_START",
         "payload": {
@@ -264,7 +283,15 @@ async fn ws_connect_and_run(
                                     cooker_id = Some(id);
                                 }
                             }
-                            _ => {}
+                            Ok(protocol::Event::Response { request_id, status }) => {
+                                eprintln!("[ws] Response: request_id={} status={}", request_id, status);
+                            }
+                            Ok(event) => {
+                                eprintln!("[ws] Event: {:?}", event);
+                            }
+                            Err(e) => {
+                                eprintln!("[ws] Parse error: {}", e);
+                            }
                         }
                     }
                     Some(Err(e)) => return Err(e.into()),
@@ -285,8 +312,10 @@ async fn ws_connect_and_run(
                     Some(WsCommand::Start(stages)) => {
                         match &cooker_id {
                             Some(id) => {
+                                let cmd_json = start_command_json(id, &stages);
                                 eprintln!("[ws] Sending CMD_APO_START for cooker {id}");
-                                sink.send(Message::text(start_command_json(id, &stages))).await?;
+                                eprintln!("[ws] Command JSON: {}", cmd_json);
+                                sink.send(Message::text(cmd_json)).await?;
                             }
                             None => eprintln!("[ws] Start requested but cooker ID not yet known"),
                         }
@@ -320,7 +349,17 @@ async fn handle_recipes(State(state): State<Arc<AppState>>) -> impl IntoResponse
     }
 
     let session = state.session.lock().await.clone();
-    match firestore::fetch_recipes(&state.http, &session).await {
+    let result = match firestore::fetch_recipes(&state.http, &session).await {
+        Ok(v) => Ok(v),
+        Err(err) => match maybe_refresh_session(&state, err).await {
+            Ok(fresh) => firestore::fetch_recipes(&state.http, &fresh)
+                .await
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e),
+        },
+    };
+
+    match result {
         Ok(recipes) => {
             let mut cache = state.recipes.lock().await;
             *cache = Some(recipes.clone());
@@ -372,14 +411,47 @@ async fn handle_start(
             .into_response();
     }
 
-    // Fetch the recipe by ID from the cached recipes
-    let recipes = state.recipes.lock().await;
-    let recipe = match &*recipes {
-        Some(recipes) => recipes.iter().find(|r| r.id == req.recipe_id).cloned(),
-        None => None,
+    // Try cache first. After a server restart, this cache may be empty.
+    let cached_recipe = {
+        let recipes = state.recipes.lock().await;
+        recipes
+            .as_ref()
+            .and_then(|recipes| recipes.iter().find(|r| r.id == req.recipe_id).cloned())
     };
-    
-    drop(recipes);
+
+    let recipe = if let Some(recipe) = cached_recipe {
+        Some(recipe)
+    } else {
+        // Cache miss: hydrate recipes from Firestore so /start works even when
+        // the server has just restarted and /recipes has not been called yet.
+        let session = state.session.lock().await.clone();
+        let fetched = match firestore::fetch_recipes(&state.http, &session).await {
+            Ok(v) => Ok(v),
+            Err(err) => match maybe_refresh_session(&state, err).await {
+                Ok(fresh) => firestore::fetch_recipes(&state.http, &fresh)
+                    .await
+                    .map_err(|e| e.to_string()),
+                Err(e) => Err(e),
+            },
+        };
+
+        match fetched {
+            Ok(recipes) => {
+                let recipe = recipes.iter().find(|r| r.id == req.recipe_id).cloned();
+                let mut cache = state.recipes.lock().await;
+                *cache = Some(recipes);
+                recipe
+            }
+            Err(e) => {
+                eprintln!("[start] Failed to refresh recipes after cache miss: {e}");
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    format!("Failed to fetch recipes for start request: {e}"),
+                )
+                    .into_response();
+            }
+        }
+    };
 
     let recipe = match recipe {
         Some(r) => r,
@@ -411,7 +483,17 @@ async fn handle_history(State(state): State<Arc<AppState>>) -> impl IntoResponse
     }
 
     let session = state.session.lock().await.clone();
-    match firestore::fetch_history(&state.http, &session, 50).await {
+    let result = match firestore::fetch_history(&state.http, &session, 50).await {
+        Ok(v) => Ok(v),
+        Err(err) => match maybe_refresh_session(&state, err).await {
+            Ok(fresh) => firestore::fetch_history(&state.http, &fresh, 50)
+                .await
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e),
+        },
+    };
+
+    match result {
         Ok(history) => {
             let mut cache = state.history.lock().await;
             *cache = Some(history.clone());
@@ -432,9 +514,40 @@ fn celcius_to_fahrenheit(c: f32) -> f32 {
     c * 9.0 / 5.0 + 32.0
 }
 
+/// If `err` is [`firestore::FirestoreError::Unauthorized`], refreshes the
+/// Firebase session in `state` and returns a fresh clone so the caller can
+/// retry the failed request. Any other error is converted to a `String` and returned as `Err`.
+async fn maybe_refresh_session(
+    state: &AppState,
+    err: firestore::FirestoreError,
+) -> Result<firestore::FirebaseSession, String> {
+    match err {
+        firestore::FirestoreError::Unauthorized => {
+            eprintln!("[auth] Firebase token expired — refreshing...");
+            let mut locked = state.session.lock().await;
+            if let Err(e) = firestore::refresh_session(&state.http, &mut locked).await {
+                return Err(format!("Token refresh failed: {e}"));
+            }
+            eprintln!("[auth] Token refreshed successfully.");
+            Ok(locked.clone())
+        }
+        firestore::FirestoreError::Other(e) => Err(e.to_string()),
+    }
+}
+
 async fn handle_current_cook(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let session = state.session.lock().await.clone();
-    match firestore::fetch_current_cook(&state.http, &session).await {
+    let result = match firestore::fetch_current_cook(&state.http, &session).await {
+        Ok(v) => Ok(v),
+        Err(err) => match maybe_refresh_session(&state, err).await {
+            Ok(fresh) => firestore::fetch_current_cook(&state.http, &fresh)
+                .await
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e),
+        },
+    };
+
+    match result {
         Ok(Some(cook)) => Json(cook).into_response(),
         Ok(None) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
