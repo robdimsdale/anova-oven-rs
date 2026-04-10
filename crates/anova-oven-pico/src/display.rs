@@ -1,9 +1,31 @@
-use hd44780_driver::non_blocking::HD44780;
+use hd44780_driver::non_blocking::{Cursor, CursorBlink, Display, DisplayMode, HD44780};
 
 use embassy_time::Delay;
 
 pub fn celcius_to_fahrenheit(c: f32) -> f32 {
     c * 1.8 + 32.0
+}
+
+pub async fn configure_lcd_display<
+    B: hd44780_driver::non_blocking::bus::DataBus,
+    M: hd44780_driver::memory_map::DisplayMemoryMap,
+    C: hd44780_driver::charset::CharsetWithFallback,
+>(
+    lcd: &mut HD44780<B, M, C>,
+    delay: &mut Delay,
+) {
+    lcd.set_display_mode(
+        DisplayMode {
+            cursor_visibility: Cursor::Invisible,
+            cursor_blink: CursorBlink::Off,
+            display: Display::On,
+        },
+        delay,
+    )
+    .await
+    .ok();
+    lcd.reset(delay).await.ok();
+    lcd.clear(delay).await.ok();
 }
 
 pub async fn render_status_display<
@@ -116,7 +138,10 @@ pub async fn render_status_display<
         }
     } else {
         lcd.set_cursor_xy((0, 0), delay).await.ok();
-        let temp_str = alloc::format!("{:.0}", celcius_to_fahrenheit(status.current_temperature_c()));
+        let temp_str = alloc::format!(
+            "{:.0}",
+            celcius_to_fahrenheit(status.current_temperature_c())
+        );
         let mut row0_len = temp_str.len() + 2;
         lcd.write_str(&temp_str, delay).await.ok();
         lcd.write_byte(0xDF, delay).await.ok();

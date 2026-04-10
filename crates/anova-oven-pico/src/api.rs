@@ -210,7 +210,11 @@ pub async fn fetch_and_log_recipes(
         Ok(recipes) => {
             info!("Recipes: {} found", recipes.len());
             for recipe in &recipes {
-                info!("  - {} ({} stages)", recipe.title.as_str(), recipe.stage_count);
+                info!(
+                    "  - {} ({} stages)",
+                    recipe.title.as_str(),
+                    recipe.stage_count
+                );
             }
             recipes
         }
