@@ -1,43 +1,74 @@
-use embassy_time::{Delay, Duration, Instant};
-use hd44780_driver::non_blocking::HD44780;
+use defmt::{debug, info};
+use embassy_time::{Duration, Instant};
 
-use crate::api::{fetch_and_log_status, fetch_current_cook};
+use crate::api::{fetch_and_log_recipes, fetch_and_log_status, fetch_current_cook};
 use crate::backlight::BacklightController;
-use crate::display::{render_recipe_browser, render_status_display};
+use crate::display::LcdController;
 use crate::events::{handle_input_event, UIState};
 use crate::logic::{is_active_cook, should_dim_backlight};
 
-pub(crate) struct AppState {
+pub(crate) struct AppState<DB, MM, CH>
+where
+    DB: hd44780_driver::non_blocking::bus::DataBus,
+    MM: hd44780_driver::memory_map::DisplayMemoryMap,
+    CH: hd44780_driver::charset::CharsetWithFallback,
+{
     pub(crate) tick: u64,
     pub(crate) ui_state: UIState,
     pub(crate) last_input_at: Option<Instant>,
     pub(crate) baseline_reentered_at: Option<Instant>,
-    pub(crate) backlight_dimmed: bool,
     pub(crate) current_cook: Option<anova_oven_api::CurrentCook>,
     pub(crate) latest_status: Option<anova_oven_api::OvenStatus>,
+    pub(crate) recipes: alloc::vec::Vec<anova_oven_api::Recipe>,
+
+    backlight_controller: BacklightController,
+    lcd_controller: LcdController<DB, MM, CH>,
 }
 
-impl AppState {
+impl<DB, MM, CH> AppState<DB, MM, CH>
+where
+    DB: hd44780_driver::non_blocking::bus::DataBus,
+    MM: hd44780_driver::memory_map::DisplayMemoryMap,
+    CH: hd44780_driver::charset::CharsetWithFallback,
+{
     pub(crate) fn new(
-        current_cook: Option<anova_oven_api::CurrentCook>,
-        latest_status: Option<anova_oven_api::OvenStatus>,
+        backlight_controller: BacklightController,
+        lcd_controller: LcdController<DB, MM, CH>,
     ) -> Self {
         Self {
             tick: 0,
             ui_state: UIState::ShowStatus,
             last_input_at: None,
             baseline_reentered_at: Some(Instant::now()),
-            backlight_dimmed: true,
-            current_cook,
-            latest_status,
+            current_cook: None,
+            latest_status: None,
+            recipes: alloc::vec::Vec::new(),
+            backlight_controller,
+            lcd_controller,
         }
+    }
+
+    pub(crate) async fn render_wifi_init(&mut self) {
+        self.lcd_controller.render_wifi_init().await;
+    }
+
+    pub(crate) async fn render_dhcp_init(&mut self) {
+        self.lcd_controller.render_dhcp_init().await;
+    }
+
+    pub(crate) async fn init_data(&mut self, stack: embassy_net::Stack<'static>) {
+        #[allow(static_mut_refs)]
+        let rx_buf = unsafe { &mut crate::HTTP_RX_BUF };
+        self.current_cook = fetch_current_cook(stack, rx_buf).await;
+        self.latest_status = fetch_and_log_status(stack, rx_buf).await;
+        self.recipes = fetch_and_log_recipes(stack, rx_buf).await;
     }
 
     pub(crate) fn update_inactivity_timeout(&mut self) {
         if let Some(t) = self.last_input_at {
             if t.elapsed() >= Duration::from_secs(crate::INACTIVITY_TIMEOUT_SECS) {
                 if !matches!(self.ui_state, UIState::ShowStatus) {
-                    defmt::info!("Inactivity timeout: reverting to ShowStatus");
+                    info!("Inactivity timeout: reverting to ShowStatus");
                     self.ui_state = UIState::ShowStatus;
                     self.baseline_reentered_at = Some(Instant::now());
                 }
@@ -46,22 +77,14 @@ impl AppState {
         }
     }
 
-    pub(crate) fn handle_user_activity(
-        &mut self,
-        event: crate::events::InputEvent,
-        recipes: &[anova_oven_api::Recipe],
-        backlight: &mut BacklightController,
-    ) {
+    pub(crate) fn handle_user_activity(&mut self, event: crate::events::InputEvent) {
         self.last_input_at = Some(Instant::now());
         self.baseline_reentered_at = None;
 
-        if self.backlight_dimmed {
-            backlight.set_full();
-            self.backlight_dimmed = false;
-            defmt::info!("Backlight: 100% (input activity)");
-        }
+        debug!("Setting backlight to full: (input activity)");
+        self.backlight_controller.set_full();
 
-        handle_input_event(event, &mut self.ui_state, recipes);
+        handle_input_event(event, &mut self.ui_state, &self.recipes);
     }
 
     pub(crate) async fn poll_status_if_due(&mut self, stack: embassy_net::Stack<'static>) {
@@ -83,7 +106,27 @@ impl AppState {
         self.tick += 1;
     }
 
-    pub(crate) fn apply_backlight_policy(&mut self, backlight: &mut BacklightController) {
+    pub(crate) async fn render_current_view(&mut self) {
+        self.apply_backlight_policy();
+        match &self.ui_state {
+            UIState::ShowStatus => {
+                self.lcd_controller
+                    .render_status_display(
+                        self.tick,
+                        self.latest_status.as_ref(),
+                        self.current_cook.as_ref(),
+                    )
+                    .await;
+            }
+            UIState::BrowseRecipes { index } => {
+                self.lcd_controller
+                    .render_recipe_browser(&self.recipes, *index)
+                    .await;
+            }
+        }
+    }
+
+    fn apply_backlight_policy(&mut self) {
         let active_cook = is_active_cook(
             self.current_cook.is_some(),
             self.latest_status
@@ -98,43 +141,12 @@ impl AppState {
             crate::LED_DIM_TIMER_SECS,
         );
 
-        if should_dim && !self.backlight_dimmed {
-            backlight.set_dim();
-            self.backlight_dimmed = true;
-            defmt::info!("Backlight: dim (idle baseline)");
-        } else if (active_cook || !matches!(self.ui_state, UIState::ShowStatus))
-            && self.backlight_dimmed
-        {
-            backlight.set_full();
-            self.backlight_dimmed = false;
-            defmt::info!("Backlight: full (active state)");
-        }
-    }
-
-    pub(crate) async fn render_current_view(
-        &self,
-        lcd: &mut HD44780<
-            impl hd44780_driver::non_blocking::bus::DataBus,
-            impl hd44780_driver::memory_map::DisplayMemoryMap,
-            impl hd44780_driver::charset::CharsetWithFallback,
-        >,
-        delay: &mut Delay,
-        recipes: &[anova_oven_api::Recipe],
-    ) {
-        match &self.ui_state {
-            UIState::ShowStatus => {
-                render_status_display(
-                    lcd,
-                    delay,
-                    self.tick,
-                    self.latest_status.as_ref(),
-                    self.current_cook.as_ref(),
-                )
-                .await;
-            }
-            UIState::BrowseRecipes { index } => {
-                render_recipe_browser(lcd, delay, recipes, *index).await;
-            }
+        if should_dim {
+            self.backlight_controller.set_dim();
+            debug!("Setting backlight to dim: (idle baseline)");
+        } else if active_cook || !matches!(self.ui_state, UIState::ShowStatus) {
+            debug!("Setting backlight to full: (active state)");
+            self.backlight_controller.set_full();
         }
     }
 }

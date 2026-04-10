@@ -23,7 +23,6 @@ use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::{Input, Level, Output, Pull};
 use embassy_rp::peripherals::{DMA_CH0, PIO0};
 use embassy_rp::pio::Pio;
-use embassy_rp::pwm::{Config as PwmConfig, Pwm};
 use embassy_time::{Delay, Duration, Timer};
 use hd44780_driver::{
     bus::FourBitBusPins, memory_map::MemoryMap1602, non_blocking::HD44780,
@@ -32,13 +31,10 @@ use hd44780_driver::{
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
-use crate::api::{fetch_and_log_recipes, fetch_and_log_status, fetch_current_cook};
 use crate::app_state::AppState;
 use crate::backlight::BacklightController;
-use crate::display::{configure_lcd_display, render_status_display};
-use crate::events::{
-    rot_enc_button_task, rotary_encoder_task, stop_button_task, EVENT_CHANNEL,
-};
+use crate::display::LcdController;
+use crate::events::{rot_enc_button_task, rotary_encoder_task, stop_button_task, EVENT_CHANNEL};
 
 const WIFI_SSID: &str = env!("ANOVA_WIFI_SSID");
 const WIFI_PASSWORD: &str = env!("ANOVA_WIFI_PASSWORD");
@@ -62,114 +58,6 @@ static CLM: &[u8] = include_bytes!("../firmware/43439A0_clm.bin");
 
 pub(crate) static mut HTTP_RX_BUF: [u8; 16384] = [0u8; 16384];
 
-fn init_heap() {
-    use core::mem::MaybeUninit;
-
-    const HEAP_SIZE: usize = 32768;
-    static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP_SIZE];
-
-    #[allow(static_mut_refs)]
-    unsafe {
-        HEAP.init(HEAP_MEM.as_ptr() as usize, HEAP_SIZE);
-    }
-}
-
-fn init_backlight_pwm(
-    pwm_slice3: embassy_rp::Peri<'static, embassy_rp::peripherals::PWM_SLICE3>,
-    pin6: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_6>,
-    pin7: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_7>,
-    pwm_slice4: embassy_rp::Peri<'static, embassy_rp::peripherals::PWM_SLICE4>,
-    pin8: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_8>,
-) -> BacklightController {
-    let mut backlight_cfg = PwmConfig::default();
-    backlight_cfg.top = 0x8000;
-    backlight_cfg.invert_a = true;
-    backlight_cfg.invert_b = true;
-    backlight_cfg.compare_b = 0;
-
-    let pwm_red_green = Pwm::new_output_ab(pwm_slice3, pin6, pin7, backlight_cfg.clone());
-
-    backlight_cfg.compare_a = 0;
-    backlight_cfg.compare_b = 0;
-    let pwm_blue = Pwm::new_output_a(pwm_slice4, pin8, backlight_cfg);
-
-    BacklightController::new(pwm_red_green, pwm_blue)
-}
-
-async fn connect_wifi(control: &mut cyw43::Control<'static>) {
-    info!("Connecting to WiFi: {}", WIFI_SSID);
-    loop {
-        match control
-            .join(WIFI_SSID, cyw43::JoinOptions::new(WIFI_PASSWORD.as_bytes()))
-            .await
-        {
-            Ok(_) => {
-                info!("WiFi connected");
-                break;
-            }
-            Err(e) => {
-                warn!("WiFi join failed: {}", e);
-                Timer::after(Duration::from_secs(1)).await;
-            }
-        }
-    }
-}
-
-async fn wait_for_dhcp(stack: embassy_net::Stack<'static>) {
-    info!("Waiting for DHCP...");
-    while !stack.is_config_up() {
-        Timer::after(Duration::from_millis(100)).await;
-    }
-    info!("Network is up");
-    if let Some(config) = stack.config_v4() {
-        info!("IP address: {}", config.address);
-    }
-}
-
-fn spawn_input_tasks(
-    spawner: &Spawner,
-    stack: embassy_net::Stack<'static>,
-    stop_button_pin: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_15>,
-    rot_enc_button_pin: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_11>,
-    enc_a_pin: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_9>,
-    enc_b_pin: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_10>,
-) {
-    let stop_button = Input::new(stop_button_pin, Pull::Up);
-    spawner.spawn(stop_button_task(stack, stop_button).unwrap());
-    info!("Stop button task spawned on GPIO 15");
-
-    let rot_enc_button = Input::new(rot_enc_button_pin, Pull::Up);
-    spawner.spawn(rot_enc_button_task(rot_enc_button).unwrap());
-    info!("Rotary encoder button task spawned on GPIO 11");
-
-    let enc_a = Input::new(enc_a_pin, Pull::Up);
-    let enc_b = Input::new(enc_b_pin, Pull::Up);
-    spawner.spawn(rotary_encoder_task(enc_a, enc_b).unwrap());
-    info!("Rotary encoder task spawned on GPIO 9/10");
-}
-
-async fn fetch_initial_data(
-    stack: embassy_net::Stack<'static>,
-) -> (
-    alloc::vec::Vec<anova_oven_api::Recipe>,
-    Option<anova_oven_api::CurrentCook>,
-    Option<anova_oven_api::OvenStatus>,
-) {
-    #[allow(static_mut_refs)]
-    let rx_buf = unsafe { &mut HTTP_RX_BUF };
-    let recipes = fetch_and_log_recipes(stack, rx_buf).await;
-
-    #[allow(static_mut_refs)]
-    let rx_buf = unsafe { &mut HTTP_RX_BUF };
-    let current_cook = fetch_current_cook(stack, rx_buf).await;
-
-    #[allow(static_mut_refs)]
-    let rx_buf = unsafe { &mut HTTP_RX_BUF };
-    let latest_status = fetch_and_log_status(stack, rx_buf).await;
-
-    (recipes, current_cook, latest_status)
-}
-
 #[embassy_executor::task]
 async fn cyw43_task(
     runner: cyw43::Runner<'static, cyw43::SpiBus<Output<'static>, PioSpi<'static, PIO0, 0>>>,
@@ -184,12 +72,27 @@ async fn net_task(mut runner: embassy_net::Runner<'static, cyw43::NetDriver<'sta
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    init_heap();
+    // Init heap
+
+    use core::mem::MaybeUninit;
+
+    const HEAP_SIZE: usize = 32768;
+    static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP_SIZE];
+
+    #[allow(static_mut_refs)]
+    unsafe {
+        HEAP.init(HEAP_MEM.as_ptr() as usize, HEAP_SIZE);
+    }
+
+    // Init peripherals
 
     let p = embassy_rp::init(Default::default());
-    let mut delay = Delay;
 
-    let mut lcd = match HD44780::new(
+    // Init LCD
+
+    let mut lcd_delay = Delay;
+
+    let lcd = match HD44780::new(
         DisplayOptions4Bit::new(MemoryMap1602::new()).with_pins(FourBitBusPins {
             rs: Output::new(p.PIN_17, Level::Low),
             en: Output::new(p.PIN_16, Level::Low),
@@ -198,22 +101,25 @@ async fn main(spawner: Spawner) {
             d6: Output::new(p.PIN_19, Level::Low),
             d7: Output::new(p.PIN_18, Level::Low),
         }),
-        &mut delay,
+        &mut lcd_delay,
     )
     .await
     {
         Ok(lcd) => lcd,
         Err(_) => panic!("LCD init failed"),
     };
-    configure_lcd_display(&mut lcd, &mut delay).await;
 
-    let mut backlight =
-        init_backlight_pwm(p.PWM_SLICE3, p.PIN_6, p.PIN_7, p.PWM_SLICE4, p.PIN_8);
-    backlight.set_full();
+    let mut lcd_controller = LcdController::new(lcd, lcd_delay);
+    lcd_controller.configure().await;
 
-    lcd.write_str("Anova Oven", &mut delay).await.ok();
-    lcd.set_cursor_xy((0, 1), &mut delay).await.ok();
-    lcd.write_str("Init: WIFI...", &mut delay).await.ok();
+    let mut app = AppState::new(
+        BacklightController::new(p.PWM_SLICE3, p.PIN_6, p.PIN_7, p.PWM_SLICE4, p.PIN_8),
+        lcd_controller,
+    );
+
+    // Initialize wifi
+
+    app.render_wifi_init().await;
 
     let pwr = Output::new(p.PIN_23, Level::Low);
     let cs = Output::new(p.PIN_25, Level::High);
@@ -251,29 +157,55 @@ async fn main(spawner: Spawner) {
     );
     spawner.spawn(net_task(runner).unwrap());
 
-    connect_wifi(&mut control).await;
+    info!("Connecting to WiFi: {}", WIFI_SSID);
+    loop {
+        match control
+            .join(WIFI_SSID, cyw43::JoinOptions::new(WIFI_PASSWORD.as_bytes()))
+            .await
+        {
+            Ok(_) => {
+                info!("WiFi connected");
+                break;
+            }
+            Err(e) => {
+                warn!("WiFi join failed: {}", e);
+                Timer::after(Duration::from_secs(1)).await;
+            }
+        }
+    }
 
-    lcd.set_cursor_xy((0, 1), &mut delay).await.ok();
-    lcd.write_str("Init: DHCP...", &mut delay).await.ok();
+    app.render_dhcp_init().await;
 
-    wait_for_dhcp(stack).await;
+    info!("Waiting for DHCP...");
+    while !stack.is_config_up() {
+        Timer::after(Duration::from_millis(100)).await;
+    }
+    info!("Network is up");
+    if let Some(config) = stack.config_v4() {
+        info!("IP address: {}", config.address);
+    }
 
-    spawn_input_tasks(&spawner, stack, p.PIN_15, p.PIN_11, p.PIN_9, p.PIN_10);
+    app.init_data(stack).await;
+    app.render_current_view().await;
 
-    let (recipes, current_cook, latest_status) = fetch_initial_data(stack).await;
-    let mut app = AppState::new(current_cook, latest_status);
+    // Spawn tasks for user input handling
 
-    info!("Init complete, dimming backlight and entering main loop");
-    backlight.set_dim();
+    spawner.spawn(stop_button_task(stack, Input::new(p.PIN_15, Pull::Up)).unwrap());
+    info!("Stop button task spawned on GPIO 15");
 
-    render_status_display(
-        &mut lcd,
-        &mut delay,
-        app.tick,
-        app.latest_status.as_ref(),
-        app.current_cook.as_ref(),
-    )
-    .await;
+    spawner.spawn(rot_enc_button_task(Input::new(p.PIN_11, Pull::Up)).unwrap());
+    info!("Rotary encoder button task spawned on GPIO 11");
+
+    spawner.spawn(
+        rotary_encoder_task(
+            Input::new(p.PIN_9, Pull::Up),
+            Input::new(p.PIN_10, Pull::Up),
+        )
+        .unwrap(),
+    );
+    info!("Rotary encoder task spawned on GPIO 9/10");
+
+    info!("Init complete, entering main loop");
 
     loop {
         debug!("--- Main loop tick {} ---", app.tick);
@@ -287,10 +219,9 @@ async fn main(spawner: Spawner) {
                 app.poll_status_if_due(stack).await;
             }
             embassy_futures::select::Either::Second(event) => {
-                app.handle_user_activity(event, &recipes, &mut backlight);
+                app.handle_user_activity(event);
             }
         }
-        app.apply_backlight_policy(&mut backlight);
-        app.render_current_view(&mut lcd, &mut delay, &recipes).await;
+        app.render_current_view().await;
     }
 }
