@@ -38,6 +38,11 @@ crates/
   writes JSON to `~/.anova-programs/`. Optional `--bookmarks` flag fetches
   bookmarked community recipes too. Refresh token is cached at
   `~/.anova-firebase-refresh-token` for future runs.
+- **`history`** subcommand — fetches recent cook history from the
+  `users/{uid}/oven-cooks` Firestore subcollection and displays a summary
+  of each cook (timestamp, stage count, temperature, duration, steam). Uses
+  the same cached refresh token as `fetch-recipes`. `--limit` flag controls
+  how many cooks to show (default 20, max 50).
 - **Pico W library target** (`src/lib.rs`) — demonstrates the same Firestore
   code paths (auth + recipe fetch) behind an `HttpClient` trait stub. Compiles
   for `thumbv6m-none-eabi`.
@@ -116,6 +121,13 @@ Firestore REST + Firebase auth, `clap` for args.
   Firestore, writes JSON to `~/.anova-programs/`. Supports `--email`,
   `--password`, `--bookmarks` flags plus `ANOVA_EMAIL` / `ANOVA_PASSWORD` env
   vars. Caches the refresh token at `~/.anova-firebase-refresh-token`.
+- `history` — fetches and displays cook history from Firestore
+  (`users/{uid}/oven-cooks`). Same auth flags as `fetch-recipes`. `--limit`
+  controls how many cooks to show.
+
+**Modules:**
+- `firebase.rs` — shared Firebase auth (sign-in + refresh token) and
+  `run_query` helper used by both `fetch_recipes` and `history`.
 
 ### Current: `anova-oven-pico` (no_std, standalone workspace)
 

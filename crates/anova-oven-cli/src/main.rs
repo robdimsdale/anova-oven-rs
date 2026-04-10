@@ -8,6 +8,8 @@ use http::{HeaderName, HeaderValue, Uri};
 use tokio_websockets::ClientBuilder;
 
 mod fetch_recipes;
+mod firebase;
+mod history;
 
 #[derive(Parser)]
 #[command(name = "anova-oven", about = "Control your Anova Precision Oven")]
@@ -40,6 +42,18 @@ enum Command {
         #[arg(long)]
         bookmarks: bool,
     },
+    /// Show recent cook history from Firebase
+    History {
+        /// Anova account email (also ANOVA_EMAIL env var)
+        #[arg(long, env = "ANOVA_EMAIL")]
+        email: Option<String>,
+        /// Anova account password (also ANOVA_PASSWORD env var)
+        #[arg(long, env = "ANOVA_PASSWORD")]
+        password: Option<String>,
+        /// Maximum number of cooks to show (default 20, max 50)
+        #[arg(long, default_value = "20")]
+        limit: u32,
+    },
 }
 
 #[tokio::main]
@@ -61,6 +75,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             password,
             bookmarks,
         } => fetch_recipes::run(email, password, bookmarks).await,
+        Command::History {
+            email,
+            password,
+            limit,
+        } => history::run(email, password, limit).await,
     }
 }
 

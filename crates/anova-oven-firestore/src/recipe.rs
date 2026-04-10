@@ -150,8 +150,18 @@ impl FavoriteOvenRecipe {
 pub struct OvenCook {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub firestore_id: Option<String>,
+    /// Cook ID as stored in the document (e.g. `ios-<uuid>`). Separate from
+    /// the Firestore document ID.
+    #[serde(default)]
+    pub id: Option<String>,
     #[serde(default)]
     pub ended_timestamp: Option<String>,
+    #[serde(default)]
+    pub created_timestamp: Option<String>,
+    /// Full path of the referenced recipe document, e.g.
+    /// `projects/anova-app/databases/(default)/documents/oven-recipes/{id}`.
+    #[serde(default)]
+    pub recipe_ref: Option<String>,
     #[serde(default)]
     pub stages: Vec<JsonValue>,
     #[serde(flatten)]
@@ -164,5 +174,14 @@ impl OvenCook {
         let mut cook: OvenCook = serde_json::from_value(json)?;
         cook.firestore_id = Some(doc.id().into());
         Ok(cook)
+    }
+
+    /// Extract just the recipe document ID from `recipe_ref`.
+    ///
+    /// `projects/.../documents/oven-recipes/vRx7WOeVrgodAM0yePQ8`
+    /// → `vRx7WOeVrgodAM0yePQ8`
+    pub fn recipe_id(&self) -> Option<&str> {
+        let r = self.recipe_ref.as_deref()?;
+        r.rsplit('/').next().filter(|s| !s.is_empty())
     }
 }
