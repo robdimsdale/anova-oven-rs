@@ -277,7 +277,7 @@ async fn fetch_and_log_status(
     match serde_json::from_slice::<anova_oven_api::OvenStatus>(body) {
         Ok(status) => {
             info!(
-                "Status: mode={} temp={} target={} steam={} door={} water={}",
+                "Status: mode={} temp={}F target={}F steam={}% door={} water={}",
                 status.mode.as_str(),
                 celcius_to_fahrenheit(status.temperature_c),
                 celcius_to_fahrenheit(status.target_temperature_c.unwrap_or(0.0)),
