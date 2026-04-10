@@ -1,12 +1,9 @@
 use anova_oven_api::Recipe;
 use defmt::info;
-use embassy_net::Stack;
 use embassy_rp::gpio::Input;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Timer};
-
-use crate::api::send_stop;
 
 #[derive(Clone, Copy, defmt::Format)]
 pub enum InputEvent {
@@ -23,18 +20,12 @@ pub enum UIState {
 
 pub static EVENT_CHANNEL: Channel<CriticalSectionRawMutex, InputEvent, 4> = Channel::new();
 
-static mut STOP_RX_BUF: [u8; 1024] = [0u8; 1024];
-
 #[embassy_executor::task]
-pub async fn stop_button_task(stack: Stack<'static>, mut button: Input<'static>) -> ! {
+pub async fn stop_button_task(mut button: Input<'static>) -> ! {
     loop {
         button.wait_for_falling_edge().await;
-        info!("Stop button pressed - sending POST /stop");
+        info!("Stop button pressed");
         EVENT_CHANNEL.send(InputEvent::StopButton).await;
-
-        #[allow(static_mut_refs)]
-        let rx_buf = unsafe { &mut STOP_RX_BUF };
-        send_stop(stack, rx_buf).await;
 
         Timer::after(Duration::from_millis(500)).await;
     }

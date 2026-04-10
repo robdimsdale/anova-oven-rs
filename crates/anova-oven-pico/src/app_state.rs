@@ -1,10 +1,10 @@
 use defmt::{debug, info};
 use embassy_time::{Duration, Instant};
 
-use crate::api::{fetch_and_log_recipes, fetch_and_log_status, fetch_current_cook};
+use crate::api::{fetch_and_log_recipes, fetch_and_log_status, fetch_current_cook, send_stop};
 use crate::backlight::BacklightController;
 use crate::display::LcdController;
-use crate::events::{handle_input_event, UIState};
+use crate::events::{handle_input_event, InputEvent, UIState};
 use crate::logic::{is_active_cook, should_dim_backlight};
 
 pub(crate) struct AppState<DB, MM, CH>
@@ -77,12 +77,23 @@ where
         }
     }
 
-    pub(crate) fn handle_user_activity(&mut self, event: crate::events::InputEvent) {
+    pub(crate) async fn handle_user_activity(
+        &mut self,
+        event: InputEvent,
+        stack: embassy_net::Stack<'static>,
+    ) {
         self.last_input_at = Some(Instant::now());
         self.baseline_reentered_at = None;
 
         debug!("Setting backlight to full: (input activity)");
         self.backlight_controller.set_full();
+
+        if matches!(event, InputEvent::StopButton) {
+            info!("Sending POST /stop");
+            #[allow(static_mut_refs)]
+            let rx_buf = unsafe { &mut crate::HTTP_RX_BUF };
+            send_stop(stack, rx_buf).await;
+        }
 
         handle_input_event(event, &mut self.ui_state, &self.recipes);
     }

@@ -73,7 +73,6 @@ async fn net_task(mut runner: embassy_net::Runner<'static, cyw43::NetDriver<'sta
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     // Init heap
-
     use core::mem::MaybeUninit;
 
     const HEAP_SIZE: usize = 32768;
@@ -85,13 +84,10 @@ async fn main(spawner: Spawner) {
     }
 
     // Init peripherals
-
     let p = embassy_rp::init(Default::default());
 
     // Init LCD
-
     let mut lcd_delay = Delay;
-
     let lcd = match HD44780::new(
         DisplayOptions4Bit::new(MemoryMap1602::new()).with_pins(FourBitBusPins {
             rs: Output::new(p.PIN_17, Level::Low),
@@ -117,8 +113,23 @@ async fn main(spawner: Spawner) {
         lcd_controller,
     );
 
-    // Initialize wifi
+    // Spawn tasks for user input handling.
+    spawner.spawn(stop_button_task(Input::new(p.PIN_15, Pull::Up)).unwrap());
+    info!("Stop button task spawned on GPIO 15");
 
+    spawner.spawn(rot_enc_button_task(Input::new(p.PIN_11, Pull::Up)).unwrap());
+    info!("Rotary encoder button task spawned on GPIO 11");
+
+    spawner.spawn(
+        rotary_encoder_task(
+            Input::new(p.PIN_9, Pull::Up),
+            Input::new(p.PIN_10, Pull::Up),
+        )
+        .unwrap(),
+    );
+    info!("Rotary encoder task spawned on GPIO 9/10");
+
+    // Initialize wifi
     app.render_wifi_init().await;
 
     let pwr = Output::new(p.PIN_23, Level::Low);
@@ -188,23 +199,6 @@ async fn main(spawner: Spawner) {
     app.init_data(stack).await;
     app.render_current_view().await;
 
-    // Spawn tasks for user input handling
-
-    spawner.spawn(stop_button_task(stack, Input::new(p.PIN_15, Pull::Up)).unwrap());
-    info!("Stop button task spawned on GPIO 15");
-
-    spawner.spawn(rot_enc_button_task(Input::new(p.PIN_11, Pull::Up)).unwrap());
-    info!("Rotary encoder button task spawned on GPIO 11");
-
-    spawner.spawn(
-        rotary_encoder_task(
-            Input::new(p.PIN_9, Pull::Up),
-            Input::new(p.PIN_10, Pull::Up),
-        )
-        .unwrap(),
-    );
-    info!("Rotary encoder task spawned on GPIO 9/10");
-
     info!("Init complete, entering main loop");
 
     loop {
@@ -219,7 +213,7 @@ async fn main(spawner: Spawner) {
                 app.poll_status_if_due(stack).await;
             }
             embassy_futures::select::Either::Second(event) => {
-                app.handle_user_activity(event);
+                app.handle_user_activity(event, stack).await;
             }
         }
         app.render_current_view().await;
