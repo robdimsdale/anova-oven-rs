@@ -78,6 +78,7 @@ dependencies = [
  "embassy-futures",
  "embassy-net",
  "embassy-rp",
+ "embassy-sync 0.8.0",
  "embassy-time",
  "embedded-alloc",
  "embedded-hal 1.0.0",
