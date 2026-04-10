@@ -704,9 +704,7 @@ pub async fn fetch_current_cook(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(
-            format!("Firestore runQuery (current-cook) failed ({status}): {body}").into(),
-        );
+        return Err(format!("Firestore runQuery (current-cook) failed ({status}): {body}").into());
     }
 
     let items: Vec<RunQueryItem> = resp.json().await?;
@@ -740,10 +738,7 @@ pub async fn fetch_current_cook(
         // Resolve recipe title.
         let recipe_title = if let Some(ref id) = recipe_id {
             let titles = fetch_recipe_titles(client, session, &[id.clone()]).await;
-            titles
-                .get(id)
-                .cloned()
-                .unwrap_or_else(|| "[custom]".into())
+            titles.get(id).cloned().unwrap_or_else(|| "[custom]".into())
         } else {
             "[custom]".into()
         };
@@ -800,13 +795,9 @@ fn stage_from_json(s: &JsonValue) -> anova_oven_api::Stage {
         .and_then(|t| t.get("initial"))
         .and_then(|t| t.as_u64());
 
-    let timer_added = s
-        .get("timerAdded")
-        .and_then(|v| v.as_bool());
+    let timer_added = s.get("timerAdded").and_then(|v| v.as_bool());
 
-    let probe_added = s
-        .get("probeAdded")
-        .and_then(|v| v.as_bool());
+    let probe_added = s.get("probeAdded").and_then(|v| v.as_bool());
 
     let probe_target_c = s
         .get("temperatureProbe")
@@ -833,9 +824,7 @@ fn stage_from_json(s: &JsonValue) -> anova_oven_api::Stage {
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as u8;
 
-    let user_action_required = s
-        .get("userActionRequired")
-        .and_then(|v| v.as_bool());
+    let user_action_required = s.get("userActionRequired").and_then(|v| v.as_bool());
 
     let rack_position = s
         .get("rackPosition")
