@@ -1,11 +1,11 @@
 [package]
-name = "anova-oven-protocol"
+name = "anova-oven-api"
 version = "0.1.0"
 edition = "2021"
 
 [features]
 default = ["std"]
-std = []
+std = ["serde/std", "serde_json/std"]
 
 [dependencies]
 serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }

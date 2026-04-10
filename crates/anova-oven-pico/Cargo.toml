@@ -10,8 +10,7 @@
   edition = "2021"
 
 [dependencies]
-  anova-oven-protocol = { path = "../anova-oven-protocol", default-features = false }
-  anova-oven-firestore = { path = "../anova-oven-firestore", default-features = false }
+  anova-oven-api = { path = "../anova-oven-api", default-features = false }
   serde_json = { version = "1.0", default-features = false, features = [
     "alloc",
   ] }
@@ -37,25 +36,11 @@
   ] }
   embassy-time = "0.5"
 
-  embedded-alloc = "0.6"
+  embedded-alloc = "0.7"
   embedded-io-async = "0.7"
 
-  # TLS (used directly for WebSocket, and internally by reqwless for HTTP)
-  embedded-tls = { version = "0.18", default-features = false, features = ["defmt"] }
-
-  # Force der to enable heapless feature (needed by embedded-tls rustpki, upstream bug)
-  der = { version = "0.8", default-features = false, features = ["heapless"] }
-
-  # HTTP client for Firestore REST + Firebase Auth
-  reqwless = { version = "0.14", default-features = false, features = ["embedded-tls", "defmt"] }
-
-  # WebSocket (zero-copy, embedded-io-async 0.7)
-  websocketz = { version = "0.2", default-features = false }
-
-  # RNG — rand 0.10 provides the Rng trait for websocketz;
-  # rand_core 0.6 is needed for embedded-tls's CryptoRng trait
-  rand = { version = "0.10", default-features = false }
-  rand_core_06 = { package = "rand_core", version = "0.6", default-features = false }
+  # Plain HTTP client (no TLS needed — server is on local network)
+  reqwless = { version = "0.14", default-features = false, features = ["defmt"] }
 
   cyw43 = { version = "0.7.0", features = ["defmt", "firmware-logs"] }
   cyw43-pio = { version = "0.10.0", features = ["defmt"] }
