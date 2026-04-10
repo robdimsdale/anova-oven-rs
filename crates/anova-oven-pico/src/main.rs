@@ -3,17 +3,18 @@
 
 extern crate alloc;
 
+mod http;
+mod rng;
+mod ws;
+
 use embedded_alloc::LlffHeap as Heap;
 
 #[global_allocator]
 static HEAP: Heap = Heap::empty();
 
-use core::net::Ipv4Addr;
-
 use cyw43_pio::PioSpi;
 use defmt::{info, warn};
 use embassy_executor::Spawner;
-use embassy_net::tcp::TcpSocket;
 use embassy_net::{Config, StackResources};
 use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::{Level, Output};
@@ -24,16 +25,21 @@ use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
 // WiFi credentials — in a real deployment these would come from flash/config.
-// For now, hardcoded for development.
 const WIFI_SSID: &str = "YOUR_WIFI_SSID";
 const WIFI_PASSWORD: &str = "YOUR_WIFI_PASSWORD";
 
 // Anova API token — in a real deployment, read from flash.
-#[allow(dead_code)]
 const ANOVA_TOKEN: &str = "YOUR_ANOVA_TOKEN";
 
-const ANOVA_HOST: &str = "devices.anovaculinary.io";
-const ANOVA_PORT: u16 = 443;
+// Firebase credentials — in a real deployment, read from flash.
+const ANOVA_EMAIL: &str = "YOUR_EMAIL";
+const ANOVA_PASSWORD: &str = "YOUR_PASSWORD";
+
+// TLS record buffers (shared between HTTP and WebSocket phases).
+// 16,640 bytes each — the TLS 1.3 maximum record size.
+// These are static because they're too large for the stack.
+static mut TLS_READ_BUF: [u8; 16640] = [0; 16640];
+static mut TLS_WRITE_BUF: [u8; 16640] = [0; 16640];
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO0>;
@@ -66,7 +72,7 @@ async fn main(spawner: Spawner) {
     // Initialize the heap allocator (needed by serde_json / alloc).
     {
         use core::mem::MaybeUninit;
-        const HEAP_SIZE: usize = 16384;
+        const HEAP_SIZE: usize = 32768;
         static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP_SIZE];
         #[allow(static_mut_refs)]
         unsafe {
@@ -142,61 +148,21 @@ async fn main(spawner: Spawner) {
         info!("IP address: {}", config.address);
     }
 
-    // Resolve the Anova API host.
-    info!("Resolving {}...", ANOVA_HOST);
-    let host_addr = match stack
-        .dns_query(ANOVA_HOST, embassy_net::dns::DnsQueryType::A)
-        .await
-    {
-        Ok(addrs) if !addrs.is_empty() => match addrs[0] {
-            embassy_net::IpAddress::Ipv4(a) => {
-                let octets = a.octets();
-                let addr = Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]);
-                info!("Resolved to {}", addr);
-                addr
-            }
-        },
-        Ok(_) => {
-            defmt::panic!("DNS returned no addresses");
-        }
-        Err(e) => {
-            defmt::panic!("DNS query failed: {}", e);
-        }
-    };
+    // Phase 1: Firestore recipe fetch via HTTPS (reqwless + embedded-tls).
+    info!("--- Firestore HTTP ---");
+    #[allow(static_mut_refs)]
+    let (tls_read, tls_write) = unsafe { (&mut TLS_READ_BUF, &mut TLS_WRITE_BUF) };
 
-    // Establish a TCP connection to the Anova API.
-    // NOTE: The Anova API requires TLS (wss://). A full implementation needs
-    // an embedded TLS library (e.g. embedded-tls) layered on top of this TCP
-    // socket, plus a WebSocket protocol handler. This is the scaffolding for
-    // that — we establish the TCP connection to prove network connectivity.
-    let mut rx_buf = [0u8; 4096];
-    let mut tx_buf = [0u8; 4096];
-    let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
-    socket.set_timeout(Some(Duration::from_secs(30)));
+    http::run_firestore_flow(stack, tls_read, tls_write, ANOVA_EMAIL, ANOVA_PASSWORD).await;
 
-    info!("Connecting to {}:{}...", host_addr, ANOVA_PORT);
-    match socket.connect((host_addr, ANOVA_PORT)).await {
-        Ok(()) => info!("TCP connected to Anova API"),
-        Err(e) => defmt::panic!("TCP connection failed: {}", e),
-    }
+    // Phase 2: WebSocket connection for oven control (embedded-tls + websocketz).
+    info!("--- WebSocket ---");
+    #[allow(static_mut_refs)]
+    let (tls_read, tls_write) = unsafe { (&mut TLS_READ_BUF, &mut TLS_WRITE_BUF) };
 
-    // TODO: Layer TLS on the TCP socket using embedded-tls.
-    // TODO: Perform WebSocket upgrade handshake over TLS.
-    // TODO: Send the token and supportedAccessories query in the upgrade request.
-    // TODO: Enter message loop using anova_oven_protocol::parse_message().
-    //
-    // The protocol crate (anova-oven-protocol) is already no_std compatible
-    // and can parse messages once we have raw WebSocket frame payloads:
-    //
-    //   match anova_oven_protocol::parse_message(&ws_payload) {
-    //       Ok(Event::ApoState(state)) => { /* use state */ }
-    //       ...
-    //   }
+    ws::run_websocket(stack, ANOVA_TOKEN, tls_read, tls_write).await;
 
-    info!("TCP connection established — TLS + WebSocket not yet implemented");
-    info!("This proves: WiFi, DHCP, DNS, and TCP connectivity all work");
-
-    // Keep the connection alive so we don't exit.
+    // Keep running if WebSocket disconnects.
     loop {
         Timer::after(Duration::from_secs(60)).await;
     }

@@ -49,8 +49,8 @@ crates/
 - `start` / `stop` / `update` subcommands
 - WebSocket reconnection / backoff
 - Graceful SIGINT shutdown
-- Pico W binary: TLS, WebSocket upgrade, and protocol integration not yet
-  implemented. WiFi + TCP scaffolding compiles and runs.
+- Pico W binary: compiles with full TLS + WebSocket + Firestore HTTP stack,
+  but not yet tested on hardware. TLS certificate verification is disabled.
 
 ---
 
@@ -130,9 +130,22 @@ methods for the caller to implement over `embassy-net` + TLS. Provides
 crate's query builders into a complete recipe-fetch flow. Compiles clean for
 `thumbv6m-none-eabi`.
 
-**Binary target** (`src/main.rs`): WiFi init, WPA2 connect, DHCP, DNS, raw TCP
-scaffold. Compiles clean for `thumbv6m-none-eabi` (embassy 0.10 / cyw43 0.7 API
-migration complete). Stubbed: TLS, WebSocket upgrade, protocol message loop.
+**Binary target** (`src/main.rs`): WiFi init, WPA2 connect, DHCP, DNS, then
+runs two sequential phases: (1) Firestore recipe fetch via `reqwless` HTTPS,
+(2) Anova WebSocket connection via `embedded-tls` + `websocketz`. Compiles
+clean for `thumbv6m-none-eabi`.
+
+**Modules:**
+- `src/lib.rs` — `HttpClient` trait + `sign_in()` / `fetch_user_recipes()`
+  (transport-agnostic, consumed by `http.rs`)
+- `src/http.rs` — `PicoHttpClient` implementing `HttpClient` via `reqwless`
+  + `embedded-tls` over embassy-net's `TcpClient` / `DnsSocket`
+- `src/ws.rs` — WebSocket-over-TLS connection to the Anova API using
+  `embedded-tls` directly + `websocketz`, with protocol message loop via
+  `anova_oven_protocol::parse_message()`
+- `src/rng.rs` — SplitMix64 PRNG implementing `rand_core` 0.6 traits
+  (for `embedded-tls`); `rand::rngs::SmallRng` (rand 0.10) used for
+  `websocketz`
 
 ### Dependency Graph
 
@@ -156,7 +169,10 @@ anova-oven-pico         (no_std, standalone workspace)
   ├── anova-oven-firestore (no_std)
   ├── serde_json (no_std, alloc)
   ├── embassy-*, cyw43, cyw43-pio
-  └── defines HttpClient trait for embassy-net transports
+  ├── embedded-tls 0.18 (TLS 1.3)
+  ├── reqwless 0.14 (HTTPS client, uses embedded-tls internally)
+  ├── websocketz 0.2 (WebSocket over embedded-io-async)
+  └── defines HttpClient trait + PicoHttpClient impl
 ```
 
 ---
@@ -224,15 +240,30 @@ are no longer needed for recipe fetching.
     `embedded-alloc` global allocator for `extern crate alloc`, and `memory.x`
     linker script for RP2040. Both lib and binary targets compile clean.
 
-14. **TLS** — add `embedded-tls` or similar. This unlocks both WebSocket and
-    Firestore on the Pico.
+14. **TLS** — COMPLETE. Added `embedded-tls` 0.18 (TLS 1.3, no_std). Used
+    directly by `ws.rs` for WebSocket, and internally by `reqwless` for HTTPS.
+    TLS certificate verification is skipped (`TlsVerify::None` / `UnsecureProvider`)
+    — acceptable for a personal IoT device, but a production build should add
+    certificate pinning. Shared 16,640-byte TLS read/write record buffers
+    (static) between HTTP and WebSocket phases to stay within 264KB RAM.
+    Required workaround: `der` crate needs explicit `heapless` feature
+    (`embedded-tls` 0.18 doesn't enable it for `rustpki`).
 
-15. **WebSocket integration** — upgrade TCP to WSS, run the protocol message
-    loop using `anova-oven-protocol::parse_message()`.
+15. **WebSocket integration** — COMPLETE. Added `websocketz` 0.2 (zero-copy,
+    `embedded-io-async` 0.7). `ws.rs` performs: DNS resolve → TCP connect →
+    TLS handshake → WebSocket upgrade with `Sec-WebSocket-Protocol: ANOVA_V2`
+    header and token query parameter → message loop calling
+    `anova_oven_protocol::parse_message()` on each text frame. Uses
+    `rand::rngs::SmallRng` (rand 0.10) for WebSocket masking. Two `rand_core`
+    versions coexist: 0.6 (embedded-tls) and 0.10 (websocketz via rand 0.10).
 
-16. **Firestore on Pico** — provide an `embassy-net` `HttpTransport` impl.
-    The Pico could fetch recipes directly over WiFi, or use pre-fetched JSON
-    from flash/SD as a fallback.
+16. **Firestore on Pico** — COMPLETE. Added `reqwless` 0.14 (HTTPS client with
+    built-in `embedded-tls` integration). `http.rs` implements the `HttpClient`
+    trait from `lib.rs` via `PicoHttpClient` wrapping reqwless's `HttpClient`
+    with embassy-net's `TcpClient` + `DnsSocket`. `run_firestore_flow()`
+    calls `sign_in()` → `fetch_user_recipes()` from the library target. The
+    full flow (Firebase auth + Firestore structured query) compiles for
+    `thumbv6m-none-eabi`. Not yet tested on hardware.
 
 ---
 
@@ -259,10 +290,11 @@ are no longer needed for recipe fetching.
 - `cyw43` 0.7, `cyw43-pio` 0.10
 - `cortex-m`, `cortex-m-rt`, `defmt`, `panic-probe`
 - `embedded-alloc` 0.6 (global allocator for `extern crate alloc`)
+- `embedded-tls` 0.18 (TLS 1.3, no_std, defmt)
+- `reqwless` 0.14 (HTTPS client with built-in embedded-tls integration)
+- `websocketz` 0.2 (WebSocket, zero-copy, embedded-io-async 0.7)
+- `rand` 0.10 (SmallRng for websocketz), `rand_core` 0.6 (for embedded-tls)
 - `serde_json` 1.0 (no_std, alloc)
-
-**Pico W (planned additions):**
-- `embedded-tls` — TLS over TCP (unlocks both WSS and HTTPS)
 
 ---
 
