@@ -11,19 +11,34 @@ use serde::{Deserialize, Serialize};
 pub struct OvenStatus {
     /// Operating mode: `"idle"`, `"cook"`, or `"preheat"`.
     pub mode: String,
+
     /// Current dry-bulb temperature in Celsius.
     pub temperature_c: f32,
+
     /// Target temperature in Celsius, if a cook is active.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub target_temperature_c: Option<f32>,
+    pub target_temperature_c: Option<f32>, // seems like this is always zero?
+
     /// Timer elapsed, in seconds.
     pub timer_current_secs: u64,
+
     /// Timer total duration, in seconds.
     pub timer_total_secs: u64,
+
     /// Steam percentage (0–100).
     pub steam_pct: f32,
+
+    /// Steam target percentage (0–100), if a cook is active.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub steam_target_pct: Option<f32>,
+
+    /// Current probe temperature in Celsius, if probe is connected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probe_temperature_c: Option<f32>,
+
     /// Whether the door is open.
     pub door_open: bool,
+
     /// Whether the water tank is empty.
     pub water_tank_empty: bool,
 }
@@ -79,6 +94,8 @@ mod tests {
             timer_current_secs: 300,
             timer_total_secs: 3600,
             steam_pct: 50.0,
+            steam_target_pct: Some(30.0),
+            probe_temperature_c: Some(65.0),
             door_open: false,
             water_tank_empty: false,
         };

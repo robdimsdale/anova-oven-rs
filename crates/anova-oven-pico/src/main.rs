@@ -187,14 +187,41 @@ async fn main(spawner: Spawner) {
         let rx_buf = unsafe { &mut HTTP_RX_BUF };
         match fetch_and_log_status(stack, rx_buf).await {
             Some(status) => {
+                // Row 0: oven temp + optional probe temp, padded to 16 chars.
+                lcd.set_cursor_xy((0, 0), &mut delay).await.ok();
+                let temp_str = alloc::format!("{:.0}", celcius_to_fahrenheit(status.temperature_c));
+                let mut row0_len = temp_str.len() + 2; // ° + F
+                lcd.write_str(&temp_str, &mut delay).await.ok();
+                lcd.write_byte(0xDF, &mut delay).await.ok();
+                lcd.write_str("F", &mut delay).await.ok();
+                if let Some(probe_c) = status.probe_temperature_c {
+                    let probe_str = alloc::format!(" P:{:.0}", celcius_to_fahrenheit(probe_c));
+                    row0_len += probe_str.len() + 2; // ° + F
+                    lcd.write_str(&probe_str, &mut delay).await.ok();
+                    lcd.write_byte(0xDF, &mut delay).await.ok();
+                    lcd.write_str("F", &mut delay).await.ok();
+                }
+                for _ in row0_len..16 {
+                    lcd.write_byte(b' ', &mut delay).await.ok();
+                }
+
+                // Row 1: mode + optional steam target, padded to 16 chars.
                 lcd.set_cursor_xy((0, 1), &mut delay).await.ok();
-                lcd.write_str(&alloc::format!("{}, {:.0}", status.mode, status.temperature_c), &mut delay).await.ok();
-                lcd.write_byte(0xDF, &mut delay).await.ok(); // degree symbol (HD44780 ROM A00)
-                lcd.write_str("C", &mut delay).await.ok();
+                let row1 = if let Some(steam) = status.steam_target_pct {
+                    alloc::format!("{} S:{:.0}%", status.mode, steam)
+                } else {
+                    status.mode.clone()
+                };
+                lcd.write_str(&row1, &mut delay).await.ok();
+                for _ in row1.len()..16 {
+                    lcd.write_byte(b' ', &mut delay).await.ok();
+                }
             }
             None => {
+                lcd.set_cursor_xy((0, 0), &mut delay).await.ok();
+                lcd.write_str("                ", &mut delay).await.ok();
                 lcd.set_cursor_xy((0, 1), &mut delay).await.ok();
-                lcd.write_str("Status: N/A", &mut delay).await.ok();
+                lcd.write_str("Status: N/A     ", &mut delay).await.ok();
             }
         }
 
@@ -252,8 +279,8 @@ async fn fetch_and_log_status(
             info!(
                 "Status: mode={} temp={} target={} steam={} door={} water={}",
                 status.mode.as_str(),
-                status.temperature_c,
-                status.target_temperature_c.unwrap_or(0.0),
+                celcius_to_fahrenheit(status.temperature_c),
+                celcius_to_fahrenheit(status.target_temperature_c.unwrap_or(0.0)),
                 status.steam_pct,
                 status.door_open,
                 status.water_tank_empty,
@@ -323,4 +350,8 @@ async fn fetch_and_log_recipes(
             warn!("GET /recipes: failed to parse JSON");
         }
     }
+}
+
+fn celcius_to_fahrenheit(c: f32) -> f32 {
+    c * 1.8 + 32.0
 }

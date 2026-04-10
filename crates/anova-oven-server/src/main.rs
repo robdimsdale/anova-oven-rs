@@ -26,9 +26,9 @@ use axum::response::IntoResponse;
 use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use http::{HeaderName, HeaderValue, Uri};
-use uuid::Uuid;
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio_websockets::{ClientBuilder, Message};
+use uuid::Uuid;
 
 // ─── Shared application state ─────────────────────────────────────────────────
 
@@ -56,12 +56,10 @@ struct AppState {
 
 #[tokio::main]
 async fn main() {
-    let anova_token = std::env::var("ANOVA_TOKEN")
-        .expect("ANOVA_TOKEN env var is required");
-    let anova_email = std::env::var("ANOVA_EMAIL")
-        .expect("ANOVA_EMAIL env var is required");
-    let anova_password = std::env::var("ANOVA_PASSWORD")
-        .expect("ANOVA_PASSWORD env var is required");
+    let anova_token = std::env::var("ANOVA_TOKEN").expect("ANOVA_TOKEN env var is required");
+    let anova_email = std::env::var("ANOVA_EMAIL").expect("ANOVA_EMAIL env var is required");
+    let anova_password =
+        std::env::var("ANOVA_PASSWORD").expect("ANOVA_PASSWORD env var is required");
 
     let http = reqwest::Client::new();
 
@@ -96,8 +94,7 @@ async fn main() {
         .route("/stop", axum::routing::post(handle_stop))
         .with_state(state);
 
-    let addr = std::env::var("ANOVA_BIND")
-        .unwrap_or_else(|_| "0.0.0.0:8080".into());
+    let addr = std::env::var("ANOVA_BIND").unwrap_or_else(|_| "0.0.0.0:8080".into());
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .expect("Failed to bind address");
@@ -173,7 +170,8 @@ async fn ws_connect_and_run(
                         match protocol::parse_message(payload) {
                             Ok(protocol::Event::ApoState(state)) => {
                                 let status = protocol::to_oven_status(&state);
-                                eprintln!("[ws] State: mode={} temp={:.1}°C", status.mode, status.temperature_c);
+                                eprintln!("[ws] State: mode={} temp={:.1}°C steam={:.0}%/{:.0}% probe={:.1}°F",
+                                status.mode, status.temperature_c, status.steam_pct, status.steam_target_pct.unwrap_or(0.0), celcius_to_fahrenheit(status.probe_temperature_c.unwrap_or(0.0)) );
                                 let _ = status_tx.send(Some(status));
                             }
                             Ok(protocol::Event::ApoWifiList { cooker_id: id }) => {
@@ -210,9 +208,7 @@ async fn ws_connect_and_run(
 
 // ─── HTTP handlers ─────────────────────────────────────────────────────────────
 
-async fn handle_status(
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+async fn handle_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     match state.status_rx.borrow().clone() {
         Some(status) => Json(status).into_response(),
         None => (
@@ -223,9 +219,7 @@ async fn handle_status(
     }
 }
 
-async fn handle_recipes(
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+async fn handle_recipes(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     {
         let cache = state.recipes.lock().await;
         if let Some(ref recipes) = *cache {
@@ -242,14 +236,16 @@ async fn handle_recipes(
         }
         Err(e) => {
             eprintln!("[recipes] Fetch error: {e}");
-            (StatusCode::BAD_GATEWAY, format!("Failed to fetch recipes: {e}")).into_response()
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to fetch recipes: {e}"),
+            )
+                .into_response()
         }
     }
 }
 
-async fn handle_stop(
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+async fn handle_stop(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     if state.cooker_id_rx.borrow().is_none() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -259,13 +255,15 @@ async fn handle_stop(
     }
     match state.cmd_tx.send(WsCommand::Stop).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "WebSocket task not running").into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "WebSocket task not running",
+        )
+            .into_response(),
     }
 }
 
-async fn handle_history(
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+async fn handle_history(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     {
         let cache = state.history.lock().await;
         if let Some(ref history) = *cache {
@@ -282,7 +280,15 @@ async fn handle_history(
         }
         Err(e) => {
             eprintln!("[history] Fetch error: {e}");
-            (StatusCode::BAD_GATEWAY, format!("Failed to fetch history: {e}")).into_response()
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to fetch history: {e}"),
+            )
+                .into_response()
         }
     }
+}
+
+fn celcius_to_fahrenheit(c: f32) -> f32 {
+    c * 9.0 / 5.0 + 32.0
 }
