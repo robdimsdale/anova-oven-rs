@@ -19,6 +19,8 @@ embassy-rp = { version = "0.10.0", features = ["defmt", "time-driver", "critical
 embassy-net = { version = "0.9.0", features = ["defmt", "tcp", "dhcpv4", "dns", "medium-ethernet", "proto-ipv4"] }
 embassy-time = "0.5"
 
+embedded-alloc = "0.6"
+
 cyw43 = { version = "0.7.0", features = ["defmt", "firmware-logs"] }
 cyw43-pio = { version = "0.10.0", features = ["defmt"] }
 

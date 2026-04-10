@@ -49,9 +49,8 @@ crates/
 - `start` / `stop` / `update` subcommands
 - WebSocket reconnection / backoff
 - Graceful SIGINT shutdown
-- Pico W binary: pre-existing embassy API drift (see Phase 4), TLS, WebSocket
-  upgrade, and protocol integration. WiFi + TCP scaffolding exists but does not
-  compile with current embassy 0.10 / cyw43 0.7.
+- Pico W binary: TLS, WebSocket upgrade, and protocol integration not yet
+  implemented. WiFi + TCP scaffolding compiles and runs.
 
 ---
 
@@ -132,8 +131,8 @@ crate's query builders into a complete recipe-fetch flow. Compiles clean for
 `thumbv6m-none-eabi`.
 
 **Binary target** (`src/main.rs`): WiFi init, WPA2 connect, DHCP, DNS, raw TCP
-scaffold. **Does not currently compile** due to embassy 0.10 / cyw43 0.7 API
-drift (see Phase 4). Stubbed: TLS, WebSocket upgrade, protocol message loop.
+scaffold. Compiles clean for `thumbv6m-none-eabi` (embassy 0.10 / cyw43 0.7 API
+migration complete). Stubbed: TLS, WebSocket upgrade, protocol message loop.
 
 ### Dependency Graph
 
@@ -183,7 +182,7 @@ are no longer needed for recipe fetching.
 
 **What was NOT done in Phase 1:**
 - `CookStage` type in protocol crate — stages remain `serde_json::Value`
-- Pico W binary does not compile (pre-existing embassy API drift, Phase 4)
+- Pico W binary compile fix (done in Phase 4, item 13)
 - Cook history fetch not wired into CLI (queries module is ready)
 
 ### Phase 2: Cook Commands
@@ -217,9 +216,13 @@ are no longer needed for recipe fetching.
 
 ### Phase 4: Embedded (Raspberry Pi Pico W)
 
-13. **Fix Pico W compile errors** — embassy/cyw43 API has changed. Known issues:
-    `PioSpi::new` signature, `cyw43::new` arity, `control.join` API,
-    `DhcpConfig` fields, `embassy_net::new` seed type, firmware alignment.
+13. **Fix Pico W compile errors** — COMPLETE. Migrated to embassy 0.10 / cyw43
+    0.7 APIs: `PioSpi::new` signature (with `DEFAULT_CLOCK_DIVIDER`, separate DMA
+    channel), `cyw43::new` 5-arg form (state, pwr, spi, FW, NVRAM) with separate
+    `control.init(CLM)`, firmware `Aligned` wrapper, `JoinOptions::new()`,
+    `Config::dhcpv4(Default::default())`, `embassy_net::new` with `u64` seed,
+    `embedded-alloc` global allocator for `extern crate alloc`, and `memory.x`
+    linker script for RP2040. Both lib and binary targets compile clean.
 
 14. **TLS** — add `embedded-tls` or similar. This unlocks both WebSocket and
     Firestore on the Pico.
@@ -255,6 +258,7 @@ are no longer needed for recipe fetching.
 - `embassy-executor` 0.10, `embassy-rp` 0.10, `embassy-net` 0.9, `embassy-time` 0.5
 - `cyw43` 0.7, `cyw43-pio` 0.10
 - `cortex-m`, `cortex-m-rt`, `defmt`, `panic-probe`
+- `embedded-alloc` 0.6 (global allocator for `extern crate alloc`)
 - `serde_json` 1.0 (no_std, alloc)
 
 **Pico W (planned additions):**

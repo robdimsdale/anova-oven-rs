@@ -3,15 +3,19 @@
 
 extern crate alloc;
 
+use embedded_alloc::LlffHeap as Heap;
+
+#[global_allocator]
+static HEAP: Heap = Heap::empty();
+
 use core::net::Ipv4Addr;
 
 use cyw43_pio::PioSpi;
 use defmt::{info, warn};
 use embassy_executor::Spawner;
 use embassy_net::tcp::TcpSocket;
-use embassy_net::{Config, DhcpConfig, Ipv4Cidr, StackResources};
+use embassy_net::{Config, StackResources};
 use embassy_rp::bind_interrupts;
-use embassy_rp::clocks::RoscRng;
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{DMA_CH0, PIO0};
 use embassy_rp::pio::Pio;
@@ -25,6 +29,7 @@ const WIFI_SSID: &str = "YOUR_WIFI_SSID";
 const WIFI_PASSWORD: &str = "YOUR_WIFI_PASSWORD";
 
 // Anova API token — in a real deployment, read from flash.
+#[allow(dead_code)]
 const ANOVA_TOKEN: &str = "YOUR_ANOVA_TOKEN";
 
 const ANOVA_HOST: &str = "devices.anovaculinary.io";
@@ -32,15 +37,21 @@ const ANOVA_PORT: u16 = 443;
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO0>;
+    DMA_IRQ_0 => embassy_rp::dma::InterruptHandler<DMA_CH0>;
 });
 
-// CYW43 WiFi firmware, included at compile time.
-static FW: &[u8] = include_bytes!("../firmware/43439A0.bin");
+// CYW43 firmware blobs, included at compile time.
+// firmware and nvram must be 4-byte aligned for the cyw43 driver.
+static FW: &cyw43::Aligned<cyw43::A4, [u8]> =
+    &cyw43::Aligned(*include_bytes!("../firmware/43439A0.bin"));
+static NVRAM: &cyw43::Aligned<cyw43::A4, [u8]> =
+    &cyw43::Aligned(*include_bytes!("../nvram_rp2040.bin"));
+// CLM blob is loaded via control.init() (plain bytes, no alignment needed).
 static CLM: &[u8] = include_bytes!("../firmware/43439A0_clm.bin");
 
 #[embassy_executor::task]
 async fn cyw43_task(
-    runner: cyw43::Runner<'static, Output<'static>, PioSpi<'static, PIO0, 0, DMA_CH0>>,
+    runner: cyw43::Runner<'static, cyw43::SpiBus<Output<'static>, PioSpi<'static, PIO0, 0>>>,
 ) -> ! {
     runner.run().await
 }
@@ -52,26 +63,39 @@ async fn net_task(mut runner: embassy_net::Runner<'static, cyw43::NetDriver<'sta
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
+    // Initialize the heap allocator (needed by serde_json / alloc).
+    {
+        use core::mem::MaybeUninit;
+        const HEAP_SIZE: usize = 16384;
+        static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP_SIZE];
+        #[allow(static_mut_refs)]
+        unsafe {
+            HEAP.init(HEAP_MEM.as_ptr() as usize, HEAP_SIZE);
+        }
+    }
+
     let p = embassy_rp::init(Default::default());
 
     // Set up CYW43 WiFi chip via PIO SPI.
     let pwr = Output::new(p.PIN_23, Level::Low);
     let cs = Output::new(p.PIN_25, Level::High);
     let mut pio = Pio::new(p.PIO0, Irqs);
+    let dma = embassy_rp::dma::Channel::new(p.DMA_CH0, Irqs);
     let spi = PioSpi::new(
         &mut pio.common,
         pio.sm0,
+        cyw43_pio::DEFAULT_CLOCK_DIVIDER,
         pio.irq0,
         cs,
         p.PIN_24,
         p.PIN_29,
-        p.DMA_CH0,
+        dma,
     );
 
     static STATE: StaticCell<cyw43::State> = StaticCell::new();
     let state = STATE.init(cyw43::State::new());
-    let (net_device, mut control, runner) = cyw43::new(state, pwr, spi, FW).await;
-    spawner.must_spawn(cyw43_task(runner));
+    let (net_device, mut control, runner) = cyw43::new(state, pwr, spi, FW, NVRAM).await;
+    spawner.spawn(cyw43_task(runner).unwrap());
 
     control.init(CLM).await;
     control
@@ -79,20 +103,21 @@ async fn main(spawner: Spawner) {
         .await;
 
     // Set up network stack.
-    let config = Config::dhcpv4(DhcpConfig {
-        hostname: Some("anova-pico".try_into().unwrap()),
-        ..Default::default()
-    });
+    let config = Config::dhcpv4(Default::default());
 
     static RESOURCES: StaticCell<StackResources<5>> = StaticCell::new();
-    let (stack, runner) = embassy_net::new(net_device, config, RESOURCES.init(StackResources::new()), RoscRng);
-    spawner.must_spawn(net_task(runner));
+    // Fixed seed is fine for a single-device dev setup. A production build
+    // would read a hardware RNG or unique chip ID here.
+    let seed: u64 = 0x0123_4567_89ab_cdef;
+    let (stack, runner) =
+        embassy_net::new(net_device, config, RESOURCES.init(StackResources::new()), seed);
+    spawner.spawn(net_task(runner).unwrap());
 
     // Connect to WiFi.
     info!("Connecting to WiFi: {}", WIFI_SSID);
     loop {
         match control
-            .join_wpa2(WIFI_SSID, WIFI_PASSWORD)
+            .join(WIFI_SSID, cyw43::JoinOptions::new(WIFI_PASSWORD.as_bytes()))
             .await
         {
             Ok(_) => {
@@ -100,7 +125,7 @@ async fn main(spawner: Spawner) {
                 break;
             }
             Err(e) => {
-                warn!("WiFi join failed: {}", e.status);
+                warn!("WiFi join failed: {}", e);
                 Timer::after(Duration::from_secs(1)).await;
             }
         }
@@ -119,7 +144,10 @@ async fn main(spawner: Spawner) {
 
     // Resolve the Anova API host.
     info!("Resolving {}...", ANOVA_HOST);
-    let host_addr = match stack.dns_query(ANOVA_HOST, embassy_net::dns::DnsQueryType::A).await {
+    let host_addr = match stack
+        .dns_query(ANOVA_HOST, embassy_net::dns::DnsQueryType::A)
+        .await
+    {
         Ok(addrs) if !addrs.is_empty() => match addrs[0] {
             embassy_net::IpAddress::Ipv4(a) => {
                 let octets = a.octets();
@@ -147,10 +175,7 @@ async fn main(spawner: Spawner) {
     socket.set_timeout(Some(Duration::from_secs(30)));
 
     info!("Connecting to {}:{}...", host_addr, ANOVA_PORT);
-    match socket
-        .connect((host_addr, ANOVA_PORT))
-        .await
-    {
+    match socket.connect((host_addr, ANOVA_PORT)).await {
         Ok(()) => info!("TCP connected to Anova API"),
         Err(e) => defmt::panic!("TCP connection failed: {}", e),
     }
