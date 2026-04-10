@@ -36,6 +36,12 @@ enum Command {
     CurrentCook,
     /// Stop the current cook
     Stop,
+    /// Start a cook with a recipe
+    Start {
+        /// Recipe ID to start
+        #[arg(long)]
+        recipe_id: String,
+    },
 }
 
 #[tokio::main]
@@ -84,6 +90,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let resp = client.post(&url).send().await?;
             if resp.status() == reqwest::StatusCode::NO_CONTENT {
                 println!("Stop command sent.");
+            } else {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(format!("Server returned {status}: {body}").into());
+            }
+        }
+
+        Command::Start { recipe_id } => {
+            let url = format!("{server}/start");
+            let resp = client
+                .post(&url)
+                .json(&serde_json::json!({ "recipe_id": recipe_id }))
+                .send()
+                .await?;
+            if resp.status() == reqwest::StatusCode::NO_CONTENT {
+                println!("Start command sent.");
             } else {
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
