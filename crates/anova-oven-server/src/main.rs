@@ -34,6 +34,9 @@ use tokio::sync::{mpsc, watch, Mutex};
 use tokio_websockets::{ClientBuilder, Message};
 use uuid::Uuid;
 
+const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 10;
+const DEFAULT_HTTP_CONNECT_TIMEOUT_SECS: u64 = 5;
+
 // ─── Shared application state ─────────────────────────────────────────────────
 
 enum WsCommand {
@@ -59,6 +62,19 @@ struct AppState {
 
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
+fn env_duration_secs(var: &str, default_secs: u64) -> Duration {
+    match std::env::var(var) {
+        Ok(value) => match value.parse::<u64>() {
+            Ok(secs) => Duration::from_secs(secs),
+            Err(err) => {
+                eprintln!("[{var}] Invalid duration '{value}': {err}; using {default_secs}s");
+                Duration::from_secs(default_secs)
+            }
+        },
+        Err(_) => Duration::from_secs(default_secs),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let anova_token = std::env::var("ANOVA_TOKEN").expect("ANOVA_TOKEN env var is required");
@@ -66,7 +82,17 @@ async fn main() {
     let anova_password =
         std::env::var("ANOVA_PASSWORD").expect("ANOVA_PASSWORD env var is required");
 
-    let http = reqwest::Client::new();
+    let http = reqwest::Client::builder()
+        .connect_timeout(env_duration_secs(
+            "ANOVA_HTTP_CONNECT_TIMEOUT_SECS",
+            DEFAULT_HTTP_CONNECT_TIMEOUT_SECS,
+        ))
+        .timeout(env_duration_secs(
+            "ANOVA_HTTP_TIMEOUT_SECS",
+            DEFAULT_HTTP_TIMEOUT_SECS,
+        ))
+        .build()
+        .expect("Failed to build HTTP client");
 
     eprintln!("Signing into Firebase...");
     let session = firestore::sign_in(&http, &anova_email, &anova_password)
@@ -524,12 +550,19 @@ async fn maybe_refresh_session(
     match err {
         firestore::FirestoreError::Unauthorized => {
             eprintln!("[auth] Firebase token expired — refreshing...");
-            let mut locked = state.session.lock().await;
-            if let Err(e) = firestore::refresh_session(&state.http, &mut locked).await {
+            let mut refreshed = {
+                let locked = state.session.lock().await;
+                locked.clone()
+            };
+
+            if let Err(e) = firestore::refresh_session(&state.http, &mut refreshed).await {
                 return Err(format!("Token refresh failed: {e}"));
             }
+
+            let mut locked = state.session.lock().await;
+            *locked = refreshed.clone();
             eprintln!("[auth] Token refreshed successfully.");
-            Ok(locked.clone())
+            Ok(refreshed)
         }
         firestore::FirestoreError::Other(e) => Err(e.to_string()),
     }
