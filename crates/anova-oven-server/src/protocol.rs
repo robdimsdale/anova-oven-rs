@@ -136,7 +136,7 @@ pub struct Lamp {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SteamGenerators {
-    pub relative_humidity: RelativeHumidity,
+    pub relative_humidity: Option<RelativeHumidity>,
     pub mode: String,
     pub boiler: Boiler,
     pub evaporator: Evaporator,
@@ -238,8 +238,15 @@ pub fn to_oven_status(payload: &ApoStatePayload) -> anova_oven_api::OvenStatus {
         timer_current_secs: nodes.timer.current,
         timer_total_secs: nodes.timer.initial,
         timer_mode: nodes.timer.mode.clone(),
-        steam_pct: sg.relative_humidity.current as f32,
-        steam_target_pct: sg.relative_humidity.setpoint.map(|s| s as f32),
+        steam_pct: sg
+            .relative_humidity
+            .as_ref()
+            .map_or(0.0, |rh| rh.current as f32),
+        steam_target_pct: sg
+            .relative_humidity
+            .as_ref()
+            .and_then(|rh| rh.setpoint)
+            .map(|s| s as f32),
         steam_generator_mode: sg.mode.clone(),
         boiler_celsius: sg.boiler.celsius,
         boiler_watts: sg.boiler.watts,
