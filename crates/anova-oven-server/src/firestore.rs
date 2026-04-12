@@ -697,7 +697,7 @@ pub async fn fetch_history(
                 .as_deref()
                 .and_then(|id| title_map.get(id))
                 .cloned()
-                .unwrap_or_else(|| "[custom]".into());
+                .unwrap_or_else(|| "[manual]".into());
             anova_oven_api::HistoryEntry {
                 recipe_title,
                 ended_at: c.ended_at,
@@ -1115,9 +1115,9 @@ pub async fn fetch_current_cook(
         };
         let recipe_title = title_from_ref
             .or_else(|| extract_cook_title(&json))
-            .unwrap_or_else(|| "[custom]".into());
+            .unwrap_or_else(|| "[manual]".into());
 
-        if recipe_title == "[custom]" {
+        if recipe_title == "[manual]" {
             let candidate_titles = cook_title_candidates_for_log(&json);
             debug!(
                 recipe_ref = ?recipe_ref,
