@@ -5,7 +5,6 @@ use reqwless::client::HttpClient;
 use reqwless::headers::ContentType;
 use reqwless::request::{Method, RequestBuilder};
 
-use crate::logic::celcius_to_fahrenheit;
 use crate::SERVER_URL;
 
 fn normalize_server_url(url: &str) -> alloc::string::String {
@@ -270,4 +269,8 @@ pub async fn fetch_and_log_recipes(
             alloc::vec::Vec::new()
         }
     }
+}
+
+pub fn celcius_to_fahrenheit(c: f32) -> f32 {
+    c * 1.8 + 32.0
 }

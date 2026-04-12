@@ -7,7 +7,6 @@ use crate::api::{
 use crate::backlight::BacklightController;
 use crate::events::InputEvent;
 use crate::lcd::LcdController;
-use crate::logic::{is_active_cook, should_dim_backlight};
 
 pub enum UIState {
     ShowIdle,
@@ -151,7 +150,7 @@ impl AppState {
     fn enter_baseline_state(&mut self) {
         self.ui_state = UIState::ShowIdle;
         self.sync_status_ui_state();
-        self.baseline_reentered_at = Some(Instant::now());
+        self.update_baseline_timer_for_current_view(Instant::now());
         self.last_input_at = None;
     }
 
@@ -231,7 +230,7 @@ impl AppState {
                 }
                 InputEvent::EncoderButton => {
                     if let Some(recipe) = self.recipes.get(*index).cloned() {
-                        self.apply_optimistic_start_state(&recipe, now);
+                        self.apply_optimistic_start_state(&recipe);
                         self.queue_start_action(recipe.id.clone(), now);
                     }
                 }
@@ -432,27 +431,31 @@ impl AppState {
             return;
         }
 
-        let active_cook = is_active_cook(
-            self.current_cook.is_some(),
-            self.latest_status
-                .as_ref()
-                .map(|status| status.mode.as_str()),
-        );
-        let baseline_elapsed_secs = self.baseline_reentered_at.map(|t| t.elapsed().as_secs());
-        let should_dim = should_dim_backlight(
-            self.is_status_view(),
-            baseline_elapsed_secs,
-            active_cook,
-            LED_DIM_TIMER_SECS,
-        );
+        let should_dim = self.is_status_view()
+            && !self.is_active_cook()
+            && self
+                .baseline_reentered_at
+                .map(|t| t.elapsed().as_secs())
+                .is_some_and(|elapsed| elapsed >= LED_DIM_TIMER_SECS);
+
+        let should_full = !self.is_status_view() || self.is_active_cook();
 
         if should_dim {
-            self.backlight_controller.set_dim();
             debug!("Setting backlight to dim: (idle baseline)");
-        } else if active_cook || !self.is_status_view() {
+            self.backlight_controller.set_dim();
+        } else if should_full {
             debug!("Setting backlight to full: (active state)");
             self.backlight_controller.set_full();
         }
+    }
+
+    pub fn is_active_cook(&self) -> bool {
+        self.current_cook.is_some()
+            || self
+                .latest_status
+                .as_ref()
+                .map(|status| status.mode.as_str())
+                .is_some_and(|mode| mode != "idle")
     }
 
     fn update_baseline_timer_for_current_view(&mut self, now: Instant) {
@@ -495,7 +498,7 @@ impl AppState {
         self.sync_status_ui_state();
     }
 
-    fn apply_optimistic_start_state(&mut self, recipe: &anova_oven_api::Recipe, now: Instant) {
+    fn apply_optimistic_start_state(&mut self, recipe: &anova_oven_api::Recipe) {
         let cook_stage_count = recipe
             .stages
             .iter()
@@ -512,7 +515,6 @@ impl AppState {
         });
 
         self.ui_state = UIState::ShowCook;
-        self.baseline_reentered_at = Some(now);
     }
 
     fn queue_stop_action(&mut self, now: Instant) {
@@ -576,14 +578,7 @@ impl AppState {
             return;
         }
 
-        let active_cook = is_active_cook(
-            self.current_cook.is_some(),
-            self.latest_status
-                .as_ref()
-                .map(|status| status.mode.as_str()),
-        );
-
-        self.ui_state = if active_cook {
+        self.ui_state = if self.is_active_cook() {
             UIState::ShowCook
         } else {
             UIState::ShowIdle
