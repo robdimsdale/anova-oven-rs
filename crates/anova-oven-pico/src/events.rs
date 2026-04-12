@@ -1,4 +1,5 @@
 use anova_oven_api::Recipe;
+use core::cmp;
 use defmt::info;
 use embassy_rp::gpio::Input;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -83,7 +84,7 @@ pub fn handle_input_event(event: InputEvent, ui_state: &mut UIState, recipes: &[
                     *ui_state = UIState::BrowseRecipes { index: 0 };
                 }
                 UIState::BrowseRecipes { index } => {
-                    *index = (*index + 1) % recipes.len();
+                    *index = cmp::min(*index + 1, recipes.len() - 1);
                 }
                 UIState::ConfirmStopCooking { .. } => {
                     // Caller owns confirm-stop transition logic.
@@ -96,12 +97,16 @@ pub fn handle_input_event(event: InputEvent, ui_state: &mut UIState, recipes: &[
             }
             match ui_state {
                 UIState::ShowStatus => {
-                    *ui_state = UIState::BrowseRecipes {
-                        index: recipes.len() - 1,
-                    };
+                    // Do nothing
                 }
                 UIState::BrowseRecipes { index } => {
-                    *index = (*index + recipes.len() - 1) % recipes.len();
+                    let maybe_index: isize = *index as isize - 1;
+                    if maybe_index < 0 {
+                        info!("Exiting recipe browser: encoder CCW past index 0");
+                        *ui_state = UIState::ShowStatus;
+                    } else {
+                        *index = maybe_index as usize;
+                    }
                 }
                 UIState::ConfirmStopCooking { .. } => {
                     // Caller owns confirm-stop transition logic.
