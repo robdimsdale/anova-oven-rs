@@ -1,11 +1,10 @@
-use anova_oven_api::Recipe;
-use core::cmp;
 use defmt::info;
 use embassy_rp::gpio::Input;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
-use embassy_time::Instant;
 use embassy_time::{Duration, Timer};
+
+pub static EVENT_CHANNEL: Channel<CriticalSectionRawMutex, InputEvent, 4> = Channel::new();
 
 #[derive(Clone, Copy, defmt::Format)]
 pub enum InputEvent {
@@ -13,14 +12,6 @@ pub enum InputEvent {
     EncoderCCW,
     EncoderButton,
 }
-
-pub enum UIState {
-    ShowStatus,
-    BrowseRecipes { index: usize },
-    ConfirmStopCooking { last_input_at: Instant },
-}
-
-pub static EVENT_CHANNEL: Channel<CriticalSectionRawMutex, InputEvent, 4> = Channel::new();
 
 #[embassy_executor::task]
 pub async fn rot_enc_button_task(mut button: Input<'static>) -> ! {
@@ -69,52 +60,6 @@ pub async fn rotary_encoder_task(mut pin_a: Input<'static>, mut pin_b: Input<'st
             info!("Rotary encoder: CCW");
             EVENT_CHANNEL.send(InputEvent::EncoderCCW).await;
             accum = 0;
-        }
-    }
-}
-
-pub fn handle_input_event(event: InputEvent, ui_state: &mut UIState, recipes: &[Recipe]) {
-    match event {
-        InputEvent::EncoderCW => {
-            if recipes.is_empty() {
-                return;
-            }
-            match ui_state {
-                UIState::ShowStatus => {
-                    *ui_state = UIState::BrowseRecipes { index: 0 };
-                }
-                UIState::BrowseRecipes { index } => {
-                    *index = cmp::min(*index + 1, recipes.len() - 1);
-                }
-                UIState::ConfirmStopCooking { .. } => {
-                    // Caller owns confirm-stop transition logic.
-                }
-            }
-        }
-        InputEvent::EncoderCCW => {
-            if recipes.is_empty() {
-                return;
-            }
-            match ui_state {
-                UIState::ShowStatus => {
-                    // Do nothing
-                }
-                UIState::BrowseRecipes { index } => {
-                    let maybe_index: isize = *index as isize - 1;
-                    if maybe_index < 0 {
-                        info!("Exiting recipe browser: encoder CCW past index 0");
-                        *ui_state = UIState::ShowStatus;
-                    } else {
-                        *index = maybe_index as usize;
-                    }
-                }
-                UIState::ConfirmStopCooking { .. } => {
-                    // Caller owns confirm-stop transition logic.
-                }
-            }
-        }
-        InputEvent::EncoderButton => {
-            // Caller handles inactivity timer reset.
         }
     }
 }

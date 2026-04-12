@@ -6,8 +6,8 @@ extern crate alloc;
 mod api;
 mod app_state;
 mod backlight;
-mod display;
 mod events;
+mod lcd;
 mod logic;
 
 use embedded_alloc::LlffHeap as Heap;
@@ -33,8 +33,8 @@ use {defmt_rtt as _, panic_probe as _};
 
 use crate::app_state::AppState;
 use crate::backlight::BacklightController;
-use crate::display::LcdController;
 use crate::events::{rot_enc_button_task, rotary_encoder_task, EVENT_CHANNEL};
+use crate::lcd::LcdController;
 
 const WIFI_SSID: &str = env!("ANOVA_WIFI_SSID");
 const WIFI_PASSWORD: &str = env!("ANOVA_WIFI_PASSWORD");
