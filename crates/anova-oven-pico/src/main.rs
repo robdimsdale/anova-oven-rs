@@ -196,8 +196,7 @@ async fn main(spawner: Spawner) {
     info!("Init complete, entering main loop");
 
     loop {
-        let now = Instant::now();
-        let next_render = now + Duration::from_millis(DISPLAY_REFRESH_MS);
+        let next_render = Instant::now() + Duration::from_millis(DISPLAY_REFRESH_MS);
         let wake_at = match app.next_event_due_at() {
             Some(t) => t.min(next_render),
             None => next_render,
