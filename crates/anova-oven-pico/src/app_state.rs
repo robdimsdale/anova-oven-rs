@@ -7,7 +7,7 @@ use crate::backlight::BacklightController;
 use crate::events::InputEvent;
 use crate::lcd::LcdController;
 
-pub enum UIState {
+enum UIState {
     ShowIdle,
     ShowCook,
     BrowseRecipes { index: usize },
@@ -19,7 +19,7 @@ const STOP_CONFIRM_TIMEOUT_SECS: u64 = 5;
 const LED_DIM_TIMER_SECS: u64 = 5;
 
 const SERVER_RETRY_LOG_INTERVAL: u64 = 5;
-const API_CALL_TIMEOUT_SECS: u64 = 3;
+const API_CALL_TIMEOUT_SECS: u64 = 5;
 const POST_ACTION_COOK_REFRESH_DELAY_SECS: u64 = 1;
 
 const COOK_POLL_INTERVAL: u64 = 10;
@@ -58,14 +58,14 @@ enum EventKind {
 struct ScheduledEvent {
     kind: EventKind,
     execution_time: Instant,
-    priority: u8,
+    priority: u8, // Lower priority value means higher priority when execution times are equal.
 }
 
 impl EventKind {
     fn priority(self) -> u8 {
         match self {
-            EventKind::APIStart | EventKind::APIStop => 1,
-            _ => 0,
+            EventKind::APIStart | EventKind::APIStop => 0,
+            _ => 1,
         }
     }
 }
@@ -122,7 +122,7 @@ impl EventQueue {
         }
     }
 
-    /// Returns the index of the soonest-due event, breaking ties by higher priority.
+    /// Returns the index of the soonest-due event, breaking ties by lower priority.
     fn soonest_index(&self) -> Option<usize> {
         self.events
             .iter()
@@ -130,7 +130,7 @@ impl EventQueue {
             .min_by(|(_, a), (_, b)| {
                 a.execution_time
                     .cmp(&b.execution_time)
-                    .then(b.priority.cmp(&a.priority))
+                    .then(a.priority.cmp(&b.priority))
             })
             .map(|(i, _)| i)
     }
