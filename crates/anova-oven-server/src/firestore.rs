@@ -1153,6 +1153,51 @@ pub async fn fetch_current_cook(
     Ok(None)
 }
 
+/// PATCH the `recipeRef` field on the `users/{uid}/oven-cooks/{cook_id}` document.
+///
+/// Uses `updateMask.fieldPaths=recipeRef` so only that field is touched (other fields
+/// written by Anova's cloud — stages, timestamps, etc. — are preserved). Creates the
+/// document if it does not yet exist.
+pub async fn patch_cook_recipe_ref(
+    client: &reqwest::Client,
+    session: &FirebaseSession,
+    cook_id: &str,
+    recipe_id: &str,
+) -> Result<(), FirestoreError> {
+    let url = format!(
+        "https://firestore.googleapis.com/v1/projects/{ANOVA_PROJECT_ID}/databases/(default)/documents/users/{uid}/oven-cooks/{cook_id}?updateMask.fieldPaths=recipeRef",
+        uid = session.uid,
+    );
+    let recipe_ref = format!(
+        "projects/{ANOVA_PROJECT_ID}/databases/(default)/documents/oven-recipes/{recipe_id}"
+    );
+    let body = serde_json::json!({
+        "fields": {
+            "recipeRef": {
+                "referenceValue": recipe_ref,
+            }
+        }
+    });
+    let resp = client
+        .patch(&url)
+        .bearer_auth(&session.id_token)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| FirestoreError::Other(e.into()))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(FirestoreError::Unauthorized);
+        }
+        let body = resp.text().await.unwrap_or_default();
+        return Err(FirestoreError::Other(
+            format!("Firestore patch (cook recipeRef) failed ({status}): {body}").into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Convert a raw Firestore stage JSON object into [`anova_oven_api::Stage`].
 fn stage_from_json(s: &JsonValue) -> anova_oven_api::Stage {
     let kind = s
