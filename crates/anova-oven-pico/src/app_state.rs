@@ -42,12 +42,7 @@ enum PendingApiAction {
     Start { recipe_id: alloc::string::String },
 }
 
-pub(crate) struct AppState<DB, MM, CH>
-where
-    DB: hd44780_driver::non_blocking::bus::DataBus,
-    MM: hd44780_driver::memory_map::DisplayMemoryMap,
-    CH: hd44780_driver::charset::CharsetWithFallback,
-{
+pub(crate) struct AppState {
     pub(crate) tick: u64,
     pub(crate) ui_state: UIState,
     pub(crate) last_input_at: Option<Instant>,
@@ -61,18 +56,13 @@ where
     queued_refresh_at: Option<Instant>,
 
     backlight_controller: BacklightController,
-    lcd_controller: LcdController<DB, MM, CH>,
+    lcd_controller: LcdController,
 }
 
-impl<DB, MM, CH> AppState<DB, MM, CH>
-where
-    DB: hd44780_driver::non_blocking::bus::DataBus,
-    MM: hd44780_driver::memory_map::DisplayMemoryMap,
-    CH: hd44780_driver::charset::CharsetWithFallback,
-{
+impl AppState {
     pub(crate) fn new(
         backlight_controller: BacklightController,
-        lcd_controller: LcdController<DB, MM, CH>,
+        lcd_controller: LcdController,
     ) -> Self {
         Self {
             tick: 0,
