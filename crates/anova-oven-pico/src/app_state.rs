@@ -36,6 +36,10 @@ const POLL_BACKOFF_TIER1_SECS: u64 = 5;
 const POLL_BACKOFF_TIER2_SECS: u64 = 15;
 const POLL_BACKOFF_TIER3_SECS: u64 = 30;
 
+const IDLE: &str = "idle";
+const COOK: &str = "cook";
+const PENDING: &str = "pending";
+
 enum PendingApiAction {
     Stop,
     Start { recipe_id: alloc::string::String },
@@ -488,8 +492,8 @@ impl AppState {
         self.current_cook = None;
 
         if let Some(status) = self.latest_status.as_mut() {
-            status.mode = alloc::string::String::from("idle");
-            status.timer_mode = alloc::string::String::from("idle");
+            status.mode = IDLE.into();
+            status.timer_mode = IDLE.into();
             status.timer_current_secs = 0;
             status.target_temperature_c = None;
             status.steam_target_pct = None;
@@ -502,13 +506,13 @@ impl AppState {
         let cook_stage_count = recipe
             .stages
             .iter()
-            .filter(|stage| stage.kind.as_str() == "cook")
+            .filter(|stage| stage.kind.as_str() == COOK)
             .count();
 
         self.current_cook = Some(anova_oven_api::CurrentCook {
             recipe_title: recipe.title.clone(),
             recipe_id: Some(recipe.id.clone()),
-            started_at: alloc::string::String::from("pending"),
+            started_at: PENDING.into(),
             stages: recipe.stages.clone(),
             cook_stage_count,
             total_stage_count: recipe.stages.len(),

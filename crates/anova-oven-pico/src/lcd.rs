@@ -139,8 +139,8 @@ impl LcdController {
             if slot == slot_idx {
                 let row1 = match stage_title {
                     Some(title) => alloc::format!("Stage: {title}"),
-                    None if cook.recipe_title == "[custom]" => {
-                        alloc::string::String::from("Custom stage")
+                    None if cook.recipe_title == "[manual]" => {
+                        alloc::string::String::from("Manual stage")
                     }
                     None => alloc::format!("Stage: {phase}"),
                 };
@@ -189,7 +189,7 @@ impl LcdController {
                 }
             }
         } else if is_cooking {
-            self.write_row(0, "Custom cook", tick).await;
+            self.write_row(0, "Manual cook", tick).await;
 
             let row1 = if let Some(steam) = status.steam_target_pct {
                 alloc::format!("{} S:{:.0}%", status.phase(), steam)
