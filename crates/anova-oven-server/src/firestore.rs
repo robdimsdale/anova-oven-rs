@@ -7,6 +7,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value as JsonValue};
+use tracing::{debug, warn};
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -519,7 +520,7 @@ pub async fn fetch_recipes(
         Ok(b) => b,
         Err(e @ FirestoreError::Unauthorized) => return Err(e),
         Err(FirestoreError::Other(e)) => {
-            eprintln!("[recipes] Failed to fetch bookmarks: {e}");
+            warn!(error = %e, "[recipes] failed to fetch bookmarks");
             Vec::new()
         }
     };
@@ -1084,10 +1085,10 @@ pub async fn fetch_current_cook(
         }
 
         if debug_current_cook_logging_enabled() {
-            eprintln!("[current-cook] in-progress document: {}", doc.name);
+            debug!(document = %doc.name, "[current-cook] in-progress document");
             match serde_json::to_string_pretty(&json) {
-                Ok(pretty) => eprintln!("[current-cook] raw json:\n{pretty}"),
-                Err(e) => eprintln!("[current-cook] failed to pretty-print json: {e}"),
+                Ok(pretty) => debug!(raw_json = %pretty, "[current-cook] raw json"),
+                Err(e) => warn!(error = %e, "[current-cook] failed to pretty-print json"),
             }
         }
 
@@ -1118,9 +1119,12 @@ pub async fn fetch_current_cook(
 
         if recipe_title == "[custom]" {
             let candidate_titles = cook_title_candidates_for_log(&json);
-            eprintln!(
-                "[current-cook] unresolved recipe title (recipeRef={:?}, recipeId={:?}, titleCandidates={:?}, identityCandidates={:?})",
-                recipe_ref, recipe_id, candidate_titles, identity_candidates
+            debug!(
+                recipe_ref = ?recipe_ref,
+                recipe_id = ?recipe_id,
+                title_candidates = ?candidate_titles,
+                identity_candidates = ?identity_candidates,
+                "[current-cook] unresolved recipe title"
             );
         }
 
