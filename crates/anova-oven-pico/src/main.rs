@@ -4,10 +4,12 @@
 extern crate alloc;
 
 mod api;
-mod app_state;
+mod api_client;
 mod backlight;
-mod events;
+mod display;
+mod input;
 mod lcd;
+mod state;
 
 use embedded_alloc::LlffHeap as Heap;
 
@@ -19,10 +21,13 @@ use defmt::{info, warn};
 use embassy_executor::Spawner;
 use embassy_net::{Config, StackResources};
 use embassy_rp::bind_interrupts;
-use embassy_rp::gpio::{Input, Level, Output, Pull};
+use embassy_rp::gpio::{Input as GpioInput, Level, Output, Pull};
 use embassy_rp::peripherals::{DMA_CH0, PIO0};
 use embassy_rp::pio::Pio;
-use embassy_time::{Delay, Duration, Instant, Timer};
+use embassy_sync::channel::Channel;
+use embassy_sync::signal::Signal;
+use embassy_sync::watch::Watch;
+use embassy_time::{Delay, Duration, Timer};
 use hd44780_driver::{
     bus::FourBitBusPins, memory_map::MemoryMap1602, non_blocking::HD44780,
     setup::DisplayOptions4Bit,
@@ -30,16 +35,16 @@ use hd44780_driver::{
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
-use crate::app_state::AppState;
+use crate::api_client::{ApiClient, CommandChannel, StateWatch};
 use crate::backlight::BacklightController;
-use crate::events::{rot_enc_button_task, rotary_encoder_task, EVENT_CHANNEL};
+use crate::display::{Display, DisplayNotifier, ViewSpec};
+use crate::input::{Input, InputChannel};
 use crate::lcd::LcdController;
+use crate::state::{AppState, Ctx};
 
 const WIFI_SSID: &str = env!("ANOVA_WIFI_SSID");
 const WIFI_PASSWORD: &str = env!("ANOVA_WIFI_PASSWORD");
 pub(crate) const SERVER_URL: &str = env!("ANOVA_SERVER_URL");
-
-const DISPLAY_REFRESH_MS: u64 = 50;
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO0>;
@@ -51,6 +56,10 @@ static FW: &cyw43::Aligned<cyw43::A4, [u8]> =
 static NVRAM: &cyw43::Aligned<cyw43::A4, [u8]> =
     &cyw43::Aligned(*include_bytes!("../nvram_rp2040.bin"));
 static CLM: &[u8] = include_bytes!("../firmware/43439A0_clm.bin");
+static DISPLAY_NOTIFIER: DisplayNotifier = Signal::new();
+static INPUT_CHANNEL: InputChannel = Channel::new();
+static API_COMMANDS: CommandChannel = Channel::new();
+static API_STATE: StateWatch = Watch::new();
 
 #[embassy_executor::task]
 async fn cyw43_task(
@@ -66,7 +75,6 @@ async fn net_task(mut runner: embassy_net::Runner<'static, cyw43::NetDriver<'sta
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    // Init heap
     use core::mem::MaybeUninit;
 
     const HEAP_SIZE: usize = 32768;
@@ -77,10 +85,8 @@ async fn main(spawner: Spawner) {
         HEAP.init(HEAP_MEM.as_ptr() as usize, HEAP_SIZE);
     }
 
-    // Init peripherals
     let p = embassy_rp::init(Default::default());
 
-    // Init LCD
     let mut lcd_delay = Delay;
     let lcd = match HD44780::new(
         DisplayOptions4Bit::new(MemoryMap1602::new()).with_pins(FourBitBusPins {
@@ -101,26 +107,22 @@ async fn main(spawner: Spawner) {
 
     let mut lcd_controller = LcdController::new(lcd, lcd_delay);
     lcd_controller.configure().await;
+    let display = Display::new(lcd_controller, &DISPLAY_NOTIFIER, spawner).unwrap();
 
     let backlight_controller =
         BacklightController::new(p.PWM_SLICE3, p.PIN_6, p.PIN_7, p.PWM_SLICE4, p.PIN_8);
 
-    // Spawn tasks for user input handling.
-    spawner.spawn(rot_enc_button_task(Input::new(p.PIN_11, Pull::Up)).unwrap());
-    info!("Rotary encoder button task spawned on GPIO 11");
+    let input = Input::new(
+        GpioInput::new(p.PIN_9, Pull::Up),
+        GpioInput::new(p.PIN_10, Pull::Up),
+        GpioInput::new(p.PIN_11, Pull::Up),
+        &INPUT_CHANNEL,
+        spawner,
+    )
+    .unwrap();
 
-    spawner.spawn(
-        rotary_encoder_task(
-            Input::new(p.PIN_9, Pull::Up),
-            Input::new(p.PIN_10, Pull::Up),
-        )
-        .unwrap(),
-    );
-    info!("Rotary encoder task spawned on GPIO 9/10");
-
-    // Initialize wifi
     info!("Initializing WiFi...");
-    lcd_controller.render_wifi_init().await;
+    display.render(ViewSpec::WifiInit);
 
     let pwr = Output::new(p.PIN_23, Level::Low);
     let cs = Output::new(p.PIN_25, Level::High);
@@ -172,15 +174,15 @@ async fn main(spawner: Spawner) {
                 info!("WiFi connected");
                 break;
             }
-            Err(e) => {
-                warn!("WiFi join failed: {}", e);
+            Err(err) => {
+                warn!("WiFi join failed: {}", err);
                 Timer::after(Duration::from_secs(1)).await;
             }
         }
     }
 
     info!("Waiting for DHCP...");
-    lcd_controller.render_dhcp_init().await;
+    display.render(ViewSpec::DhcpInit);
 
     while !stack.is_config_up() {
         Timer::after(Duration::from_millis(100)).await;
@@ -190,28 +192,20 @@ async fn main(spawner: Spawner) {
         info!("IP address: {}", config.address);
     }
 
-    let mut app = AppState::new(backlight_controller, lcd_controller);
-
-    app.render_current_view().await;
+    let api = ApiClient::new(stack, &API_COMMANDS, &API_STATE, spawner).unwrap();
+    let api_rx = api.receiver().unwrap();
+    let mut ctx = Ctx {
+        input: &input,
+        api: &api,
+        api_rx,
+        display: &display,
+        backlight: backlight_controller,
+    };
+    let mut state = AppState::default();
 
     info!("Init complete, entering main loop");
 
     loop {
-        let next_render = Instant::now() + Duration::from_millis(DISPLAY_REFRESH_MS);
-        let wake_at = match app.next_event_due_at() {
-            Some(t) => t.min(next_render),
-            None => next_render,
-        };
-
-        match embassy_futures::select::select(Timer::at(wake_at), EVENT_CHANNEL.receive()).await {
-            embassy_futures::select::Either::First(()) => {
-                app.handle_due_scheduled_event(stack).await;
-            }
-            embassy_futures::select::Either::Second(event) => {
-                app.handle_user_event(event).await;
-            }
-        }
-
-        app.render_current_view().await;
+        state = state.execute(&mut ctx).await;
     }
 }
