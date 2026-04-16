@@ -190,12 +190,6 @@ where
                     self.last_input_at = None;
                     return;
                 }
-                InputEvent::StopButton => {
-                    info!("Sending POST /stop");
-                    self.apply_optimistic_stop_state();
-                    self.queue_stop_action(now);
-                    return;
-                }
             }
         }
 
@@ -214,19 +208,7 @@ where
                 InputEvent::EncoderButton => {
                     return;
                 }
-                InputEvent::StopButton => {
-                    info!("Sending POST /stop");
-                    self.apply_optimistic_stop_state();
-                    self.queue_stop_action(now);
-                    return;
-                }
             }
-        }
-
-        if matches!(event, InputEvent::StopButton) {
-            info!("Sending POST /stop");
-            self.apply_optimistic_stop_state();
-            self.queue_stop_action(now);
         }
 
         if matches!(event, InputEvent::EncoderButton) {
