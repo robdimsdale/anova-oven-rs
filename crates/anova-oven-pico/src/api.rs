@@ -7,6 +7,8 @@ use reqwless::request::{Method, RequestBuilder};
 
 use crate::SERVER_URL;
 
+static mut HTTP_RX_BUF: [u8; 16384] = [0u8; 16384];
+
 fn normalize_server_url(url: &str) -> alloc::string::String {
     let trimmed = url.trim_end_matches('/');
     if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
@@ -16,10 +18,12 @@ fn normalize_server_url(url: &str) -> alloc::string::String {
     }
 }
 
-pub async fn fetch_and_log_status(
+pub async fn fetch_status(
     stack: embassy_net::Stack<'static>,
-    rx_buf: &mut [u8],
 ) -> Option<anova_oven_api::OvenStatus> {
+    #[allow(static_mut_refs)]
+    let rx_buf = unsafe { &mut HTTP_RX_BUF };
+
     let client_state = TcpClientState::<1, 1024, 1024>::new();
     let tcp = TcpClient::new(stack, &client_state);
     let dns = DnsSocket::new(stack);
@@ -83,8 +87,10 @@ pub async fn fetch_and_log_status(
 
 pub async fn fetch_current_cook(
     stack: embassy_net::Stack<'static>,
-    rx_buf: &mut [u8],
 ) -> Option<anova_oven_api::CurrentCook> {
+    #[allow(static_mut_refs)]
+    let rx_buf = unsafe { &mut HTTP_RX_BUF };
+
     let client_state = TcpClientState::<1, 1024, 1024>::new();
     let tcp = TcpClient::new(stack, &client_state);
     let dns = DnsSocket::new(stack);
@@ -140,7 +146,10 @@ pub async fn fetch_current_cook(
     }
 }
 
-pub async fn send_stop(stack: embassy_net::Stack<'static>, rx_buf: &mut [u8]) {
+pub async fn send_stop(stack: embassy_net::Stack<'static>) {
+    #[allow(static_mut_refs)]
+    let rx_buf = unsafe { &mut HTTP_RX_BUF };
+
     let client_state = TcpClientState::<1, 1024, 1024>::new();
     let tcp = TcpClient::new(stack, &client_state);
     let dns = DnsSocket::new(stack);
@@ -171,7 +180,10 @@ pub async fn send_stop(stack: embassy_net::Stack<'static>, rx_buf: &mut [u8]) {
     }
 }
 
-pub async fn send_start(stack: embassy_net::Stack<'static>, rx_buf: &mut [u8], recipe_id: &str) {
+pub async fn send_start(stack: embassy_net::Stack<'static>, recipe_id: &str) {
+    #[allow(static_mut_refs)]
+    let rx_buf = unsafe { &mut HTTP_RX_BUF };
+
     let client_state = TcpClientState::<1, 1024, 1024>::new();
     let tcp = TcpClient::new(stack, &client_state);
     let dns = DnsSocket::new(stack);
@@ -208,10 +220,12 @@ pub async fn send_start(stack: embassy_net::Stack<'static>, rx_buf: &mut [u8], r
     }
 }
 
-pub async fn fetch_and_log_recipes(
+pub async fn fetch_recipes(
     stack: embassy_net::Stack<'static>,
-    rx_buf: &mut [u8],
 ) -> alloc::vec::Vec<anova_oven_api::Recipe> {
+    #[allow(static_mut_refs)]
+    let rx_buf = unsafe { &mut HTTP_RX_BUF };
+
     let client_state = TcpClientState::<1, 4096, 4096>::new();
     let tcp = TcpClient::new(stack, &client_state);
     let dns = DnsSocket::new(stack);
