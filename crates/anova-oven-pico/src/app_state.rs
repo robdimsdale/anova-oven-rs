@@ -191,14 +191,6 @@ impl AppState {
         }
     }
 
-    pub(crate) async fn render_wifi_init(&mut self) {
-        self.lcd_controller.render_wifi_init().await;
-    }
-
-    pub(crate) async fn render_dhcp_init(&mut self) {
-        self.lcd_controller.render_dhcp_init().await;
-    }
-
     pub(crate) fn next_event_due_at(&self) -> Option<Instant> {
         self.event_queue.next_due_at()
     }

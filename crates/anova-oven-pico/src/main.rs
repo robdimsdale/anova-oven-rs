@@ -102,10 +102,8 @@ async fn main(spawner: Spawner) {
     let mut lcd_controller = LcdController::new(lcd, lcd_delay);
     lcd_controller.configure().await;
 
-    let mut app = AppState::new(
-        BacklightController::new(p.PWM_SLICE3, p.PIN_6, p.PIN_7, p.PWM_SLICE4, p.PIN_8),
-        lcd_controller,
-    );
+    let backlight_controller =
+        BacklightController::new(p.PWM_SLICE3, p.PIN_6, p.PIN_7, p.PWM_SLICE4, p.PIN_8);
 
     // Spawn tasks for user input handling.
     spawner.spawn(rot_enc_button_task(Input::new(p.PIN_11, Pull::Up)).unwrap());
@@ -121,7 +119,8 @@ async fn main(spawner: Spawner) {
     info!("Rotary encoder task spawned on GPIO 9/10");
 
     // Initialize wifi
-    app.render_wifi_init().await;
+    info!("Initializing WiFi...");
+    lcd_controller.render_wifi_init().await;
 
     let pwr = Output::new(p.PIN_23, Level::Low);
     let cs = Output::new(p.PIN_25, Level::High);
@@ -162,7 +161,7 @@ async fn main(spawner: Spawner) {
     info!("Connecting to WiFi: {}", WIFI_SSID);
     info!("Configured server URL: {}", SERVER_URL);
     if SERVER_URL.contains("localhost") || SERVER_URL.contains("127.0.0.1") {
-        warn!("ANOVA_SERVER_URL points to loopback; Pico cannot reach your laptop via localhost");
+        warn!("ANOVA_SERVER_URL points to loopback");
     }
     loop {
         match control
@@ -180,9 +179,9 @@ async fn main(spawner: Spawner) {
         }
     }
 
-    app.render_dhcp_init().await;
-
     info!("Waiting for DHCP...");
+    lcd_controller.render_dhcp_init().await;
+
     while !stack.is_config_up() {
         Timer::after(Duration::from_millis(100)).await;
     }
@@ -190,6 +189,8 @@ async fn main(spawner: Spawner) {
     if let Some(config) = stack.config_v4() {
         info!("IP address: {}", config.address);
     }
+
+    let mut app = AppState::new(backlight_controller, lcd_controller);
 
     app.render_current_view().await;
 
