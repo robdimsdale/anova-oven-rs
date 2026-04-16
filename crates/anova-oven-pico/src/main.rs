@@ -15,7 +15,7 @@ use embedded_alloc::LlffHeap as Heap;
 static HEAP: Heap = Heap::empty();
 
 use cyw43_pio::PioSpi;
-use defmt::{debug, info, warn};
+use defmt::{info, warn};
 use embassy_executor::Spawner;
 use embassy_net::{Config, StackResources};
 use embassy_rp::bind_interrupts;
@@ -191,42 +191,25 @@ async fn main(spawner: Spawner) {
         info!("IP address: {}", config.address);
     }
 
-    app.init_data(stack).await;
     app.render_current_view().await;
 
     info!("Init complete, entering main loop");
 
-    let mut next_poll_at = Instant::now() + Duration::from_secs(app.next_poll_interval_secs());
-
     loop {
-        debug!("--- Main loop tick {} ---", app.tick);
-        app.update_inactivity_timeout();
+        let now = Instant::now();
+        let next_render = now + Duration::from_millis(DISPLAY_REFRESH_MS);
+        let wake_at = match app.next_event_due_at() {
+            Some(t) => t.min(next_render),
+            None => next_render,
+        };
 
-        match embassy_futures::select::select(
-            Timer::after(Duration::from_millis(DISPLAY_REFRESH_MS)),
-            EVENT_CHANNEL.receive(),
-        )
-        .await
-        {
+        match embassy_futures::select::select(Timer::at(wake_at), EVENT_CHANNEL.receive()).await {
             embassy_futures::select::Either::First(()) => {
-                // This branch is a no-op; we just want to trigger a display refresh at a regular interval for smoother scrolling,
-                // independent of status polling or user input. The display task will run at the end of the loop unconditionally, so no action is needed here.
+                app.handle_due_scheduled_event(stack).await;
             }
             embassy_futures::select::Either::Second(event) => {
-                app.handle_user_activity(event).await;
+                app.handle_user_event(event).await;
             }
-        }
-
-        // Render first so optimistic UI transitions are visible immediately.
-        app.render_current_view().await;
-
-        // TODO: can we split out the status update API call into the same queue? Should we?
-        app.process_pending_api_action(stack).await;
-        app.process_queued_refresh_if_due(stack).await;
-
-        if Instant::now() >= next_poll_at {
-            app.poll_status_if_due(stack).await;
-            next_poll_at = Instant::now() + Duration::from_secs(app.next_poll_interval_secs());
         }
 
         app.render_current_view().await;

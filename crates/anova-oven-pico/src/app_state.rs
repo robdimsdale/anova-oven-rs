@@ -1,5 +1,6 @@
-use defmt::{debug, info, warn};
+use defmt::{debug, error, info, warn};
 use embassy_time::{with_timeout, Duration, Instant};
+use heapless::Vec as HeaplessVec;
 
 use crate::api::{fetch_current_cook, fetch_recipes, fetch_status, send_start, send_stop};
 use crate::backlight::BacklightController;
@@ -10,7 +11,7 @@ pub enum UIState {
     ShowIdle,
     ShowCook,
     BrowseRecipes { index: usize },
-    ConfirmStopCooking { last_input_at: Instant },
+    ConfirmStopCooking,
 }
 
 const MENU_INACTIVITY_TIMEOUT_SECS: u64 = 15;
@@ -41,23 +42,123 @@ const IDLE: &str = "idle";
 const COOK: &str = "cook";
 const PENDING: &str = "pending";
 
-enum PendingApiAction {
-    Stop,
-    Start { recipe_id: alloc::string::String },
+const EVENT_QUEUE_CAPACITY: usize = 16;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EventKind {
+    PollStatus,
+    PollCurrentCook,
+    PollRecipes,
+    APIStart,
+    APIStop,
+    InactivityCheck,
+}
+
+#[derive(Clone, Copy)]
+struct ScheduledEvent {
+    kind: EventKind,
+    execution_time: Instant,
+    priority: u8,
+}
+
+impl EventKind {
+    fn priority(self) -> u8 {
+        match self {
+            EventKind::APIStart | EventKind::APIStop => 1,
+            _ => 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum EnqueueMode {
+    /// Replace existing entry of the same kind only if the new time is sooner.
+    PreferEarlier,
+    /// Always replace existing entry of the same kind with the new time.
+    Replace,
+}
+
+struct EventQueue {
+    events: HeaplessVec<ScheduledEvent, EVENT_QUEUE_CAPACITY>,
+}
+
+impl EventQueue {
+    fn new() -> Self {
+        Self {
+            events: HeaplessVec::new(),
+        }
+    }
+
+    fn enqueue(&mut self, kind: EventKind, execution_time: Instant, mode: EnqueueMode) {
+        if let Some(existing) = self.events.iter_mut().find(|e| e.kind == kind) {
+            existing.execution_time = match mode {
+                EnqueueMode::PreferEarlier => existing.execution_time.min(execution_time),
+                EnqueueMode::Replace => execution_time,
+            };
+            return;
+        }
+
+        let event = ScheduledEvent {
+            kind,
+            execution_time,
+            priority: kind.priority(),
+        };
+
+        if self.events.push(event).is_err() {
+            error!(
+                "Event queue overflow (capacity {}); dropping event",
+                EVENT_QUEUE_CAPACITY
+            );
+        }
+    }
+
+    fn contains(&self, kind: EventKind) -> bool {
+        self.events.iter().any(|e| e.kind == kind)
+    }
+
+    fn remove(&mut self, kind: EventKind) {
+        if let Some(idx) = self.events.iter().position(|e| e.kind == kind) {
+            self.events.swap_remove(idx);
+        }
+    }
+
+    /// Returns the index of the soonest-due event, breaking ties by higher priority.
+    fn soonest_index(&self) -> Option<usize> {
+        self.events
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                a.execution_time
+                    .cmp(&b.execution_time)
+                    .then(b.priority.cmp(&a.priority))
+            })
+            .map(|(i, _)| i)
+    }
+
+    fn next_due_at(&self) -> Option<Instant> {
+        self.soonest_index().map(|i| self.events[i].execution_time)
+    }
+
+    fn pop_due(&mut self, now: Instant) -> Option<ScheduledEvent> {
+        let idx = self.soonest_index()?;
+        if self.events[idx].execution_time > now {
+            return None;
+        }
+        Some(self.events.swap_remove(idx))
+    }
 }
 
 pub(crate) struct AppState {
-    pub(crate) tick: u64,
-    pub(crate) ui_state: UIState,
-    pub(crate) last_input_at: Option<Instant>,
-    pub(crate) baseline_reentered_at: Option<Instant>,
-    pub(crate) current_cook: Option<anova_oven_api::CurrentCook>,
-    pub(crate) latest_status: Option<anova_oven_api::OvenStatus>,
-    pub(crate) recipes: alloc::vec::Vec<anova_oven_api::Recipe>,
-    pub(crate) server_offline: bool,
-    pub(crate) server_fail_count: u64,
-    pending_api_action: Option<PendingApiAction>,
-    queued_refresh_at: Option<Instant>,
+    tick: u64,
+    ui_state: UIState,
+    baseline_reentered_at: Option<Instant>,
+    current_cook: Option<anova_oven_api::CurrentCook>,
+    latest_status: Option<anova_oven_api::OvenStatus>,
+    recipes: alloc::vec::Vec<anova_oven_api::Recipe>,
+    server_offline: bool,
+    server_fail_count: u64,
+    pending_start_recipe_id: Option<alloc::string::String>,
+    event_queue: EventQueue,
 
     backlight_controller: BacklightController,
     lcd_controller: LcdController,
@@ -68,18 +169,23 @@ impl AppState {
         backlight_controller: BacklightController,
         lcd_controller: LcdController,
     ) -> Self {
+        let now = Instant::now();
+        let mut event_queue = EventQueue::new();
+        event_queue.enqueue(EventKind::PollStatus, now, EnqueueMode::PreferEarlier);
+        event_queue.enqueue(EventKind::PollCurrentCook, now, EnqueueMode::PreferEarlier);
+        event_queue.enqueue(EventKind::PollRecipes, now, EnqueueMode::PreferEarlier);
+
         Self {
             tick: 0,
             ui_state: UIState::ShowIdle,
-            last_input_at: None,
-            baseline_reentered_at: Some(Instant::now()),
+            baseline_reentered_at: Some(now),
             current_cook: None,
             latest_status: None,
             recipes: alloc::vec::Vec::new(),
             server_offline: false,
             server_fail_count: 0,
-            pending_api_action: None,
-            queued_refresh_at: None,
+            pending_start_recipe_id: None,
+            event_queue,
             backlight_controller,
             lcd_controller,
         }
@@ -93,16 +199,27 @@ impl AppState {
         self.lcd_controller.render_dhcp_init().await;
     }
 
-    pub(crate) async fn init_data(&mut self, stack: embassy_net::Stack<'static>) {
-        self.update_status(stack).await;
-        self.update_current_cook(stack).await;
-        self.update_recipes(stack).await;
-
-        self.reconcile_current_cook_recipe_title();
-        self.sync_status_ui_state();
+    pub(crate) fn next_event_due_at(&self) -> Option<Instant> {
+        self.event_queue.next_due_at()
     }
 
-    pub(crate) fn next_poll_interval_secs(&self) -> u64 {
+    pub(crate) async fn handle_due_scheduled_event(&mut self, stack: embassy_net::Stack<'static>) {
+        let now = Instant::now();
+        let Some(event) = self.event_queue.pop_due(now) else {
+            return;
+        };
+
+        match event.kind {
+            EventKind::PollStatus => self.handle_poll_status(stack).await,
+            EventKind::PollCurrentCook => self.handle_poll_current_cook(stack).await,
+            EventKind::PollRecipes => self.handle_poll_recipes(stack).await,
+            EventKind::APIStart => self.handle_api_start(stack).await,
+            EventKind::APIStop => self.handle_api_stop(stack).await,
+            EventKind::InactivityCheck => self.handle_inactivity_check(),
+        }
+    }
+
+    fn next_poll_interval_secs(&self) -> u64 {
         match self.server_fail_count {
             n if n >= POLL_BACKOFF_TIER3_FAILS => POLL_BACKOFF_TIER3_SECS,
             n if n >= POLL_BACKOFF_TIER2_FAILS => POLL_BACKOFF_TIER2_SECS,
@@ -111,30 +228,84 @@ impl AppState {
         }
     }
 
-    pub(crate) fn update_inactivity_timeout(&mut self) {
-        if let UIState::ConfirmStopCooking { last_input_at } = self.ui_state {
-            if last_input_at.elapsed() >= Duration::from_secs(STOP_CONFIRM_TIMEOUT_SECS) {
-                info!("Stop-confirm timeout: reverting to status view");
-                self.enter_baseline_state();
-            }
-            return;
-        }
+    fn poll_action_in_flight(&self) -> bool {
+        self.event_queue.contains(EventKind::APIStart)
+            || self.event_queue.contains(EventKind::APIStop)
+    }
 
-        if let Some(t) = self.last_input_at {
-            if t.elapsed() >= Duration::from_secs(MENU_INACTIVITY_TIMEOUT_SECS) {
-                if !matches!(self.ui_state, UIState::ShowIdle | UIState::ShowCook) {
-                    info!("Inactivity timeout: reverting to status view");
-                    self.enter_baseline_state();
-                }
-                self.last_input_at = None;
-            }
+    async fn handle_api_start(&mut self, stack: embassy_net::Stack<'static>) {
+        let Some(recipe_id) = self.pending_start_recipe_id.take() else {
+            warn!("APIStart event fired but no recipe id was staged");
+            return;
+        };
+        info!("Sending POST /start with recipe id: {}", recipe_id.as_str());
+        if with_timeout(
+            Duration::from_secs(API_CALL_TIMEOUT_SECS),
+            send_start(stack, recipe_id.as_str()),
+        )
+        .await
+        .is_err()
+        {
+            warn!("POST /start: timed out");
         }
     }
 
-    pub(crate) async fn handle_user_activity(&mut self, event: InputEvent) {
-        let now = Instant::now();
+    async fn handle_api_stop(&mut self, stack: embassy_net::Stack<'static>) {
+        if with_timeout(Duration::from_secs(API_CALL_TIMEOUT_SECS), send_stop(stack))
+            .await
+            .is_err()
+        {
+            warn!("POST /stop: timed out");
+        }
+    }
 
-        self.last_input_at = Some(now);
+    async fn handle_poll_status(&mut self, stack: embassy_net::Stack<'static>) {
+        if !self.poll_action_in_flight() {
+            self.update_status(stack).await;
+        }
+        self.tick += 1;
+
+        let interval = self
+            .next_poll_interval_secs()
+            .max(NORMAL_POLL_INTERVAL_SECS);
+        self.event_queue.enqueue(
+            EventKind::PollStatus,
+            Instant::now() + Duration::from_secs(interval),
+            EnqueueMode::PreferEarlier,
+        );
+    }
+
+    async fn handle_poll_current_cook(&mut self, stack: embassy_net::Stack<'static>) {
+        if !self.poll_action_in_flight() {
+            self.update_current_cook(stack).await;
+            self.reconcile_current_cook_recipe_title();
+            self.sync_status_ui_state();
+        }
+
+        let interval = self.next_poll_interval_secs().max(COOK_POLL_INTERVAL);
+        self.event_queue.enqueue(
+            EventKind::PollCurrentCook,
+            Instant::now() + Duration::from_secs(interval),
+            EnqueueMode::PreferEarlier,
+        );
+    }
+
+    async fn handle_poll_recipes(&mut self, stack: embassy_net::Stack<'static>) {
+        if !self.poll_action_in_flight() {
+            self.update_recipes(stack).await;
+            self.reconcile_current_cook_recipe_title();
+        }
+
+        let interval = self.next_poll_interval_secs().max(RECIPE_POLL_INTERVAL);
+        self.event_queue.enqueue(
+            EventKind::PollRecipes,
+            Instant::now() + Duration::from_secs(interval),
+            EnqueueMode::PreferEarlier,
+        );
+    }
+
+    pub(crate) async fn handle_user_event(&mut self, event: InputEvent) {
+        let now = Instant::now();
 
         debug!("Setting backlight to full: (input activity)");
         self.backlight_controller.set_full();
@@ -143,7 +314,7 @@ impl AppState {
             UIState::ShowCook => match event {
                 InputEvent::EncoderCCW => {
                     info!("Entering stop-confirm mode: encoder CCW");
-                    self.ui_state = UIState::ConfirmStopCooking { last_input_at: now };
+                    self.ui_state = UIState::ConfirmStopCooking;
                 }
                 InputEvent::EncoderCW => {
                     // Explicit no-op while cooking to keep this branch ready for future behavior.
@@ -192,9 +363,9 @@ impl AppState {
                     }
                 }
             },
-            UIState::ConfirmStopCooking { .. } => match event {
+            UIState::ConfirmStopCooking => match event {
                 InputEvent::EncoderCCW => {
-                    self.ui_state = UIState::ConfirmStopCooking { last_input_at: now };
+                    // Stay in confirm; the inactivity reschedule below pushes the deadline out.
                 }
                 InputEvent::EncoderCW => {
                     info!("Exiting stop-confirm mode: encoder CW");
@@ -210,28 +381,31 @@ impl AppState {
         }
 
         self.update_baseline_timer_for_current_view(now);
+        self.reschedule_inactivity_check(now);
     }
 
-    pub(crate) async fn poll_status_if_due(&mut self, stack: embassy_net::Stack<'static>) {
-        if self.pending_api_action.is_some() || self.queued_refresh_at.is_some() {
-            self.tick += 1;
-            return;
+    fn reschedule_inactivity_check(&mut self, now: Instant) {
+        let timeout_secs = match self.ui_state {
+            UIState::ShowIdle | UIState::ShowCook => {
+                self.event_queue.remove(EventKind::InactivityCheck);
+                return;
+            }
+            UIState::ConfirmStopCooking => STOP_CONFIRM_TIMEOUT_SECS,
+            UIState::BrowseRecipes { .. } => MENU_INACTIVITY_TIMEOUT_SECS,
+        };
+
+        self.event_queue.enqueue(
+            EventKind::InactivityCheck,
+            now + Duration::from_secs(timeout_secs),
+            EnqueueMode::Replace,
+        );
+    }
+
+    fn handle_inactivity_check(&mut self) {
+        if !self.is_status_view() {
+            info!("Inactivity timeout: reverting to status view");
+            self.enter_baseline_state();
         }
-
-        if self.tick % COOK_POLL_INTERVAL == 0 {
-            self.update_current_cook(stack).await;
-            self.reconcile_current_cook_recipe_title();
-            self.sync_status_ui_state();
-        }
-
-        if self.tick % RECIPE_POLL_INTERVAL == 0 {
-            self.update_recipes(stack).await;
-            self.reconcile_current_cook_recipe_title();
-        }
-
-        self.update_status(stack).await;
-
-        self.tick += 1;
     }
 
     pub(crate) async fn render_current_view(&mut self) {
@@ -257,7 +431,7 @@ impl AppState {
                     .render_recipe_browser(&self.recipes, *index, self.tick)
                     .await;
             }
-            UIState::ConfirmStopCooking { .. } => {
+            UIState::ConfirmStopCooking => {
                 self.lcd_controller
                     .render_stop_confirmation(
                         self.tick,
@@ -266,54 +440,6 @@ impl AppState {
                     )
                     .await;
             }
-        }
-    }
-
-    pub(crate) async fn process_pending_api_action(&mut self, stack: embassy_net::Stack<'static>) {
-        let Some(action) = self.pending_api_action.take() else {
-            return;
-        };
-
-        match action {
-            PendingApiAction::Stop => {
-                if with_timeout(Duration::from_secs(API_CALL_TIMEOUT_SECS), send_stop(stack))
-                    .await
-                    .is_err()
-                {
-                    warn!("POST /stop: timed out");
-                }
-            }
-            PendingApiAction::Start { recipe_id } => {
-                info!("Sending POST /start with recipe id: {}", recipe_id.as_str());
-                if with_timeout(
-                    Duration::from_secs(API_CALL_TIMEOUT_SECS),
-                    send_start(stack, recipe_id.as_str()),
-                )
-                .await
-                .is_err()
-                {
-                    warn!("POST /start: timed out");
-                }
-            }
-        }
-    }
-
-    pub(crate) async fn process_queued_refresh_if_due(
-        &mut self,
-        stack: embassy_net::Stack<'static>,
-    ) {
-        if self.pending_api_action.is_some() {
-            return;
-        }
-
-        if self
-            .queued_refresh_at
-            .is_some_and(|due_at| Instant::now() >= due_at)
-        {
-            self.queued_refresh_at = None;
-
-            self.update_status(stack).await;
-            self.update_current_cook(stack).await;
         }
     }
 
@@ -383,7 +509,7 @@ impl AppState {
         self.ui_state = UIState::ShowIdle;
         self.sync_status_ui_state();
         self.update_baseline_timer_for_current_view(Instant::now());
-        self.last_input_at = None;
+        self.event_queue.remove(EventKind::InactivityCheck);
     }
 
     fn set_server_offline(&mut self, offline: bool) {
@@ -507,15 +633,30 @@ impl AppState {
     }
 
     fn queue_stop_action(&mut self, now: Instant) {
-        self.pending_api_action = Some(PendingApiAction::Stop);
-        self.queued_refresh_at =
-            Some(now + Duration::from_secs(POST_ACTION_COOK_REFRESH_DELAY_SECS));
+        self.event_queue
+            .enqueue(EventKind::APIStop, now, EnqueueMode::PreferEarlier);
+        self.queue_post_action_refresh(now);
     }
 
     fn queue_start_action(&mut self, recipe_id: alloc::string::String, now: Instant) {
-        self.pending_api_action = Some(PendingApiAction::Start { recipe_id });
-        self.queued_refresh_at =
-            Some(now + Duration::from_secs(POST_ACTION_COOK_REFRESH_DELAY_SECS));
+        self.pending_start_recipe_id = Some(recipe_id);
+        self.event_queue
+            .enqueue(EventKind::APIStart, now, EnqueueMode::PreferEarlier);
+        self.queue_post_action_refresh(now);
+    }
+
+    fn queue_post_action_refresh(&mut self, now: Instant) {
+        let refresh_at = now + Duration::from_secs(POST_ACTION_COOK_REFRESH_DELAY_SECS);
+        self.event_queue.enqueue(
+            EventKind::PollStatus,
+            refresh_at,
+            EnqueueMode::PreferEarlier,
+        );
+        self.event_queue.enqueue(
+            EventKind::PollCurrentCook,
+            refresh_at,
+            EnqueueMode::PreferEarlier,
+        );
     }
 
     fn sync_status_ui_state(&mut self) {
