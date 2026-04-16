@@ -150,13 +150,17 @@ where
         }
     }
 
+    fn enter_baseline_state(&mut self) {
+        self.ui_state = UIState::ShowStatus;
+        self.baseline_reentered_at = Some(Instant::now());
+        self.last_input_at = None;
+    }
+
     pub(crate) fn update_inactivity_timeout(&mut self) {
         if let UIState::ConfirmStopCooking { last_input_at } = self.ui_state {
             if last_input_at.elapsed() >= Duration::from_secs(STOP_CONFIRM_TIMEOUT_SECS) {
                 info!("Stop-confirm timeout: reverting to ShowStatus");
-                self.ui_state = UIState::ShowStatus;
-                self.baseline_reentered_at = Some(Instant::now());
-                self.last_input_at = None;
+                self.enter_baseline_state();
             }
             return;
         }
@@ -165,8 +169,7 @@ where
             if t.elapsed() >= Duration::from_secs(MENU_INACTIVITY_TIMEOUT_SECS) {
                 if !matches!(self.ui_state, UIState::ShowStatus) {
                     info!("Inactivity timeout: reverting to ShowStatus");
-                    self.ui_state = UIState::ShowStatus;
-                    self.baseline_reentered_at = Some(Instant::now());
+                    self.enter_baseline_state();
                 }
                 self.last_input_at = None;
             }
@@ -197,19 +200,14 @@ where
                 }
                 InputEvent::EncoderCW => {
                     info!("Exiting stop-confirm mode: encoder CW");
-                    self.ui_state = UIState::ShowStatus;
-                    self.baseline_reentered_at = Some(now);
-                    self.last_input_at = None;
+                    self.enter_baseline_state();
                     return;
                 }
                 InputEvent::EncoderButton => {
                     info!("Sending POST /stop (confirm-stop mode)");
                     self.apply_optimistic_stop_state();
                     self.queue_stop_action(now);
-
-                    self.ui_state = UIState::ShowStatus;
-                    self.baseline_reentered_at = Some(now);
-                    self.last_input_at = None;
+                    self.enter_baseline_state();
                     return;
                 }
             }
@@ -244,7 +242,14 @@ where
             }
         }
 
+        let was_browse_recipes = matches!(self.ui_state, UIState::BrowseRecipes { .. });
         handle_input_event(event, &mut self.ui_state, &self.recipes);
+
+        // If we transitioned from BrowseRecipes to ShowStatus via encoder CCW past index 0,
+        // reset baseline state (logging was already done in events.rs)
+        if was_browse_recipes && matches!(self.ui_state, UIState::ShowStatus) {
+            self.enter_baseline_state();
+        }
     }
 
     pub(crate) async fn poll_status_if_due(&mut self, stack: embassy_net::Stack<'static>) {
