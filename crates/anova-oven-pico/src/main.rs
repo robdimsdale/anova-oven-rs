@@ -34,7 +34,7 @@ use {defmt_rtt as _, panic_probe as _};
 use crate::app_state::AppState;
 use crate::backlight::BacklightController;
 use crate::display::LcdController;
-use crate::events::{rot_enc_button_task, rotary_encoder_task, stop_button_task, EVENT_CHANNEL};
+use crate::events::{rot_enc_button_task, rotary_encoder_task, EVENT_CHANNEL};
 
 const WIFI_SSID: &str = env!("ANOVA_WIFI_SSID");
 const WIFI_PASSWORD: &str = env!("ANOVA_WIFI_PASSWORD");
@@ -112,9 +112,6 @@ async fn main(spawner: Spawner) {
     );
 
     // Spawn tasks for user input handling.
-    spawner.spawn(stop_button_task(Input::new(p.PIN_15, Pull::Up)).unwrap());
-    info!("Stop button task spawned on GPIO 15");
-
     spawner.spawn(rot_enc_button_task(Input::new(p.PIN_11, Pull::Up)).unwrap());
     info!("Rotary encoder button task spawned on GPIO 11");
 
