@@ -36,6 +36,8 @@ use uuid::Uuid;
 
 const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_HTTP_CONNECT_TIMEOUT_SECS: u64 = 5;
+const DEFAULT_CURRENT_COOK_TIMEOUT_SECS: u64 = 4;
+const DEFAULT_CURRENT_COOK_RESOLUTION_TIMEOUT_SECS: u64 = 1;
 
 // ─── Shared application state ─────────────────────────────────────────────────
 
@@ -58,6 +60,8 @@ struct AppState {
     /// Firebase session (ID token + UID), refreshed as needed.
     session: Mutex<firestore::FirebaseSession>,
     http: reqwest::Client,
+    current_cook_timeout: Duration,
+    current_cook_resolution_timeout: Duration,
 }
 
 // ─── Entry point ──────────────────────────────────────────────────────────────
@@ -112,6 +116,14 @@ async fn main() {
         history: Mutex::new(None),
         session: Mutex::new(session),
         http,
+        current_cook_timeout: env_duration_secs(
+            "ANOVA_CURRENT_COOK_TIMEOUT_SECS",
+            DEFAULT_CURRENT_COOK_TIMEOUT_SECS,
+        ),
+        current_cook_resolution_timeout: env_duration_secs(
+            "ANOVA_CURRENT_COOK_RESOLUTION_TIMEOUT_SECS",
+            DEFAULT_CURRENT_COOK_RESOLUTION_TIMEOUT_SECS,
+        ),
     });
 
     // Spawn WebSocket background task.
@@ -639,22 +651,44 @@ async fn recipes_for_resolution(state: &AppState) -> Result<Vec<anova_oven_api::
 }
 
 async fn handle_current_cook(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let session = state.session.lock().await.clone();
-    let result = match firestore::fetch_current_cook(&state.http, &session).await {
-        Ok(v) => Ok(v),
-        Err(err) => match maybe_refresh_session(&state, err).await {
-            Ok(fresh) => firestore::fetch_current_cook(&state.http, &fresh)
-                .await
-                .map_err(|e| e.to_string()),
-            Err(e) => Err(e),
-        },
+    let result = match tokio::time::timeout(state.current_cook_timeout, async {
+        let session = state.session.lock().await.clone();
+        match firestore::fetch_current_cook(&state.http, &session).await {
+            Ok(v) => Ok(v),
+            Err(err) => match maybe_refresh_session(&state, err).await {
+                Ok(fresh) => firestore::fetch_current_cook(&state.http, &fresh)
+                    .await
+                    .map_err(|e| e.to_string()),
+                Err(e) => Err(e),
+            },
+        }
+    })
+    .await
+    {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!(
+                "[current-cook] timed out after {}s",
+                state.current_cook_timeout.as_secs()
+            );
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                "Timed out fetching current cook from Firestore",
+            )
+                .into_response();
+        }
     };
 
     match result {
         Ok(Some(mut cook)) => {
             if cook.recipe_title == "[custom]" {
-                match recipes_for_resolution(&state).await {
-                    Ok(recipes) => {
+                match tokio::time::timeout(
+                    state.current_cook_resolution_timeout,
+                    recipes_for_resolution(&state),
+                )
+                .await
+                {
+                    Ok(Ok(recipes)) => {
                         if let Some((title, id)) = resolve_title_from_recipes(&cook, &recipes) {
                             eprintln!(
                                 "[current-cook] resolved title from recipe stage match: '{}' ({})",
@@ -666,8 +700,14 @@ async fn handle_current_cook(State(state): State<Arc<AppState>>) -> impl IntoRes
                             }
                         }
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         eprintln!("[current-cook] recipe resolution skipped: {e}");
+                    }
+                    Err(_) => {
+                        eprintln!(
+                            "[current-cook] recipe resolution skipped: timed out after {}s",
+                            state.current_cook_resolution_timeout.as_secs()
+                        );
                     }
                 }
             }
