@@ -40,7 +40,6 @@ const WIFI_SSID: &str = env!("ANOVA_WIFI_SSID");
 const WIFI_PASSWORD: &str = env!("ANOVA_WIFI_PASSWORD");
 pub(crate) const SERVER_URL: &str = env!("ANOVA_SERVER_URL");
 
-const POLL_INTERVAL_SECS: u64 = 1;
 const DISPLAY_REFRESH_MS: u64 = 50;
 
 bind_interrupts!(struct Irqs {
@@ -153,7 +152,7 @@ async fn main(spawner: Spawner) {
         .await;
 
     let config = Config::dhcpv4(Default::default());
-    static RESOURCES: StaticCell<StackResources<5>> = StaticCell::new();
+    static RESOURCES: StaticCell<StackResources<8>> = StaticCell::new();
     let seed: u64 = 0x0123_4567_89ab_cdef;
     let (stack, runner) = embassy_net::new(
         net_device,
@@ -200,7 +199,8 @@ async fn main(spawner: Spawner) {
 
     info!("Init complete, entering main loop");
 
-    let mut next_poll_at = Instant::now() + Duration::from_secs(POLL_INTERVAL_SECS);
+    let mut next_poll_at =
+        Instant::now() + Duration::from_secs(crate::app_state::NORMAL_POLL_INTERVAL_SECS);
 
     loop {
         debug!("--- Main loop tick {} ---", app.tick);
@@ -228,7 +228,7 @@ async fn main(spawner: Spawner) {
 
         if Instant::now() >= next_poll_at {
             app.poll_status_if_due(stack).await;
-            next_poll_at += Duration::from_secs(POLL_INTERVAL_SECS);
+            next_poll_at = Instant::now() + Duration::from_secs(app.next_poll_interval_secs());
         }
 
         app.render_current_view().await;

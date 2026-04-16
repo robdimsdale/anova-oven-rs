@@ -28,18 +28,23 @@ pub async fn fetch_and_log_status(
 
     let server = normalize_server_url(SERVER_URL);
     let url = alloc::format!("{server}/status");
+    debug!(
+        "GET /status: link_up={} config_up={}",
+        stack.is_link_up(),
+        stack.is_config_up()
+    );
     let mut request = match client.request(Method::GET, &url).await {
         Ok(r) => r,
-        Err(_) => {
-            warn!("GET /status: connection failed");
+        Err(e) => {
+            warn!("GET /status: connection failed: {:?}", e);
             return None;
         }
     };
 
     let response = match request.send(rx_buf).await {
         Ok(r) => r,
-        Err(_) => {
-            warn!("GET /status: send failed");
+        Err(e) => {
+            warn!("GET /status: send failed: {:?}", e);
             return None;
         }
     };

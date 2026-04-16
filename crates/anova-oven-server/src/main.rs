@@ -150,9 +150,13 @@ async fn main() {
         .expect("Failed to build HTTP client");
 
     eprintln!("Signing into Firebase...");
-    let session = firestore::sign_in(&http, &anova_email, &anova_password)
-        .await
-        .expect("Firebase sign-in failed");
+    let session = tokio::time::timeout(
+        Duration::from_secs(20),
+        firestore::sign_in(&http, &anova_email, &anova_password),
+    )
+    .await
+    .expect("Firebase sign-in timed out after 20s")
+    .expect("Firebase sign-in failed");
     eprintln!("Signed in as UID {}", session.uid);
 
     let (status_tx, status_rx) = watch::channel(None::<anova_oven_api::OvenStatus>);
@@ -195,13 +199,15 @@ async fn main() {
         ),
     });
 
-    match refresh_recipes_cache(&state).await {
-        Ok(recipes) => eprintln!("[recipes] Preloaded {} recipe(s)", recipes.len()),
-        Err(e) => eprintln!("[recipes] Startup preload failed: {e}"),
+    match tokio::time::timeout(Duration::from_secs(15), refresh_recipes_cache(&state)).await {
+        Ok(Ok(recipes)) => eprintln!("[recipes] Preloaded {} recipe(s)", recipes.len()),
+        Ok(Err(e)) => eprintln!("[recipes] Startup preload failed: {e}"),
+        Err(_) => eprintln!("[recipes] Startup preload timed out after 15s"),
     }
-    match refresh_history_cache(&state).await {
-        Ok(entries) => eprintln!("[history] Preloaded {} entr(y/ies)", entries.len()),
-        Err(e) => eprintln!("[history] Startup preload failed: {e}"),
+    match tokio::time::timeout(Duration::from_secs(15), refresh_history_cache(&state)).await {
+        Ok(Ok(entries)) => eprintln!("[history] Preloaded {} entr(y/ies)", entries.len()),
+        Ok(Err(e)) => eprintln!("[history] Startup preload failed: {e}"),
+        Err(_) => eprintln!("[history] Startup preload timed out after 15s"),
     }
 
     // Spawn WebSocket background task.
@@ -242,7 +248,8 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .expect("Failed to bind address");
-    eprintln!("Listening on http://{addr}");
+    eprintln!("[server] Listening on http://{addr}");
+    eprintln!("[server] HTTP server starting...");
     axum::serve(listener, app).await.expect("Server error");
 }
 
@@ -638,17 +645,19 @@ async fn history_refresh_task(
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                match refresh_history_cache(&state).await {
-                    Ok(entries) => eprintln!("[history] Periodic refresh: {} entr(y/ies)", entries.len()),
-                    Err(e) => eprintln!("[history] Periodic refresh failed: {e}"),
+                match tokio::time::timeout(Duration::from_secs(15), refresh_history_cache(&state)).await {
+                    Ok(Ok(entries)) => eprintln!("[history] Periodic refresh: {} entr(y/ies)", entries.len()),
+                    Ok(Err(e)) => eprintln!("[history] Periodic refresh failed: {e}"),
+                    Err(_) => eprintln!("[history] Periodic refresh timed out after 15s"),
                 }
             }
             reason = refresh_rx.recv() => {
                 match reason {
                     Some(reason) => {
-                        match refresh_history_cache(&state).await {
-                            Ok(entries) => eprintln!("[history] Refreshed (reason={}): {} entr(y/ies)", reason.as_str(), entries.len()),
-                            Err(e) => eprintln!("[history] Refresh failed (reason={}): {e}", reason.as_str()),
+                        match tokio::time::timeout(Duration::from_secs(15), refresh_history_cache(&state)).await {
+                            Ok(Ok(entries)) => eprintln!("[history] Refreshed (reason={}): {} entr(y/ies)", reason.as_str(), entries.len()),
+                            Ok(Err(e)) => eprintln!("[history] Refresh failed (reason={}): {e}", reason.as_str()),
+                            Err(_) => eprintln!("[history] Refresh timed out (reason={}) after 15s", reason.as_str()),
                         }
                     }
                     None => {
@@ -668,9 +677,10 @@ async fn recipes_refresh_task(state: Arc<AppState>) {
 
     loop {
         interval.tick().await;
-        match refresh_recipes_cache(&state).await {
-            Ok(recipes) => eprintln!("[recipes] Periodic refresh: {} recipe(s)", recipes.len()),
-            Err(e) => eprintln!("[recipes] Periodic refresh failed: {e}"),
+        match tokio::time::timeout(Duration::from_secs(15), refresh_recipes_cache(&state)).await {
+            Ok(Ok(recipes)) => eprintln!("[recipes] Periodic refresh: {} recipe(s)", recipes.len()),
+            Ok(Err(e)) => eprintln!("[recipes] Periodic refresh failed: {e}"),
+            Err(_) => eprintln!("[recipes] Periodic refresh timed out after 15s"),
         }
     }
 }
@@ -678,33 +688,55 @@ async fn recipes_refresh_task(state: Arc<AppState>) {
 // ─── HTTP handlers ─────────────────────────────────────────────────────────────
 
 async fn handle_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    eprintln!("[http] GET /status");
     match state.status_rx.borrow().clone() {
-        Some(status) => Json(status).into_response(),
-        None => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Oven state not yet received — WebSocket may still be connecting",
-        )
-            .into_response(),
+        Some(status) => {
+            eprintln!("[http] GET /status -> OK");
+            Json(status).into_response()
+        }
+        None => {
+            eprintln!("[http] GET /status -> SERVICE_UNAVAILABLE");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Oven state not yet received — WebSocket may still be connecting",
+            )
+                .into_response()
+        }
     }
 }
 
 async fn handle_recipes(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    eprintln!("[http] GET /recipes");
     let cache = state.recipes.lock().await;
+    eprintln!("[http] GET /recipes -> locked cache");
     match &*cache {
-        Some(recipes) => Json(recipes.clone()).into_response(),
-        None => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Recipe cache not yet populated — server may still be starting up",
-        )
-            .into_response(),
+        Some(recipes) => {
+            eprintln!("[http] GET /recipes -> OK ({} recipes)", recipes.len());
+            Json(recipes.clone()).into_response()
+        }
+        None => {
+            eprintln!("[http] GET /recipes -> SERVICE_UNAVAILABLE");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Recipe cache not yet populated — server may still be starting up",
+            )
+                .into_response()
+        }
     }
 }
 
 async fn handle_update_recipes(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    eprintln!("[http] POST /update-recipes");
     match refresh_recipes_cache(&state).await {
-        Ok(recipes) => Json(recipes).into_response(),
+        Ok(recipes) => {
+            eprintln!(
+                "[http] POST /update-recipes -> OK ({} recipes)",
+                recipes.len()
+            );
+            Json(recipes).into_response()
+        }
         Err(e) => {
-            eprintln!("[recipes] Forced refresh error: {e}");
+            eprintln!("[http] POST /update-recipes -> ERROR: {e}");
             (
                 StatusCode::BAD_GATEWAY,
                 format!("Failed to refresh recipes: {e}"),
@@ -715,7 +747,9 @@ async fn handle_update_recipes(State(state): State<Arc<AppState>>) -> impl IntoR
 }
 
 async fn handle_stop(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    eprintln!("[http] POST /stop");
     if state.cooker_id.lock().await.is_none() {
+        eprintln!("[http] POST /stop -> SERVICE_UNAVAILABLE (no cooker ID)");
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "Cooker ID not yet received — WebSocket may still be connecting",
@@ -723,12 +757,18 @@ async fn handle_stop(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             .into_response();
     }
     match state.cmd_tx.send(WsCommand::Stop).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "WebSocket task not running",
-        )
-            .into_response(),
+        Ok(()) => {
+            eprintln!("[http] POST /stop -> NO_CONTENT");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(_) => {
+            eprintln!("[http] POST /stop -> INTERNAL_SERVER_ERROR");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "WebSocket task not running",
+            )
+                .into_response()
+        }
     }
 }
 
@@ -741,7 +781,9 @@ async fn handle_start(
     State(state): State<Arc<AppState>>,
     Json(req): Json<StartRequest>,
 ) -> impl IntoResponse {
+    eprintln!("[http] POST /start recipe_id={}", req.recipe_id);
     if state.cooker_id.lock().await.is_none() {
+        eprintln!("[http] POST /start -> SERVICE_UNAVAILABLE (no cooker ID)");
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "Cooker ID not yet received — WebSocket may still be connecting",
@@ -751,24 +793,37 @@ async fn handle_start(
 
     // Try cache first. After a server restart, this cache may be empty.
     let cached_recipe = {
+        eprintln!("[http] POST /start -> checking recipes cache");
         let recipes = state.recipes.lock().await;
+        eprintln!("[http] POST /start -> recipes cache locked");
         recipes
             .as_ref()
             .and_then(|recipes| recipes.iter().find(|r| r.id == req.recipe_id).cloned())
     };
+    eprintln!(
+        "[http] POST /start -> cache check complete, found: {}",
+        cached_recipe.is_some()
+    );
 
     let recipe = if let Some(recipe) = cached_recipe {
+        eprintln!("[http] POST /start -> using cached recipe");
         Some(recipe)
     } else {
         // Cache miss: hydrate recipes from Firestore so /start works even when
         // the server has just restarted and /recipes has not been called yet.
+        eprintln!("[http] POST /start -> cache miss, refreshing from Firestore");
         match refresh_recipes_cache(&state).await {
             Ok(recipes) => {
+                eprintln!(
+                    "[http] POST /start -> refresh complete, got {} recipes",
+                    recipes.len()
+                );
                 let recipe = recipes.iter().find(|r| r.id == req.recipe_id).cloned();
                 recipe
             }
             Err(e) => {
                 eprintln!("[start] Failed to refresh recipes after cache miss: {e}");
+                eprintln!("[http] POST /start -> BAD_GATEWAY");
                 return (
                     StatusCode::BAD_GATEWAY,
                     format!("Failed to fetch recipes for start request: {e}"),
@@ -781,6 +836,7 @@ async fn handle_start(
     let recipe = match recipe {
         Some(r) => r,
         None => {
+            eprintln!("[http] POST /start -> NOT_FOUND");
             return (
                 StatusCode::NOT_FOUND,
                 format!("Recipe with ID '{}' not found", req.recipe_id),
@@ -790,24 +846,38 @@ async fn handle_start(
     };
 
     match state.cmd_tx.send(WsCommand::Start(recipe.stages)).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "WebSocket task not running",
-        )
-            .into_response(),
+        Ok(()) => {
+            eprintln!("[http] POST /start -> NO_CONTENT");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(_) => {
+            eprintln!("[http] POST /start -> INTERNAL_SERVER_ERROR");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "WebSocket task not running",
+            )
+                .into_response()
+        }
     }
 }
 
 async fn handle_history(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    eprintln!("[http] GET /history");
     let cache = state.history.lock().await;
+    eprintln!("[http] GET /history -> locked cache");
     match &*cache {
-        Some(history) => Json(history.clone()).into_response(),
-        None => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "History cache not yet populated — server may still be starting up",
-        )
-            .into_response(),
+        Some(history) => {
+            eprintln!("[http] GET /history -> OK ({} entries)", history.len());
+            Json(history.clone()).into_response()
+        }
+        None => {
+            eprintln!("[http] GET /history -> SERVICE_UNAVAILABLE");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "History cache not yet populated — server may still be starting up",
+            )
+                .into_response()
+        }
     }
 }
 
@@ -901,9 +971,16 @@ async fn recipes_for_resolution(state: &AppState) -> Result<Vec<anova_oven_api::
 }
 
 async fn handle_current_cook(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    eprintln!("[http] GET /current-cook");
     match state.current_cook_rx.borrow().clone() {
-        Some(cook) => Json(cook).into_response(),
-        None => StatusCode::NO_CONTENT.into_response(),
+        Some(cook) => {
+            eprintln!("[http] GET /current-cook -> OK");
+            Json(cook).into_response()
+        }
+        None => {
+            eprintln!("[http] GET /current-cook -> NO_CONTENT");
+            StatusCode::NO_CONTENT.into_response()
+        }
     }
 }
 
