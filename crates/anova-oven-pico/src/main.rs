@@ -52,8 +52,6 @@ static NVRAM: &cyw43::Aligned<cyw43::A4, [u8]> =
     &cyw43::Aligned(*include_bytes!("../nvram_rp2040.bin"));
 static CLM: &[u8] = include_bytes!("../firmware/43439A0_clm.bin");
 
-pub(crate) static mut HTTP_RX_BUF: [u8; 16384] = [0u8; 16384];
-
 #[embassy_executor::task]
 async fn cyw43_task(
     runner: cyw43::Runner<'static, cyw43::SpiBus<Output<'static>, PioSpi<'static, PIO0, 0>>>,
@@ -198,17 +196,18 @@ async fn main(spawner: Spawner) {
 
     info!("Init complete, entering main loop");
 
-    let mut next_poll_at =
-        Instant::now() + Duration::from_secs(crate::app_state::NORMAL_POLL_INTERVAL_SECS);
+    let mut next_poll_at = Instant::now() + Duration::from_secs(app.next_poll_interval_secs());
 
     loop {
         debug!("--- Main loop tick {} ---", app.tick);
         app.update_inactivity_timeout();
 
-        let display_timer = Timer::after(Duration::from_millis(DISPLAY_REFRESH_MS));
-        let event_recv = EVENT_CHANNEL.receive();
-
-        match embassy_futures::select::select(display_timer, event_recv).await {
+        match embassy_futures::select::select(
+            Timer::after(Duration::from_millis(DISPLAY_REFRESH_MS)),
+            EVENT_CHANNEL.receive(),
+        )
+        .await
+        {
             embassy_futures::select::Either::First(()) => {
                 // This branch is a no-op; we just want to trigger a display refresh at a regular interval for smoother scrolling,
                 // independent of status polling or user input. The display task will run at the end of the loop unconditionally, so no action is needed here.
