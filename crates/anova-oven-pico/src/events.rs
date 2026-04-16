@@ -20,7 +20,7 @@ pub async fn rot_enc_button_task(mut button: Input<'static>) -> ! {
         info!("Rotary encoder button pressed");
         EVENT_CHANNEL.send(InputEvent::EncoderButton).await;
 
-        Timer::after(Duration::from_millis(500)).await;
+        Timer::after(Duration::from_millis(500)).await; // Debounce delay
     }
 }
 
@@ -35,7 +35,7 @@ pub async fn rotary_encoder_task(mut pin_a: Input<'static>, mut pin_b: Input<'st
 
     loop {
         embassy_futures::select::select(pin_a.wait_for_any_edge(), pin_b.wait_for_any_edge()).await;
-        Timer::after(Duration::from_micros(500)).await;
+        Timer::after(Duration::from_micros(500)).await; // Debounce delay
 
         let curr = ((pin_a.is_low() as u8) << 1) | (pin_b.is_low() as u8);
         let dir = QEM[((prev << 2) | curr) as usize];
