@@ -1,9 +1,7 @@
 use defmt::{debug, info, warn};
 use embassy_time::{with_timeout, Duration, Instant};
 
-use crate::api::{
-    fetch_and_log_recipes, fetch_and_log_status, fetch_current_cook, send_start, send_stop,
-};
+use crate::api::{fetch_current_cook, fetch_recipes, fetch_status, send_start, send_stop};
 use crate::backlight::BacklightController;
 use crate::events::InputEvent;
 use crate::lcd::LcdController;
@@ -18,17 +16,20 @@ pub enum UIState {
 const MENU_INACTIVITY_TIMEOUT_SECS: u64 = 15;
 const STOP_CONFIRM_TIMEOUT_SECS: u64 = 5;
 const LED_DIM_TIMER_SECS: u64 = 5;
-const COOK_POLL_INTERVAL: u64 = 10;
+
 const SERVER_RETRY_LOG_INTERVAL: u64 = 5;
 const API_CALL_TIMEOUT_SECS: u64 = 3;
 const POST_ACTION_COOK_REFRESH_DELAY_SECS: u64 = 1;
+
+const COOK_POLL_INTERVAL: u64 = 10;
+const RECIPE_POLL_INTERVAL: u64 = 3600;
 
 // Polling backoff. Without this, repeated failed connections pile up sockets
 // in smoltcp and packets in cyw43's tiny rx channel (4 buffers, hardcoded in
 // cyw43 0.7.0). Slowing the poll cadence as failures accumulate gives those
 // queues time to drain, which is what actually unsticks things — the cyw43
 // driver itself can't be safely re-initialized at runtime.
-pub(crate) const NORMAL_POLL_INTERVAL_SECS: u64 = 1;
+const NORMAL_POLL_INTERVAL_SECS: u64 = 1;
 const POLL_BACKOFF_TIER1_FAILS: u64 = 5;
 const POLL_BACKOFF_TIER2_FAILS: u64 = 10;
 const POLL_BACKOFF_TIER3_FAILS: u64 = 15;
@@ -53,7 +54,7 @@ pub(crate) struct AppState {
     pub(crate) current_cook: Option<anova_oven_api::CurrentCook>,
     pub(crate) latest_status: Option<anova_oven_api::OvenStatus>,
     pub(crate) recipes: alloc::vec::Vec<anova_oven_api::Recipe>,
-    pub(crate) server_online: bool,
+    pub(crate) server_offline: bool,
     pub(crate) server_fail_count: u64,
     pending_api_action: Option<PendingApiAction>,
     queued_refresh_at: Option<Instant>,
@@ -75,7 +76,7 @@ impl AppState {
             current_cook: None,
             latest_status: None,
             recipes: alloc::vec::Vec::new(),
-            server_online: true,
+            server_offline: false,
             server_fail_count: 0,
             pending_api_action: None,
             queued_refresh_at: None,
@@ -93,50 +94,9 @@ impl AppState {
     }
 
     pub(crate) async fn init_data(&mut self, stack: embassy_net::Stack<'static>) {
-        #[allow(static_mut_refs)]
-        let rx_buf = unsafe { &mut crate::HTTP_RX_BUF };
-        self.current_cook = match with_timeout(
-            Duration::from_secs(API_CALL_TIMEOUT_SECS),
-            fetch_current_cook(stack, rx_buf),
-        )
-        .await
-        {
-            Ok(cook) => cook,
-            Err(_) => {
-                warn!("GET /current-cook: timed out during init");
-                None
-            }
-        };
-        self.latest_status = match with_timeout(
-            Duration::from_secs(API_CALL_TIMEOUT_SECS),
-            fetch_and_log_status(stack, rx_buf),
-        )
-        .await
-        {
-            Ok(status) => status,
-            Err(_) => {
-                warn!("GET /status: timed out during init");
-                None
-            }
-        };
-        self.recipes = match with_timeout(
-            Duration::from_secs(API_CALL_TIMEOUT_SECS),
-            fetch_and_log_recipes(stack, rx_buf),
-        )
-        .await
-        {
-            Ok(recipes) => recipes,
-            Err(_) => {
-                warn!("GET /recipes: timed out during init");
-                alloc::vec::Vec::new()
-            }
-        };
-
-        self.server_online = self.latest_status.is_some();
-        if !self.server_online {
-            self.server_fail_count = 1;
-            warn!("Server unavailable during init; LCD will show offline status");
-        }
+        self.update_status(stack).await;
+        self.update_current_cook(stack).await;
+        self.update_recipes(stack).await;
 
         self.reconcile_current_cook_recipe_title();
         self.sync_status_ui_state();
@@ -149,13 +109,6 @@ impl AppState {
             n if n >= POLL_BACKOFF_TIER1_FAILS => POLL_BACKOFF_TIER1_SECS,
             _ => NORMAL_POLL_INTERVAL_SECS,
         }
-    }
-
-    fn enter_baseline_state(&mut self) {
-        self.ui_state = UIState::ShowIdle;
-        self.sync_status_ui_state();
-        self.update_baseline_timer_for_current_view(Instant::now());
-        self.last_input_at = None;
     }
 
     pub(crate) fn update_inactivity_timeout(&mut self) {
@@ -266,77 +219,17 @@ impl AppState {
         }
 
         if self.tick % COOK_POLL_INTERVAL == 0 {
-            #[allow(static_mut_refs)]
-            let rx_buf = unsafe { &mut crate::HTTP_RX_BUF };
-            match with_timeout(
-                Duration::from_secs(API_CALL_TIMEOUT_SECS),
-                fetch_current_cook(stack, rx_buf),
-            )
-            .await
-            {
-                Ok(cook) => {
-                    self.current_cook = cook;
-                }
-                Err(_) => {
-                    warn!("GET /current-cook: timed out");
-                }
-            }
+            self.update_current_cook(stack).await;
             self.reconcile_current_cook_recipe_title();
             self.sync_status_ui_state();
         }
 
-        #[allow(static_mut_refs)]
-        let rx_buf = unsafe { &mut crate::HTTP_RX_BUF };
-        match with_timeout(
-            Duration::from_secs(API_CALL_TIMEOUT_SECS),
-            fetch_and_log_status(stack, rx_buf),
-        )
-        .await
-        {
-            Ok(Some(status)) => {
-                if !self.server_online {
-                    info!("Server communication restored");
-                }
-                self.server_online = true;
-                self.server_fail_count = 0;
-                self.latest_status = Some(status);
-                self.sync_status_ui_state();
-            }
-            Ok(None) => {
-                self.server_fail_count = self.server_fail_count.saturating_add(1);
-                if self.server_online {
-                    warn!("Lost communication with server");
-                } else if self.server_fail_count % SERVER_RETRY_LOG_INTERVAL == 0 {
-                    warn!(
-                        "Still offline: {} consecutive status poll failures",
-                        self.server_fail_count
-                    );
-                }
-
-                self.server_online = false;
-                // Clear stale data so the UI reflects that data is unavailable.
-                self.latest_status = None;
-                self.current_cook = None;
-                self.sync_status_ui_state();
-            }
-            Err(_) => {
-                warn!("GET /status: timed out");
-                self.server_fail_count = self.server_fail_count.saturating_add(1);
-                if self.server_online {
-                    warn!("Lost communication with server");
-                } else if self.server_fail_count % SERVER_RETRY_LOG_INTERVAL == 0 {
-                    warn!(
-                        "Still offline: {} consecutive status poll failures",
-                        self.server_fail_count
-                    );
-                }
-
-                self.server_online = false;
-                self.latest_status = None;
-                self.current_cook = None;
-                self.sync_status_ui_state();
-            }
+        if self.tick % RECIPE_POLL_INTERVAL == 0 {
+            self.update_recipes(stack).await;
+            self.reconcile_current_cook_recipe_title();
         }
+
+        self.update_status(stack).await;
 
         self.tick += 1;
     }
@@ -344,7 +237,7 @@ impl AppState {
     pub(crate) async fn render_current_view(&mut self) {
         self.apply_backlight_policy();
 
-        if !self.server_online {
+        if self.server_offline {
             self.lcd_controller.render_server_offline(self.tick).await;
             return;
         }
@@ -381,17 +274,11 @@ impl AppState {
             return;
         };
 
-        #[allow(static_mut_refs)]
-        let rx_buf = unsafe { &mut crate::HTTP_RX_BUF };
-
         match action {
             PendingApiAction::Stop => {
-                if with_timeout(
-                    Duration::from_secs(API_CALL_TIMEOUT_SECS),
-                    send_stop(stack, rx_buf),
-                )
-                .await
-                .is_err()
+                if with_timeout(Duration::from_secs(API_CALL_TIMEOUT_SECS), send_stop(stack))
+                    .await
+                    .is_err()
                 {
                     warn!("POST /stop: timed out");
                 }
@@ -400,7 +287,7 @@ impl AppState {
                 info!("Sending POST /start with recipe id: {}", recipe_id.as_str());
                 if with_timeout(
                     Duration::from_secs(API_CALL_TIMEOUT_SECS),
-                    send_start(stack, rx_buf, recipe_id.as_str()),
+                    send_start(stack, recipe_id.as_str()),
                 )
                 .await
                 .is_err()
@@ -424,12 +311,110 @@ impl AppState {
             .is_some_and(|due_at| Instant::now() >= due_at)
         {
             self.queued_refresh_at = None;
-            self.refresh_current_cook_and_status_now(stack).await;
+
+            self.update_status(stack).await;
+            self.update_current_cook(stack).await;
         }
     }
 
+    async fn update_status(&mut self, stack: embassy_net::Stack<'static>) {
+        self.latest_status = match with_timeout(
+            Duration::from_secs(API_CALL_TIMEOUT_SECS),
+            fetch_status(stack),
+        )
+        .await
+        {
+            Ok(Some(status)) => {
+                self.set_server_offline(false);
+                Some(status)
+            }
+            Ok(None) => {
+                warn!("GET /status: failed");
+                self.set_server_offline(true);
+                None
+            }
+            Err(_) => {
+                warn!("GET /status: timed out");
+                self.set_server_offline(true);
+                None
+            }
+        };
+    }
+
+    async fn update_current_cook(&mut self, stack: embassy_net::Stack<'static>) {
+        self.current_cook = match with_timeout(
+            Duration::from_secs(API_CALL_TIMEOUT_SECS),
+            fetch_current_cook(stack),
+        )
+        .await
+        {
+            Ok(maybe_cook) => {
+                self.set_server_offline(false);
+                maybe_cook
+            }
+            Err(_) => {
+                warn!("GET /current-cook: timed out");
+                self.set_server_offline(true);
+                None
+            }
+        }
+    }
+
+    async fn update_recipes(&mut self, stack: embassy_net::Stack<'static>) {
+        self.recipes = match with_timeout(
+            Duration::from_secs(API_CALL_TIMEOUT_SECS),
+            fetch_recipes(stack),
+        )
+        .await
+        {
+            Ok(recipes) => {
+                self.set_server_offline(false);
+                recipes
+            }
+            Err(_) => {
+                warn!("GET /recipes: timed out");
+                self.set_server_offline(true);
+                alloc::vec::Vec::new()
+            }
+        };
+    }
+
+    fn enter_baseline_state(&mut self) {
+        self.ui_state = UIState::ShowIdle;
+        self.sync_status_ui_state();
+        self.update_baseline_timer_for_current_view(Instant::now());
+        self.last_input_at = None;
+    }
+
+    fn set_server_offline(&mut self, offline: bool) {
+        if offline {
+            if !self.server_offline {
+                warn!("Lost communication with server");
+            } else {
+                if self.server_fail_count % SERVER_RETRY_LOG_INTERVAL == 0 {
+                    warn!(
+                        "Still offline: {} consecutive server failures",
+                        self.server_fail_count
+                    );
+                }
+            }
+            self.server_offline = true;
+            self.latest_status = None;
+            self.current_cook = None;
+            self.server_fail_count = self.server_fail_count.saturating_add(1);
+        } else {
+            if self.server_offline {
+                info!("Server communication restored");
+            }
+            self.server_offline = false;
+            self.server_fail_count = 0;
+        }
+
+        self.sync_status_ui_state();
+    }
+
     fn apply_backlight_policy(&mut self) {
-        if !self.server_online {
+        if self.server_offline {
             debug!("Setting backlight to full: (server offline)");
             self.backlight_controller.set_full();
             return;
@@ -453,7 +438,7 @@ impl AppState {
         }
     }
 
-    pub fn is_active_cook(&self) -> bool {
+    fn is_active_cook(&self) -> bool {
         self.current_cook.is_some()
             || self
                 .latest_status
@@ -531,50 +516,6 @@ impl AppState {
         self.pending_api_action = Some(PendingApiAction::Start { recipe_id });
         self.queued_refresh_at =
             Some(now + Duration::from_secs(POST_ACTION_COOK_REFRESH_DELAY_SECS));
-    }
-
-    async fn refresh_current_cook_and_status_now(&mut self, stack: embassy_net::Stack<'static>) {
-        #[allow(static_mut_refs)]
-        let rx_buf = unsafe { &mut crate::HTTP_RX_BUF };
-
-        match with_timeout(
-            Duration::from_secs(API_CALL_TIMEOUT_SECS),
-            fetch_current_cook(stack, rx_buf),
-        )
-        .await
-        {
-            Ok(cook) => {
-                self.current_cook = cook;
-                self.reconcile_current_cook_recipe_title();
-                self.sync_status_ui_state();
-            }
-            Err(_) => {
-                warn!("GET /current-cook: timed out after action");
-            }
-        }
-
-        match with_timeout(
-            Duration::from_secs(API_CALL_TIMEOUT_SECS),
-            fetch_and_log_status(stack, rx_buf),
-        )
-        .await
-        {
-            Ok(Some(status)) => {
-                if !self.server_online {
-                    info!("Server communication restored");
-                }
-                self.server_online = true;
-                self.server_fail_count = 0;
-                self.latest_status = Some(status);
-                self.sync_status_ui_state();
-            }
-            Ok(None) => {
-                warn!("GET /status: failed after action");
-            }
-            Err(_) => {
-                warn!("GET /status: timed out after action");
-            }
-        }
     }
 
     fn sync_status_ui_state(&mut self) {
