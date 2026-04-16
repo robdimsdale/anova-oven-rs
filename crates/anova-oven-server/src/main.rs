@@ -14,6 +14,7 @@
 //! - `GET /recipes`      — user's saved recipes
 //! - `GET /history`      — cook history (last 50 cooks)
 //! - `GET /current-cook` — in-progress cook (diagnostic)
+//! - `POST /update-recipes` — refresh recipe cache from Firestore
 //! - `POST /stop`        — stop the current cook
 //! - `POST /start`       — start a cook with a recipe (recipe ID in JSON body)
 
@@ -38,6 +39,9 @@ const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_HTTP_CONNECT_TIMEOUT_SECS: u64 = 5;
 const DEFAULT_CURRENT_COOK_TIMEOUT_SECS: u64 = 4;
 const DEFAULT_CURRENT_COOK_RESOLUTION_TIMEOUT_SECS: u64 = 1;
+const DEFAULT_CURRENT_COOK_REFRESH_INTERVAL_SECS: u64 = 60;
+const DEFAULT_RECIPES_REFRESH_INTERVAL_SECS: u64 = 3600;
+const DEFAULT_HISTORY_REFRESH_INTERVAL_SECS: u64 = 3600;
 
 // ─── Shared application state ─────────────────────────────────────────────────
 
@@ -46,22 +50,69 @@ enum WsCommand {
     Start(Vec<anova_oven_api::Stage>),
 }
 
+#[derive(Clone, Copy, Debug)]
+enum CurrentCookRefreshReason {
+    Periodic,
+    Startup,
+    WsIdleToCooking,
+    WsConnectedCookingState,
+    WsStageTransition,
+    StartCommandAccepted,
+}
+
+impl CurrentCookRefreshReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            CurrentCookRefreshReason::Periodic => "periodic",
+            CurrentCookRefreshReason::Startup => "startup",
+            CurrentCookRefreshReason::WsIdleToCooking => "ws-idle-to-cooking",
+            CurrentCookRefreshReason::WsConnectedCookingState => "ws-connected-cooking-state",
+            CurrentCookRefreshReason::WsStageTransition => "ws-stage-transition",
+            CurrentCookRefreshReason::StartCommandAccepted => "start-command-accepted",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum HistoryRefreshReason {
+    WsIdleToCooking,
+    WsCookToIdle,
+}
+
+impl HistoryRefreshReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            HistoryRefreshReason::WsIdleToCooking => "ws-idle-to-cooking",
+            HistoryRefreshReason::WsCookToIdle => "ws-cook-to-idle",
+        }
+    }
+}
+
 struct AppState {
     /// Latest oven status from the WebSocket stream.
     status_rx: watch::Receiver<Option<anova_oven_api::OvenStatus>>,
     /// Cooker ID received from EVENT_APO_WIFI_LIST, needed to address commands.
-    cooker_id_rx: watch::Receiver<Option<String>>,
+    cooker_id: Mutex<Option<String>>,
     /// Send commands to the WebSocket background task.
     cmd_tx: mpsc::Sender<WsCommand>,
-    /// Cached recipe list, fetched from Firestore on first request.
+    /// Cached current cook; refreshed in the background to avoid request-time Firestore reads.
+    current_cook_rx: watch::Receiver<Option<anova_oven_api::CurrentCook>>,
+    /// Trigger immediate current-cook refreshes (best effort).
+    current_cook_refresh_tx: mpsc::Sender<CurrentCookRefreshReason>,
+    /// Cached recipe list, refreshed in the background periodically.
     recipes: Mutex<Option<Vec<anova_oven_api::Recipe>>>,
-    /// Cached history list, fetched from Firestore on first request.
+    /// Cached history list, refreshed in the background periodically.
     history: Mutex<Option<Vec<anova_oven_api::HistoryEntry>>>,
+    /// Trigger immediate history refreshes (best effort).
+    history_refresh_tx: mpsc::Sender<HistoryRefreshReason>,
     /// Firebase session (ID token + UID), refreshed as needed.
     session: Mutex<firestore::FirebaseSession>,
     http: reqwest::Client,
     current_cook_timeout: Duration,
     current_cook_resolution_timeout: Duration,
+    current_cook_refresh_interval: Duration,
+    recipes_refresh_interval: Duration,
+    history_refresh_interval: Duration,
 }
 
 // ─── Entry point ──────────────────────────────────────────────────────────────
@@ -105,15 +156,21 @@ async fn main() {
     eprintln!("Signed in as UID {}", session.uid);
 
     let (status_tx, status_rx) = watch::channel(None::<anova_oven_api::OvenStatus>);
-    let (cooker_id_tx, cooker_id_rx) = watch::channel(None::<String>);
     let (cmd_tx, cmd_rx) = mpsc::channel::<WsCommand>(8);
+    let (current_cook_tx, current_cook_rx) = watch::channel(None::<anova_oven_api::CurrentCook>);
+    let (current_cook_refresh_tx, current_cook_refresh_rx) =
+        mpsc::channel::<CurrentCookRefreshReason>(16);
+    let (history_refresh_tx, history_refresh_rx) = mpsc::channel::<HistoryRefreshReason>(16);
 
     let state = Arc::new(AppState {
         status_rx,
-        cooker_id_rx,
+        cooker_id: Mutex::new(None),
         cmd_tx,
+        current_cook_rx,
+        current_cook_refresh_tx,
         recipes: Mutex::new(None),
         history: Mutex::new(None),
+        history_refresh_tx,
         session: Mutex::new(session),
         http,
         current_cook_timeout: env_duration_secs(
@@ -124,15 +181,57 @@ async fn main() {
             "ANOVA_CURRENT_COOK_RESOLUTION_TIMEOUT_SECS",
             DEFAULT_CURRENT_COOK_RESOLUTION_TIMEOUT_SECS,
         ),
+        current_cook_refresh_interval: env_duration_secs(
+            "ANOVA_CURRENT_COOK_REFRESH_INTERVAL_SECS",
+            DEFAULT_CURRENT_COOK_REFRESH_INTERVAL_SECS,
+        ),
+        recipes_refresh_interval: env_duration_secs(
+            "ANOVA_RECIPES_REFRESH_INTERVAL_SECS",
+            DEFAULT_RECIPES_REFRESH_INTERVAL_SECS,
+        ),
+        history_refresh_interval: env_duration_secs(
+            "ANOVA_HISTORY_REFRESH_INTERVAL_SECS",
+            DEFAULT_HISTORY_REFRESH_INTERVAL_SECS,
+        ),
     });
+
+    match refresh_recipes_cache(&state).await {
+        Ok(recipes) => eprintln!("[recipes] Preloaded {} recipe(s)", recipes.len()),
+        Err(e) => eprintln!("[recipes] Startup preload failed: {e}"),
+    }
+    match refresh_history_cache(&state).await {
+        Ok(entries) => eprintln!("[history] Preloaded {} entr(y/ies)", entries.len()),
+        Err(e) => eprintln!("[history] Startup preload failed: {e}"),
+    }
 
     // Spawn WebSocket background task.
     let ws_token = anova_token.clone();
-    tokio::spawn(ws_task(ws_token, status_tx, cooker_id_tx, cmd_rx));
+    tokio::spawn(ws_task(
+        ws_token,
+        status_tx,
+        state.clone(),
+        current_cook_tx.clone(),
+        cmd_rx,
+    ));
+
+    // Spawn periodic + event-driven current-cook cache refresher.
+    tokio::spawn(current_cook_refresh_task(
+        state.clone(),
+        current_cook_tx,
+        current_cook_refresh_rx,
+    ));
+
+    // Spawn periodic history and recipes cache refreshers.
+    tokio::spawn(history_refresh_task(state.clone(), history_refresh_rx));
+    tokio::spawn(recipes_refresh_task(state.clone()));
 
     let app = Router::new()
         .route("/status", axum::routing::get(handle_status))
         .route("/recipes", axum::routing::get(handle_recipes))
+        .route(
+            "/update-recipes",
+            axum::routing::post(handle_update_recipes),
+        )
         .route("/history", axum::routing::get(handle_history))
         .route("/stop", axum::routing::post(handle_stop))
         .route("/start", axum::routing::post(handle_start))
@@ -260,12 +359,13 @@ fn start_command_json(cooker_id: &str, stages: &[anova_oven_api::Stage]) -> Stri
 async fn ws_task(
     token: String,
     status_tx: watch::Sender<Option<anova_oven_api::OvenStatus>>,
-    cooker_id_tx: watch::Sender<Option<String>>,
+    state: Arc<AppState>,
+    current_cook_tx: watch::Sender<Option<anova_oven_api::CurrentCook>>,
     mut cmd_rx: mpsc::Receiver<WsCommand>,
 ) {
     loop {
         eprintln!("[ws] Connecting to Anova WebSocket...");
-        match ws_connect_and_run(&token, &status_tx, &cooker_id_tx, &mut cmd_rx).await {
+        match ws_connect_and_run(&token, &status_tx, &state, &current_cook_tx, &mut cmd_rx).await {
             Ok(()) => eprintln!("[ws] Connection closed cleanly."),
             Err(e) => eprintln!("[ws] Connection error: {e}"),
         }
@@ -277,7 +377,8 @@ async fn ws_task(
 async fn ws_connect_and_run(
     token: &str,
     status_tx: &watch::Sender<Option<anova_oven_api::OvenStatus>>,
-    cooker_id_tx: &watch::Sender<Option<String>>,
+    state: &Arc<AppState>,
+    current_cook_tx: &watch::Sender<Option<anova_oven_api::CurrentCook>>,
     cmd_rx: &mut mpsc::Receiver<WsCommand>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let uri = Uri::builder()
@@ -298,7 +399,9 @@ async fn ws_connect_and_run(
 
     eprintln!("[ws] Connected.");
 
-    let mut cooker_id: Option<String> = None;
+    let mut was_cooking = false;
+    let mut seen_state = false;
+    let mut prev_timer_initial: Option<u64> = None;
     let (mut sink, mut stream) = ws.split();
 
     loop {
@@ -308,17 +411,63 @@ async fn ws_connect_and_run(
                     Some(Ok(msg)) => {
                         let payload = msg.as_payload();
                         match protocol::parse_message(payload) {
-                            Ok(protocol::Event::ApoState(state)) => {
-                                let status = protocol::to_oven_status(&state);
+                            Ok(protocol::Event::ApoState(payload)) => {
+                                let status = protocol::to_oven_status(&payload);
+                                let is_cooking = status.mode != "idle";
+                                let timer_initial = status.timer_total_secs;
+
+                                if is_cooking && !was_cooking {
+                                    let reason = if seen_state {
+                                        CurrentCookRefreshReason::WsIdleToCooking
+                                    } else {
+                                        CurrentCookRefreshReason::WsConnectedCookingState
+                                    };
+                                    request_current_cook_refresh(&state.current_cook_refresh_tx, reason);
+                                    request_history_refresh(
+                                        &state.history_refresh_tx,
+                                        HistoryRefreshReason::WsIdleToCooking,
+                                    );
+                                }
+
+                                if !is_cooking && was_cooking {
+                                    request_history_refresh(
+                                        &state.history_refresh_tx,
+                                        HistoryRefreshReason::WsCookToIdle,
+                                    );
+                                }
+
+                                // Detect stage transitions: timer_initial changes while
+                                // continuously cooking indicates the oven moved to a new stage.
+                                if is_cooking && was_cooking {
+                                    if let Some(prev) = prev_timer_initial {
+                                        if prev != timer_initial {
+                                            request_current_cook_refresh(
+                                                &state.current_cook_refresh_tx,
+                                                CurrentCookRefreshReason::WsStageTransition,
+                                            );
+                                        }
+                                    }
+                                }
+
+                                if !is_cooking {
+                                    // Clear stale cache immediately when oven returns to idle.
+                                    let _ = current_cook_tx.send(None);
+                                    prev_timer_initial = None;
+                                } else {
+                                    prev_timer_initial = Some(timer_initial);
+                                }
+
                                 eprintln!("[ws] State: mode={} temp={:.1}°F steam={:.0}%/{:.0}% probe={:.1}°F",
                                 status.mode, celcius_to_fahrenheit(status.temperature_c), status.steam_pct, status.steam_target_pct.unwrap_or(0.0), celcius_to_fahrenheit(status.probe_temperature_c.unwrap_or(0.0)) );
                                 let _ = status_tx.send(Some(status));
+                                was_cooking = is_cooking;
+                                seen_state = true;
                             }
                             Ok(protocol::Event::ApoWifiList { cooker_id: id }) => {
                                 if let Some(id) = id {
                                     eprintln!("[ws] Cooker ID: {id}");
-                                    let _ = cooker_id_tx.send(Some(id.clone()));
-                                    cooker_id = Some(id);
+                                    let mut cooker_id = state.cooker_id.lock().await;
+                                    *cooker_id = Some(id);
                                 }
                             }
                             Ok(protocol::Event::Response { request_id, status }) => {
@@ -339,21 +488,27 @@ async fn ws_connect_and_run(
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(WsCommand::Stop) => {
-                        match &cooker_id {
+                        let cooker_id = state.cooker_id.lock().await.clone();
+                        match cooker_id {
                             Some(id) => {
                                 eprintln!("[ws] Sending CMD_APO_STOP for cooker {id}");
-                                sink.send(Message::text(stop_command_json(id))).await?;
+                                sink.send(Message::text(stop_command_json(&id))).await?;
                             }
                             None => eprintln!("[ws] Stop requested but cooker ID not yet known"),
                         }
                     }
                     Some(WsCommand::Start(stages)) => {
-                        match &cooker_id {
+                        let cooker_id = state.cooker_id.lock().await.clone();
+                        match cooker_id {
                             Some(id) => {
-                                let cmd_json = start_command_json(id, &stages);
+                                let cmd_json = start_command_json(&id, &stages);
                                 eprintln!("[ws] Sending CMD_APO_START for cooker {id}");
                                 eprintln!("[ws] Command JSON: {}", cmd_json);
                                 sink.send(Message::text(cmd_json)).await?;
+                                request_current_cook_refresh(
+                                    &state.current_cook_refresh_tx,
+                                    CurrentCookRefreshReason::StartCommandAccepted,
+                                );
                             }
                             None => eprintln!("[ws] Start requested but cooker ID not yet known"),
                         }
@@ -361,6 +516,161 @@ async fn ws_connect_and_run(
                     None => {} // cmd_tx dropped — server shutting down
                 }
             }
+        }
+    }
+}
+
+fn request_current_cook_refresh(
+    tx: &mpsc::Sender<CurrentCookRefreshReason>,
+    reason: CurrentCookRefreshReason,
+) {
+    match tx.try_send(reason) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            eprintln!(
+                "[current-cook] refresh trigger dropped (queue full): {}",
+                reason.as_str()
+            );
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            eprintln!(
+                "[current-cook] refresh trigger dropped (task not running): {}",
+                reason.as_str()
+            );
+        }
+    }
+}
+
+fn request_history_refresh(tx: &mpsc::Sender<HistoryRefreshReason>, reason: HistoryRefreshReason) {
+    match tx.try_send(reason) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            eprintln!(
+                "[history] refresh trigger dropped (queue full): {}",
+                reason.as_str()
+            );
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            eprintln!(
+                "[history] refresh trigger dropped (task not running): {}",
+                reason.as_str()
+            );
+        }
+    }
+}
+
+async fn current_cook_refresh_task(
+    state: Arc<AppState>,
+    current_cook_tx: watch::Sender<Option<anova_oven_api::CurrentCook>>,
+    mut refresh_rx: mpsc::Receiver<CurrentCookRefreshReason>,
+) {
+    let mut interval = tokio::time::interval(state.current_cook_refresh_interval);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    refresh_current_cook_cache(&state, &current_cook_tx, CurrentCookRefreshReason::Startup).await;
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let is_cooking = state.status_rx.borrow().as_ref().map(|s| s.is_cooking()).unwrap_or(false);
+                if is_cooking {
+                    refresh_current_cook_cache(&state, &current_cook_tx, CurrentCookRefreshReason::Periodic).await;
+                }
+            }
+            reason = refresh_rx.recv() => {
+                match reason {
+                    Some(reason) => {
+                        refresh_current_cook_cache(&state, &current_cook_tx, reason).await;
+                    }
+                    None => {
+                        eprintln!("[current-cook] refresh trigger channel closed");
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn refresh_current_cook_cache(
+    state: &AppState,
+    current_cook_tx: &watch::Sender<Option<anova_oven_api::CurrentCook>>,
+    reason: CurrentCookRefreshReason,
+) {
+    let result = match tokio::time::timeout(state.current_cook_timeout, async {
+        fetch_current_cook_from_firebase(state).await
+    })
+    .await
+    {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!(
+                "[current-cook] refresh timed out after {}s (reason={})",
+                state.current_cook_timeout.as_secs(),
+                reason.as_str()
+            );
+            return;
+        }
+    };
+
+    match result {
+        Ok(cook) => {
+            let _ = current_cook_tx.send(cook);
+        }
+        Err(e) => {
+            eprintln!(
+                "[current-cook] refresh failed (reason={}): {}",
+                reason.as_str(),
+                e
+            );
+        }
+    }
+}
+
+async fn history_refresh_task(
+    state: Arc<AppState>,
+    mut refresh_rx: mpsc::Receiver<HistoryRefreshReason>,
+) {
+    let mut interval = tokio::time::interval(state.history_refresh_interval);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval.tick().await; // startup preload already done in main
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                match refresh_history_cache(&state).await {
+                    Ok(entries) => eprintln!("[history] Periodic refresh: {} entr(y/ies)", entries.len()),
+                    Err(e) => eprintln!("[history] Periodic refresh failed: {e}"),
+                }
+            }
+            reason = refresh_rx.recv() => {
+                match reason {
+                    Some(reason) => {
+                        match refresh_history_cache(&state).await {
+                            Ok(entries) => eprintln!("[history] Refreshed (reason={}): {} entr(y/ies)", reason.as_str(), entries.len()),
+                            Err(e) => eprintln!("[history] Refresh failed (reason={}): {e}", reason.as_str()),
+                        }
+                    }
+                    None => {
+                        eprintln!("[history] Refresh trigger channel closed");
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn recipes_refresh_task(state: Arc<AppState>) {
+    let mut interval = tokio::time::interval(state.recipes_refresh_interval);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval.tick().await; // startup preload already done in main
+
+    loop {
+        interval.tick().await;
+        match refresh_recipes_cache(&state).await {
+            Ok(recipes) => eprintln!("[recipes] Periodic refresh: {} recipe(s)", recipes.len()),
+            Err(e) => eprintln!("[recipes] Periodic refresh failed: {e}"),
         }
     }
 }
@@ -379,35 +689,25 @@ async fn handle_status(State(state): State<Arc<AppState>>) -> impl IntoResponse 
 }
 
 async fn handle_recipes(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    {
-        let cache = state.recipes.lock().await;
-        if let Some(ref recipes) = *cache {
-            return Json(recipes.clone()).into_response();
-        }
+    let cache = state.recipes.lock().await;
+    match &*cache {
+        Some(recipes) => Json(recipes.clone()).into_response(),
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Recipe cache not yet populated — server may still be starting up",
+        )
+            .into_response(),
     }
+}
 
-    let session = state.session.lock().await.clone();
-    let result = match firestore::fetch_recipes(&state.http, &session).await {
-        Ok(v) => Ok(v),
-        Err(err) => match maybe_refresh_session(&state, err).await {
-            Ok(fresh) => firestore::fetch_recipes(&state.http, &fresh)
-                .await
-                .map_err(|e| e.to_string()),
-            Err(e) => Err(e),
-        },
-    };
-
-    match result {
-        Ok(recipes) => {
-            let mut cache = state.recipes.lock().await;
-            *cache = Some(recipes.clone());
-            Json(recipes).into_response()
-        }
+async fn handle_update_recipes(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match refresh_recipes_cache(&state).await {
+        Ok(recipes) => Json(recipes).into_response(),
         Err(e) => {
-            eprintln!("[recipes] Fetch error: {e}");
+            eprintln!("[recipes] Forced refresh error: {e}");
             (
                 StatusCode::BAD_GATEWAY,
-                format!("Failed to fetch recipes: {e}"),
+                format!("Failed to refresh recipes: {e}"),
             )
                 .into_response()
         }
@@ -415,7 +715,7 @@ async fn handle_recipes(State(state): State<Arc<AppState>>) -> impl IntoResponse
 }
 
 async fn handle_stop(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    if state.cooker_id_rx.borrow().is_none() {
+    if state.cooker_id.lock().await.is_none() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "Cooker ID not yet received — WebSocket may still be connecting",
@@ -441,7 +741,7 @@ async fn handle_start(
     State(state): State<Arc<AppState>>,
     Json(req): Json<StartRequest>,
 ) -> impl IntoResponse {
-    if state.cooker_id_rx.borrow().is_none() {
+    if state.cooker_id.lock().await.is_none() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "Cooker ID not yet received — WebSocket may still be connecting",
@@ -462,22 +762,9 @@ async fn handle_start(
     } else {
         // Cache miss: hydrate recipes from Firestore so /start works even when
         // the server has just restarted and /recipes has not been called yet.
-        let session = state.session.lock().await.clone();
-        let fetched = match firestore::fetch_recipes(&state.http, &session).await {
-            Ok(v) => Ok(v),
-            Err(err) => match maybe_refresh_session(&state, err).await {
-                Ok(fresh) => firestore::fetch_recipes(&state.http, &fresh)
-                    .await
-                    .map_err(|e| e.to_string()),
-                Err(e) => Err(e),
-            },
-        };
-
-        match fetched {
+        match refresh_recipes_cache(&state).await {
             Ok(recipes) => {
                 let recipe = recipes.iter().find(|r| r.id == req.recipe_id).cloned();
-                let mut cache = state.recipes.lock().await;
-                *cache = Some(recipes);
                 recipe
             }
             Err(e) => {
@@ -513,38 +800,14 @@ async fn handle_start(
 }
 
 async fn handle_history(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    {
-        let cache = state.history.lock().await;
-        if let Some(ref history) = *cache {
-            return Json(history.clone()).into_response();
-        }
-    }
-
-    let session = state.session.lock().await.clone();
-    let result = match firestore::fetch_history(&state.http, &session, 50).await {
-        Ok(v) => Ok(v),
-        Err(err) => match maybe_refresh_session(&state, err).await {
-            Ok(fresh) => firestore::fetch_history(&state.http, &fresh, 50)
-                .await
-                .map_err(|e| e.to_string()),
-            Err(e) => Err(e),
-        },
-    };
-
-    match result {
-        Ok(history) => {
-            let mut cache = state.history.lock().await;
-            *cache = Some(history.clone());
-            Json(history).into_response()
-        }
-        Err(e) => {
-            eprintln!("[history] Fetch error: {e}");
-            (
-                StatusCode::BAD_GATEWAY,
-                format!("Failed to fetch history: {e}"),
-            )
-                .into_response()
-        }
+    let cache = state.history.lock().await;
+    match &*cache {
+        Some(history) => Json(history.clone()).into_response(),
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "History cache not yet populated — server may still be starting up",
+        )
+            .into_response(),
     }
 }
 
@@ -634,8 +897,19 @@ async fn recipes_for_resolution(state: &AppState) -> Result<Vec<anova_oven_api::
         }
     }
 
+    refresh_recipes_cache(state).await
+}
+
+async fn handle_current_cook(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match state.current_cook_rx.borrow().clone() {
+        Some(cook) => Json(cook).into_response(),
+        None => StatusCode::NO_CONTENT.into_response(),
+    }
+}
+
+async fn fetch_recipes_with_retry(state: &AppState) -> Result<Vec<anova_oven_api::Recipe>, String> {
     let session = state.session.lock().await.clone();
-    let fetched = match firestore::fetch_recipes(&state.http, &session).await {
+    match firestore::fetch_recipes(&state.http, &session).await {
         Ok(v) => Ok(v),
         Err(err) => match maybe_refresh_session(state, err).await {
             Ok(fresh) => firestore::fetch_recipes(&state.http, &fresh)
@@ -643,85 +917,85 @@ async fn recipes_for_resolution(state: &AppState) -> Result<Vec<anova_oven_api::
                 .map_err(|e| e.to_string()),
             Err(e) => Err(e),
         },
-    }?;
-
-    let mut cache = state.recipes.lock().await;
-    *cache = Some(fetched.clone());
-    Ok(fetched)
+    }
 }
 
-async fn handle_current_cook(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let result = match tokio::time::timeout(state.current_cook_timeout, async {
-        let session = state.session.lock().await.clone();
-        match firestore::fetch_current_cook(&state.http, &session).await {
-            Ok(v) => Ok(v),
-            Err(err) => match maybe_refresh_session(&state, err).await {
-                Ok(fresh) => firestore::fetch_current_cook(&state.http, &fresh)
-                    .await
-                    .map_err(|e| e.to_string()),
-                Err(e) => Err(e),
-            },
+async fn refresh_recipes_cache(state: &AppState) -> Result<Vec<anova_oven_api::Recipe>, String> {
+    let recipes = fetch_recipes_with_retry(state).await?;
+    let mut cache = state.recipes.lock().await;
+    *cache = Some(recipes.clone());
+    Ok(recipes)
+}
+
+async fn refresh_history_cache(
+    state: &AppState,
+) -> Result<Vec<anova_oven_api::HistoryEntry>, String> {
+    let session = state.session.lock().await.clone();
+    let result = match firestore::fetch_history(&state.http, &session, 50).await {
+        Ok(v) => Ok(v),
+        Err(err) => match maybe_refresh_session(state, err).await {
+            Ok(fresh) => firestore::fetch_history(&state.http, &fresh, 50)
+                .await
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e),
+        },
+    };
+    match result {
+        Ok(history) => {
+            let mut cache = state.history.lock().await;
+            *cache = Some(history.clone());
+            Ok(history)
         }
-    })
-    .await
-    {
+        Err(e) => Err(e),
+    }
+}
+
+async fn fetch_current_cook_from_firebase(
+    state: &AppState,
+) -> Result<Option<anova_oven_api::CurrentCook>, String> {
+    let session = state.session.lock().await.clone();
+    let mut cook = match firestore::fetch_current_cook(&state.http, &session).await {
         Ok(v) => v,
-        Err(_) => {
-            eprintln!(
-                "[current-cook] timed out after {}s",
-                state.current_cook_timeout.as_secs()
-            );
-            return (
-                StatusCode::GATEWAY_TIMEOUT,
-                "Timed out fetching current cook from Firestore",
-            )
-                .into_response();
-        }
+        Err(err) => match maybe_refresh_session(state, err).await {
+            Ok(fresh) => firestore::fetch_current_cook(&state.http, &fresh)
+                .await
+                .map_err(|e| e.to_string())?,
+            Err(e) => return Err(e),
+        },
     };
 
-    match result {
-        Ok(Some(mut cook)) => {
-            if cook.recipe_title == "[custom]" {
-                match tokio::time::timeout(
-                    state.current_cook_resolution_timeout,
-                    recipes_for_resolution(&state),
-                )
-                .await
-                {
-                    Ok(Ok(recipes)) => {
-                        if let Some((title, id)) = resolve_title_from_recipes(&cook, &recipes) {
-                            eprintln!(
-                                "[current-cook] resolved title from recipe stage match: '{}' ({})",
-                                title, id
-                            );
-                            cook.recipe_title = title;
-                            if cook.recipe_id.is_none() {
-                                cook.recipe_id = Some(id);
-                            }
+    if let Some(ref mut cook_value) = cook {
+        if cook_value.recipe_title == "[custom]" {
+            match tokio::time::timeout(
+                state.current_cook_resolution_timeout,
+                recipes_for_resolution(state),
+            )
+            .await
+            {
+                Ok(Ok(recipes)) => {
+                    if let Some((title, id)) = resolve_title_from_recipes(cook_value, &recipes) {
+                        eprintln!(
+                            "[current-cook] resolved title from recipe stage match: '{}' ({})",
+                            title, id
+                        );
+                        cook_value.recipe_title = title;
+                        if cook_value.recipe_id.is_none() {
+                            cook_value.recipe_id = Some(id);
                         }
                     }
-                    Ok(Err(e)) => {
-                        eprintln!("[current-cook] recipe resolution skipped: {e}");
-                    }
-                    Err(_) => {
-                        eprintln!(
-                            "[current-cook] recipe resolution skipped: timed out after {}s",
-                            state.current_cook_resolution_timeout.as_secs()
-                        );
-                    }
+                }
+                Ok(Err(e)) => {
+                    eprintln!("[current-cook] recipe resolution skipped: {e}");
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[current-cook] recipe resolution skipped: timed out after {}s",
+                        state.current_cook_resolution_timeout.as_secs()
+                    );
                 }
             }
-
-            Json(cook).into_response()
-        }
-        Ok(None) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => {
-            eprintln!("[current-cook] Fetch error: {e}");
-            (
-                StatusCode::BAD_GATEWAY,
-                format!("Failed to fetch current cook: {e}"),
-            )
-                .into_response()
         }
     }
+
+    Ok(cook)
 }

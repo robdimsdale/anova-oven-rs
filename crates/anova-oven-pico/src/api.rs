@@ -1,4 +1,4 @@
-use defmt::{info, warn};
+use defmt::{debug, info, warn};
 use embassy_net::dns::DnsSocket;
 use embassy_net::tcp::client::{TcpClient, TcpClientState};
 use reqwless::client::HttpClient;
@@ -59,7 +59,7 @@ pub async fn fetch_and_log_status(
 
     match serde_json::from_slice::<anova_oven_api::OvenStatus>(body) {
         Ok(status) => {
-            info!(
+            debug!(
                 "Status: mode={} temp={}F target={}F steam={}% door={} water={}",
                 status.mode.as_str(),
                 celcius_to_fahrenheit(status.current_temperature_c()),
