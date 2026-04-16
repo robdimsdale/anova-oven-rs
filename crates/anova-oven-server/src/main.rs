@@ -24,15 +24,20 @@ mod protocol;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::body::Body;
 use axum::extract::State;
+use axum::http::header::{CONNECTION, CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use http::{HeaderName, HeaderValue, Uri};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio_websockets::{ClientBuilder, Message};
+use tracing::{debug, info, trace, warn};
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use uuid::Uuid;
 
 const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 10;
@@ -122,7 +127,13 @@ fn env_duration_secs(var: &str, default_secs: u64) -> Duration {
         Ok(value) => match value.parse::<u64>() {
             Ok(secs) => Duration::from_secs(secs),
             Err(err) => {
-                eprintln!("[{var}] Invalid duration '{value}': {err}; using {default_secs}s");
+                warn!(
+                    env_var = var,
+                    value = %value,
+                    error = %err,
+                    default_secs,
+                    "Invalid duration; using default"
+                );
                 Duration::from_secs(default_secs)
             }
         },
@@ -130,8 +141,29 @@ fn env_duration_secs(var: &str, default_secs: u64) -> Duration {
     }
 }
 
+fn init_tracing() -> WorkerGuard {
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("anova_oven_server=info,anova_oven_server::ws=debug"));
+
+    let (non_blocking, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
+        .lossy(true)
+        .finish(std::io::stderr());
+
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_writer(non_blocking),
+        )
+        .init();
+
+    guard
+}
+
 #[tokio::main]
 async fn main() {
+    let _tracing_guard = init_tracing();
     let anova_token = std::env::var("ANOVA_TOKEN").expect("ANOVA_TOKEN env var is required");
     let anova_email = std::env::var("ANOVA_EMAIL").expect("ANOVA_EMAIL env var is required");
     let anova_password =
@@ -149,7 +181,7 @@ async fn main() {
         .build()
         .expect("Failed to build HTTP client");
 
-    eprintln!("Signing into Firebase...");
+    info!("Signing into Firebase...");
     let session = tokio::time::timeout(
         Duration::from_secs(20),
         firestore::sign_in(&http, &anova_email, &anova_password),
@@ -157,7 +189,7 @@ async fn main() {
     .await
     .expect("Firebase sign-in timed out after 20s")
     .expect("Firebase sign-in failed");
-    eprintln!("Signed in as UID {}", session.uid);
+    info!(uid = %session.uid, "Signed into Firebase");
 
     let (status_tx, status_rx) = watch::channel(None::<anova_oven_api::OvenStatus>);
     let (cmd_tx, cmd_rx) = mpsc::channel::<WsCommand>(8);
@@ -200,14 +232,14 @@ async fn main() {
     });
 
     match tokio::time::timeout(Duration::from_secs(15), refresh_recipes_cache(&state)).await {
-        Ok(Ok(recipes)) => eprintln!("[recipes] Preloaded {} recipe(s)", recipes.len()),
-        Ok(Err(e)) => eprintln!("[recipes] Startup preload failed: {e}"),
-        Err(_) => eprintln!("[recipes] Startup preload timed out after 15s"),
+        Ok(Ok(recipes)) => info!(count = recipes.len(), "[recipes] preloaded"),
+        Ok(Err(e)) => warn!(error = %e, "[recipes] startup preload failed"),
+        Err(_) => warn!("[recipes] startup preload timed out after 15s"),
     }
     match tokio::time::timeout(Duration::from_secs(15), refresh_history_cache(&state)).await {
-        Ok(Ok(entries)) => eprintln!("[history] Preloaded {} entr(y/ies)", entries.len()),
-        Ok(Err(e)) => eprintln!("[history] Startup preload failed: {e}"),
-        Err(_) => eprintln!("[history] Startup preload timed out after 15s"),
+        Ok(Ok(entries)) => info!(count = entries.len(), "[history] preloaded"),
+        Ok(Err(e)) => warn!(error = %e, "[history] startup preload failed"),
+        Err(_) => warn!("[history] startup preload timed out after 15s"),
     }
 
     // Spawn WebSocket background task.
@@ -248,8 +280,7 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .expect("Failed to bind address");
-    eprintln!("[server] Listening on http://{addr}");
-    eprintln!("[server] HTTP server starting...");
+    info!(address = %addr, "HTTP server listening");
     axum::serve(listener, app).await.expect("Server error");
 }
 
@@ -371,12 +402,12 @@ async fn ws_task(
     mut cmd_rx: mpsc::Receiver<WsCommand>,
 ) {
     loop {
-        eprintln!("[ws] Connecting to Anova WebSocket...");
+        info!("[ws] connecting to Anova WebSocket");
         match ws_connect_and_run(&token, &status_tx, &state, &current_cook_tx, &mut cmd_rx).await {
-            Ok(()) => eprintln!("[ws] Connection closed cleanly."),
-            Err(e) => eprintln!("[ws] Connection error: {e}"),
+            Ok(()) => info!("[ws] connection closed cleanly"),
+            Err(e) => warn!(error = %e, "[ws] connection error"),
         }
-        eprintln!("[ws] Reconnecting in 5 s...");
+        info!("[ws] reconnecting in 5s");
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
 }
@@ -404,7 +435,7 @@ async fn ws_connect_and_run(
         .connect()
         .await?;
 
-    eprintln!("[ws] Connected.");
+    info!("[ws] connected");
 
     let mut was_cooking = false;
     let mut seen_state = false;
@@ -464,27 +495,33 @@ async fn ws_connect_and_run(
                                     prev_timer_initial = Some(timer_initial);
                                 }
 
-                                eprintln!("[ws] State: mode={} temp={:.1}°F steam={:.0}%/{:.0}% probe={:.1}°F",
-                                status.mode, celcius_to_fahrenheit(status.temperature_c), status.steam_pct, status.steam_target_pct.unwrap_or(0.0), celcius_to_fahrenheit(status.probe_temperature_c.unwrap_or(0.0)) );
+                                info!(
+                                    mode = %status.mode,
+                                    temp_f = celcius_to_fahrenheit(status.temperature_c),
+                                    steam_current_pct = status.steam_pct,
+                                    steam_target_pct = status.steam_target_pct.unwrap_or(0.0),
+                                    probe_f = celcius_to_fahrenheit(status.probe_temperature_c.unwrap_or(0.0)),
+                                    "[ws] state"
+                                );
                                 let _ = status_tx.send(Some(status));
                                 was_cooking = is_cooking;
                                 seen_state = true;
                             }
                             Ok(protocol::Event::ApoWifiList { cooker_id: id }) => {
                                 if let Some(id) = id {
-                                    eprintln!("[ws] Cooker ID: {id}");
+                                    info!(cooker_id = %id, "[ws] cooker id received");
                                     let mut cooker_id = state.cooker_id.lock().await;
                                     *cooker_id = Some(id);
                                 }
                             }
                             Ok(protocol::Event::Response { request_id, status }) => {
-                                eprintln!("[ws] Response: request_id={} status={}", request_id, status);
+                                debug!(request_id = %request_id, status = %status, "[ws] response");
                             }
                             Ok(event) => {
-                                eprintln!("[ws] Event: {:?}", event);
+                                trace!(event = ?event, "[ws] event");
                             }
                             Err(e) => {
-                                eprintln!("[ws] Parse error: {}", e);
+                                warn!(error = %e, "[ws] parse error");
                             }
                         }
                     }
@@ -498,10 +535,10 @@ async fn ws_connect_and_run(
                         let cooker_id = state.cooker_id.lock().await.clone();
                         match cooker_id {
                             Some(id) => {
-                                eprintln!("[ws] Sending CMD_APO_STOP for cooker {id}");
+                                info!(cooker_id = %id, "[ws] sending CMD_APO_STOP");
                                 sink.send(Message::text(stop_command_json(&id))).await?;
                             }
-                            None => eprintln!("[ws] Stop requested but cooker ID not yet known"),
+                            None => warn!("[ws] stop requested before cooker id known"),
                         }
                     }
                     Some(WsCommand::Start(stages)) => {
@@ -509,15 +546,15 @@ async fn ws_connect_and_run(
                         match cooker_id {
                             Some(id) => {
                                 let cmd_json = start_command_json(&id, &stages);
-                                eprintln!("[ws] Sending CMD_APO_START for cooker {id}");
-                                eprintln!("[ws] Command JSON: {}", cmd_json);
+                                info!(cooker_id = %id, "[ws] sending CMD_APO_START");
+                                trace!(command_json = %cmd_json, "[ws] start payload");
                                 sink.send(Message::text(cmd_json)).await?;
                                 request_current_cook_refresh(
                                     &state.current_cook_refresh_tx,
                                     CurrentCookRefreshReason::StartCommandAccepted,
                                 );
                             }
-                            None => eprintln!("[ws] Start requested but cooker ID not yet known"),
+                            None => warn!("[ws] start requested before cooker id known"),
                         }
                     }
                     None => {} // cmd_tx dropped — server shutting down
@@ -534,15 +571,15 @@ fn request_current_cook_refresh(
     match tx.try_send(reason) {
         Ok(()) => {}
         Err(mpsc::error::TrySendError::Full(_)) => {
-            eprintln!(
-                "[current-cook] refresh trigger dropped (queue full): {}",
-                reason.as_str()
+            warn!(
+                reason = reason.as_str(),
+                "[current-cook] refresh trigger dropped (queue full)"
             );
         }
         Err(mpsc::error::TrySendError::Closed(_)) => {
-            eprintln!(
-                "[current-cook] refresh trigger dropped (task not running): {}",
-                reason.as_str()
+            warn!(
+                reason = reason.as_str(),
+                "[current-cook] refresh trigger dropped (task not running)"
             );
         }
     }
@@ -552,15 +589,15 @@ fn request_history_refresh(tx: &mpsc::Sender<HistoryRefreshReason>, reason: Hist
     match tx.try_send(reason) {
         Ok(()) => {}
         Err(mpsc::error::TrySendError::Full(_)) => {
-            eprintln!(
-                "[history] refresh trigger dropped (queue full): {}",
-                reason.as_str()
+            warn!(
+                reason = reason.as_str(),
+                "[history] refresh trigger dropped (queue full)"
             );
         }
         Err(mpsc::error::TrySendError::Closed(_)) => {
-            eprintln!(
-                "[history] refresh trigger dropped (task not running): {}",
-                reason.as_str()
+            warn!(
+                reason = reason.as_str(),
+                "[history] refresh trigger dropped (task not running)"
             );
         }
     }
@@ -590,7 +627,7 @@ async fn current_cook_refresh_task(
                         refresh_current_cook_cache(&state, &current_cook_tx, reason).await;
                     }
                     None => {
-                        eprintln!("[current-cook] refresh trigger channel closed");
+                        warn!("[current-cook] refresh trigger channel closed");
                         return;
                     }
                 }
@@ -611,10 +648,10 @@ async fn refresh_current_cook_cache(
     {
         Ok(v) => v,
         Err(_) => {
-            eprintln!(
-                "[current-cook] refresh timed out after {}s (reason={})",
-                state.current_cook_timeout.as_secs(),
-                reason.as_str()
+            warn!(
+                timeout_secs = state.current_cook_timeout.as_secs(),
+                reason = reason.as_str(),
+                "[current-cook] refresh timed out"
             );
             return;
         }
@@ -625,11 +662,7 @@ async fn refresh_current_cook_cache(
             let _ = current_cook_tx.send(cook);
         }
         Err(e) => {
-            eprintln!(
-                "[current-cook] refresh failed (reason={}): {}",
-                reason.as_str(),
-                e
-            );
+            warn!(reason = reason.as_str(), error = %e, "[current-cook] refresh failed");
         }
     }
 }
@@ -646,22 +679,22 @@ async fn history_refresh_task(
         tokio::select! {
             _ = interval.tick() => {
                 match tokio::time::timeout(Duration::from_secs(15), refresh_history_cache(&state)).await {
-                    Ok(Ok(entries)) => eprintln!("[history] Periodic refresh: {} entr(y/ies)", entries.len()),
-                    Ok(Err(e)) => eprintln!("[history] Periodic refresh failed: {e}"),
-                    Err(_) => eprintln!("[history] Periodic refresh timed out after 15s"),
+                    Ok(Ok(entries)) => info!(count = entries.len(), "[history] periodic refresh"),
+                    Ok(Err(e)) => warn!(error = %e, "[history] periodic refresh failed"),
+                    Err(_) => warn!("[history] periodic refresh timed out after 15s"),
                 }
             }
             reason = refresh_rx.recv() => {
                 match reason {
                     Some(reason) => {
                         match tokio::time::timeout(Duration::from_secs(15), refresh_history_cache(&state)).await {
-                            Ok(Ok(entries)) => eprintln!("[history] Refreshed (reason={}): {} entr(y/ies)", reason.as_str(), entries.len()),
-                            Ok(Err(e)) => eprintln!("[history] Refresh failed (reason={}): {e}", reason.as_str()),
-                            Err(_) => eprintln!("[history] Refresh timed out (reason={}) after 15s", reason.as_str()),
+                            Ok(Ok(entries)) => info!(reason = reason.as_str(), count = entries.len(), "[history] refreshed"),
+                            Ok(Err(e)) => warn!(reason = reason.as_str(), error = %e, "[history] refresh failed"),
+                            Err(_) => warn!(reason = reason.as_str(), "[history] refresh timed out after 15s"),
                         }
                     }
                     None => {
-                        eprintln!("[history] Refresh trigger channel closed");
+                        warn!("[history] refresh trigger channel closed");
                         return;
                     }
                 }
@@ -678,96 +711,119 @@ async fn recipes_refresh_task(state: Arc<AppState>) {
     loop {
         interval.tick().await;
         match tokio::time::timeout(Duration::from_secs(15), refresh_recipes_cache(&state)).await {
-            Ok(Ok(recipes)) => eprintln!("[recipes] Periodic refresh: {} recipe(s)", recipes.len()),
-            Ok(Err(e)) => eprintln!("[recipes] Periodic refresh failed: {e}"),
-            Err(_) => eprintln!("[recipes] Periodic refresh timed out after 15s"),
+            Ok(Ok(recipes)) => info!(count = recipes.len(), "[recipes] periodic refresh"),
+            Ok(Err(e)) => warn!(error = %e, "[recipes] periodic refresh failed"),
+            Err(_) => warn!("[recipes] periodic refresh timed out after 15s"),
         }
     }
 }
 
 // ─── HTTP handlers ─────────────────────────────────────────────────────────────
 
+fn build_response(status: StatusCode, content_type: &'static str, body: Vec<u8>) -> Response {
+    let content_length = body.len().to_string();
+
+    Response::builder()
+        .status(status)
+        .header(CONTENT_TYPE, content_type)
+        .header(CONTENT_LENGTH, content_length)
+        .header(CONNECTION, "close")
+        .body(Body::from(body))
+        .expect("failed to build HTTP response")
+}
+
+fn text_response(status: StatusCode, message: impl Into<String>) -> Response {
+    build_response(
+        status,
+        "text/plain; charset=utf-8",
+        message.into().into_bytes(),
+    )
+}
+
+fn json_response<T: Serialize>(status: StatusCode, value: &T) -> Response {
+    match serde_json::to_vec(value) {
+        Ok(body) => build_response(status, "application/json", body),
+        Err(err) => text_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to serialize JSON response: {err}"),
+        ),
+    }
+}
+
+fn empty_response(status: StatusCode) -> Response {
+    build_response(status, "text/plain; charset=utf-8", Vec::new())
+}
+
 async fn handle_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    eprintln!("[http] GET /status");
+    trace!("[http] GET /status");
     match state.status_rx.borrow().clone() {
         Some(status) => {
-            eprintln!("[http] GET /status -> OK");
-            Json(status).into_response()
+            trace!("[http] GET /status -> OK");
+            json_response(StatusCode::OK, &status)
         }
-        None => {
-            eprintln!("[http] GET /status -> SERVICE_UNAVAILABLE");
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Oven state not yet received — WebSocket may still be connecting",
-            )
-                .into_response()
-        }
+        None => text_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Oven state not yet received — WebSocket may still be connecting",
+        ),
     }
 }
 
 async fn handle_recipes(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    eprintln!("[http] GET /recipes");
+    trace!("[http] GET /recipes");
     let cache = state.recipes.lock().await;
-    eprintln!("[http] GET /recipes -> locked cache");
+    trace!("[http] GET /recipes -> locked cache");
     match &*cache {
         Some(recipes) => {
-            eprintln!("[http] GET /recipes -> OK ({} recipes)", recipes.len());
-            Json(recipes.clone()).into_response()
+            trace!(count = recipes.len(), "[http] GET /recipes -> OK");
+            json_response(StatusCode::OK, recipes)
         }
         None => {
-            eprintln!("[http] GET /recipes -> SERVICE_UNAVAILABLE");
-            (
+            debug!("[http] GET /recipes -> SERVICE_UNAVAILABLE");
+            text_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Recipe cache not yet populated — server may still be starting up",
             )
-                .into_response()
         }
     }
 }
 
 async fn handle_update_recipes(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    eprintln!("[http] POST /update-recipes");
+    debug!("[http] POST /update-recipes");
     match refresh_recipes_cache(&state).await {
         Ok(recipes) => {
-            eprintln!(
-                "[http] POST /update-recipes -> OK ({} recipes)",
-                recipes.len()
-            );
-            Json(recipes).into_response()
+            info!(count = recipes.len(), "[http] POST /update-recipes -> OK");
+            json_response(StatusCode::OK, &recipes)
         }
         Err(e) => {
-            eprintln!("[http] POST /update-recipes -> ERROR: {e}");
-            (
+            warn!(error = %e, "[http] POST /update-recipes -> ERROR");
+            text_response(
                 StatusCode::BAD_GATEWAY,
                 format!("Failed to refresh recipes: {e}"),
             )
-                .into_response()
         }
     }
 }
 
 async fn handle_stop(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    eprintln!("[http] POST /stop");
+    debug!("[http] POST /stop");
     if state.cooker_id.lock().await.is_none() {
-        eprintln!("[http] POST /stop -> SERVICE_UNAVAILABLE (no cooker ID)");
-        return (
+        debug!("[http] POST /stop -> SERVICE_UNAVAILABLE (no cooker ID)");
+        return text_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "Cooker ID not yet received — WebSocket may still be connecting",
-        )
-            .into_response();
+        );
     }
     match state.cmd_tx.send(WsCommand::Stop).await {
         Ok(()) => {
-            eprintln!("[http] POST /stop -> NO_CONTENT");
-            StatusCode::NO_CONTENT.into_response()
+            info!("[http] POST /stop -> NO_CONTENT");
+            empty_response(StatusCode::NO_CONTENT)
         }
         Err(_) => {
-            eprintln!("[http] POST /stop -> INTERNAL_SERVER_ERROR");
-            (
+            warn!("[http] POST /stop -> INTERNAL_SERVER_ERROR");
+            text_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "WebSocket task not running",
             )
-                .into_response()
         }
     }
 }
@@ -781,54 +837,52 @@ async fn handle_start(
     State(state): State<Arc<AppState>>,
     Json(req): Json<StartRequest>,
 ) -> impl IntoResponse {
-    eprintln!("[http] POST /start recipe_id={}", req.recipe_id);
+    debug!(recipe_id = %req.recipe_id, "[http] POST /start");
     if state.cooker_id.lock().await.is_none() {
-        eprintln!("[http] POST /start -> SERVICE_UNAVAILABLE (no cooker ID)");
-        return (
+        debug!("[http] POST /start -> SERVICE_UNAVAILABLE (no cooker ID)");
+        return text_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "Cooker ID not yet received — WebSocket may still be connecting",
-        )
-            .into_response();
+        );
     }
 
     // Try cache first. After a server restart, this cache may be empty.
     let cached_recipe = {
-        eprintln!("[http] POST /start -> checking recipes cache");
+        trace!("[http] POST /start -> checking recipes cache");
         let recipes = state.recipes.lock().await;
-        eprintln!("[http] POST /start -> recipes cache locked");
+        trace!("[http] POST /start -> recipes cache locked");
         recipes
             .as_ref()
             .and_then(|recipes| recipes.iter().find(|r| r.id == req.recipe_id).cloned())
     };
-    eprintln!(
-        "[http] POST /start -> cache check complete, found: {}",
-        cached_recipe.is_some()
+    debug!(
+        found = cached_recipe.is_some(),
+        "[http] POST /start -> cache check complete"
     );
 
     let recipe = if let Some(recipe) = cached_recipe {
-        eprintln!("[http] POST /start -> using cached recipe");
+        trace!("[http] POST /start -> using cached recipe");
         Some(recipe)
     } else {
         // Cache miss: hydrate recipes from Firestore so /start works even when
         // the server has just restarted and /recipes has not been called yet.
-        eprintln!("[http] POST /start -> cache miss, refreshing from Firestore");
+        debug!("[http] POST /start -> cache miss, refreshing from Firestore");
         match refresh_recipes_cache(&state).await {
             Ok(recipes) => {
-                eprintln!(
-                    "[http] POST /start -> refresh complete, got {} recipes",
-                    recipes.len()
+                info!(
+                    count = recipes.len(),
+                    "[http] POST /start -> refresh complete"
                 );
                 let recipe = recipes.iter().find(|r| r.id == req.recipe_id).cloned();
                 recipe
             }
             Err(e) => {
-                eprintln!("[start] Failed to refresh recipes after cache miss: {e}");
-                eprintln!("[http] POST /start -> BAD_GATEWAY");
-                return (
+                warn!(error = %e, "[start] failed to refresh recipes after cache miss");
+                warn!("[http] POST /start -> BAD_GATEWAY");
+                return text_response(
                     StatusCode::BAD_GATEWAY,
                     format!("Failed to fetch recipes for start request: {e}"),
-                )
-                    .into_response();
+                );
             }
         }
     };
@@ -836,47 +890,44 @@ async fn handle_start(
     let recipe = match recipe {
         Some(r) => r,
         None => {
-            eprintln!("[http] POST /start -> NOT_FOUND");
-            return (
+            debug!("[http] POST /start -> NOT_FOUND");
+            return text_response(
                 StatusCode::NOT_FOUND,
                 format!("Recipe with ID '{}' not found", req.recipe_id),
-            )
-                .into_response();
+            );
         }
     };
 
     match state.cmd_tx.send(WsCommand::Start(recipe.stages)).await {
         Ok(()) => {
-            eprintln!("[http] POST /start -> NO_CONTENT");
-            StatusCode::NO_CONTENT.into_response()
+            info!("[http] POST /start -> NO_CONTENT");
+            empty_response(StatusCode::NO_CONTENT)
         }
         Err(_) => {
-            eprintln!("[http] POST /start -> INTERNAL_SERVER_ERROR");
-            (
+            warn!("[http] POST /start -> INTERNAL_SERVER_ERROR");
+            text_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "WebSocket task not running",
             )
-                .into_response()
         }
     }
 }
 
 async fn handle_history(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    eprintln!("[http] GET /history");
+    trace!("[http] GET /history");
     let cache = state.history.lock().await;
-    eprintln!("[http] GET /history -> locked cache");
+    trace!("[http] GET /history -> locked cache");
     match &*cache {
         Some(history) => {
-            eprintln!("[http] GET /history -> OK ({} entries)", history.len());
-            Json(history.clone()).into_response()
+            trace!(count = history.len(), "[http] GET /history -> OK");
+            json_response(StatusCode::OK, history)
         }
         None => {
-            eprintln!("[http] GET /history -> SERVICE_UNAVAILABLE");
-            (
+            debug!("[http] GET /history -> SERVICE_UNAVAILABLE");
+            text_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "History cache not yet populated — server may still be starting up",
             )
-                .into_response()
         }
     }
 }
@@ -894,7 +945,7 @@ async fn maybe_refresh_session(
 ) -> Result<firestore::FirebaseSession, String> {
     match err {
         firestore::FirestoreError::Unauthorized => {
-            eprintln!("[auth] Firebase token expired — refreshing...");
+            info!("[auth] Firebase token expired; refreshing");
             let mut refreshed = {
                 let locked = state.session.lock().await;
                 locked.clone()
@@ -906,7 +957,7 @@ async fn maybe_refresh_session(
 
             let mut locked = state.session.lock().await;
             *locked = refreshed.clone();
-            eprintln!("[auth] Token refreshed successfully.");
+            info!("[auth] Token refreshed successfully");
             Ok(refreshed)
         }
         firestore::FirestoreError::Other(e) => Err(e.to_string()),
@@ -971,16 +1022,9 @@ async fn recipes_for_resolution(state: &AppState) -> Result<Vec<anova_oven_api::
 }
 
 async fn handle_current_cook(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    eprintln!("[http] GET /current-cook");
     match state.current_cook_rx.borrow().clone() {
-        Some(cook) => {
-            eprintln!("[http] GET /current-cook -> OK");
-            Json(cook).into_response()
-        }
-        None => {
-            eprintln!("[http] GET /current-cook -> NO_CONTENT");
-            StatusCode::NO_CONTENT.into_response()
-        }
+        Some(cook) => json_response(StatusCode::OK, &cook),
+        None => empty_response(StatusCode::NO_CONTENT),
     }
 }
 
@@ -1051,10 +1095,7 @@ async fn fetch_current_cook_from_firebase(
             {
                 Ok(Ok(recipes)) => {
                     if let Some((title, id)) = resolve_title_from_recipes(cook_value, &recipes) {
-                        eprintln!(
-                            "[current-cook] resolved title from recipe stage match: '{}' ({})",
-                            title, id
-                        );
+                        debug!(title = %title, recipe_id = %id, "[current-cook] resolved title from stage match");
                         cook_value.recipe_title = title;
                         if cook_value.recipe_id.is_none() {
                             cook_value.recipe_id = Some(id);
@@ -1062,12 +1103,12 @@ async fn fetch_current_cook_from_firebase(
                     }
                 }
                 Ok(Err(e)) => {
-                    eprintln!("[current-cook] recipe resolution skipped: {e}");
+                    warn!(error = %e, "[current-cook] recipe resolution skipped");
                 }
                 Err(_) => {
-                    eprintln!(
-                        "[current-cook] recipe resolution skipped: timed out after {}s",
-                        state.current_cook_resolution_timeout.as_secs()
+                    warn!(
+                        timeout_secs = state.current_cook_resolution_timeout.as_secs(),
+                        "[current-cook] recipe resolution skipped: timeout"
                     );
                 }
             }
