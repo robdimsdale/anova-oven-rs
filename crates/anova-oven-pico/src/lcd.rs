@@ -5,8 +5,6 @@ use alloc::vec::Vec;
 use embassy_rp::gpio::Output;
 use embassy_time::{Delay, Duration, Instant};
 
-use crate::logic::celcius_to_fahrenheit;
-
 const LCD_WIDTH: usize = 16;
 const SCROLL_STEP_MS: u64 = 350;
 const CHAR_SCROLL_COUNT: usize = 3;
@@ -394,4 +392,8 @@ impl LcdController {
             &mut self.row1_last_rendered
         }
     }
+}
+
+pub fn celcius_to_fahrenheit(c: f32) -> f32 {
+    c * 1.8 + 32.0
 }

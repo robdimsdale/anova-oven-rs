@@ -8,7 +8,6 @@ mod app_state;
 mod backlight;
 mod events;
 mod lcd;
-mod logic;
 
 use embedded_alloc::LlffHeap as Heap;
 
