@@ -1086,7 +1086,7 @@ async fn fetch_current_cook_from_firebase(
     };
 
     if let Some(ref mut cook_value) = cook {
-        if cook_value.recipe_title == "[custom]" {
+        if cook_value.recipe_title == "[manual]" {
             match tokio::time::timeout(
                 state.current_cook_resolution_timeout,
                 recipes_for_resolution(state),

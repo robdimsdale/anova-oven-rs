@@ -258,7 +258,7 @@ impl Recipe {
 /// A cook history entry, as served by `GET /history`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryEntry {
-    /// Resolved recipe title, or `"[custom]"` if unknown.
+    /// Resolved recipe title, or `"[manual]"` if unknown.
     pub recipe_title: String,
     /// ISO 8601 timestamp when the cook ended.
     pub ended_at: String,
@@ -269,7 +269,7 @@ pub struct HistoryEntry {
 /// An in-progress cook, as served by `GET /current-cook`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CurrentCook {
-    /// Resolved recipe title, or `"[custom]"` if no recipe reference.
+    /// Resolved recipe title, or `"[manual]"` if no recipe reference.
     pub recipe_title: String,
     /// Firestore recipe document ID, if this cook came from a recipe.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -287,8 +287,8 @@ pub struct CurrentCook {
 impl CurrentCook {
     /// Display name: recipe title, or "Custom cook" for custom cooks.
     pub fn display_name(&self) -> &str {
-        if self.recipe_title == "[custom]" {
-            "Custom cook"
+        if self.recipe_title == "[manual]" {
+            "Manual cook"
         } else {
             &self.recipe_title
         }
