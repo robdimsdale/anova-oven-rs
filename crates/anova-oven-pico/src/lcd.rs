@@ -200,6 +200,11 @@ impl LcdController {
             };
             self.write_row(1, &row1, tick).await;
         } else {
+            // Row 0 is rendered via direct LCD byte writes below (for degree glyph),
+            // so invalidate cached state to keep transition redraws correct.
+            self.row0_scroll_state = None;
+            self.row0_last_rendered = None;
+
             self.lcd.set_cursor_xy((0, 0), &mut self.delay).await.ok();
             let temp_str = alloc::format!(
                 "{:.0}",
