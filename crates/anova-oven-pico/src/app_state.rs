@@ -5,9 +5,16 @@ use crate::api::{
     fetch_and_log_recipes, fetch_and_log_status, fetch_current_cook, send_start, send_stop,
 };
 use crate::backlight::BacklightController;
-use crate::display::LcdController;
-use crate::events::{handle_input_event, InputEvent, UIState};
+use crate::events::InputEvent;
+use crate::lcd::LcdController;
 use crate::logic::{is_active_cook, should_dim_backlight};
+
+pub enum UIState {
+    ShowIdle,
+    ShowCook,
+    BrowseRecipes { index: usize },
+    ConfirmStopCooking { last_input_at: Instant },
+}
 
 const MENU_INACTIVITY_TIMEOUT_SECS: u64 = 15;
 const STOP_CONFIRM_TIMEOUT_SECS: u64 = 5;
@@ -69,7 +76,7 @@ where
     ) -> Self {
         Self {
             tick: 0,
-            ui_state: UIState::ShowStatus,
+            ui_state: UIState::ShowIdle,
             last_input_at: None,
             baseline_reentered_at: Some(Instant::now()),
             current_cook: None,
@@ -139,6 +146,7 @@ where
         }
 
         self.reconcile_current_cook_recipe_title();
+        self.sync_status_ui_state();
     }
 
     pub(crate) fn next_poll_interval_secs(&self) -> u64 {
@@ -151,7 +159,8 @@ where
     }
 
     fn enter_baseline_state(&mut self) {
-        self.ui_state = UIState::ShowStatus;
+        self.ui_state = UIState::ShowIdle;
+        self.sync_status_ui_state();
         self.baseline_reentered_at = Some(Instant::now());
         self.last_input_at = None;
     }
@@ -159,7 +168,7 @@ where
     pub(crate) fn update_inactivity_timeout(&mut self) {
         if let UIState::ConfirmStopCooking { last_input_at } = self.ui_state {
             if last_input_at.elapsed() >= Duration::from_secs(STOP_CONFIRM_TIMEOUT_SECS) {
-                info!("Stop-confirm timeout: reverting to ShowStatus");
+                info!("Stop-confirm timeout: reverting to status view");
                 self.enter_baseline_state();
             }
             return;
@@ -167,8 +176,8 @@ where
 
         if let Some(t) = self.last_input_at {
             if t.elapsed() >= Duration::from_secs(MENU_INACTIVITY_TIMEOUT_SECS) {
-                if !matches!(self.ui_state, UIState::ShowStatus) {
-                    info!("Inactivity timeout: reverting to ShowStatus");
+                if !matches!(self.ui_state, UIState::ShowIdle | UIState::ShowCook) {
+                    info!("Inactivity timeout: reverting to status view");
                     self.enter_baseline_state();
                 }
                 self.last_input_at = None;
@@ -185,70 +194,75 @@ where
         debug!("Setting backlight to full: (input activity)");
         self.backlight_controller.set_full();
 
-        let active_cook = is_active_cook(
-            self.current_cook.is_some(),
-            self.latest_status
-                .as_ref()
-                .map(|status| status.mode.as_str()),
-        );
+        match self.ui_state {
+            UIState::ShowCook => match event {
+                InputEvent::EncoderCCW => {
+                    info!("Entering stop-confirm mode: encoder CCW");
+                    self.ui_state = UIState::ConfirmStopCooking { last_input_at: now };
+                }
+                InputEvent::EncoderCW => {
+                    // Explicit no-op while cooking to keep this branch ready for future behavior.
+                    debug!("Ignoring encoder CW while active cook status is shown");
+                }
+                InputEvent::EncoderButton => {
+                    // No-op while showing cook status.
+                }
+            },
+            UIState::ShowIdle => match event {
+                InputEvent::EncoderCW => {
+                    if self.recipes.is_empty() {
+                        return;
+                    }
+                    self.ui_state = UIState::BrowseRecipes { index: 0 };
+                }
+                InputEvent::EncoderCCW => {
+                    // No-op while at the top-level idle status view.
+                }
+                InputEvent::EncoderButton => {
+                    // No-op while showing idle status.
+                }
+            },
+            UIState::BrowseRecipes { ref mut index } => match event {
+                InputEvent::EncoderCW => {
+                    if self.recipes.is_empty() {
+                        return;
+                    }
+                    *index = (*index + 1).min(self.recipes.len() - 1);
+                }
+                InputEvent::EncoderCCW => {
+                    if self.recipes.is_empty() {
+                        return;
+                    }
 
-        if let UIState::ConfirmStopCooking { .. } = self.ui_state {
-            match event {
+                    if *index == 0 {
+                        info!("Exiting recipe browser: encoder CCW past index 0");
+                        self.enter_baseline_state();
+                    } else {
+                        *index -= 1;
+                    }
+                }
+                InputEvent::EncoderButton => {
+                    if let Some(recipe) = self.recipes.get(*index).cloned() {
+                        self.apply_optimistic_start_state(&recipe, now);
+                        self.queue_start_action(recipe.id.clone(), now);
+                    }
+                }
+            },
+            UIState::ConfirmStopCooking { .. } => match event {
                 InputEvent::EncoderCCW => {
                     self.ui_state = UIState::ConfirmStopCooking { last_input_at: now };
-                    return;
                 }
                 InputEvent::EncoderCW => {
                     info!("Exiting stop-confirm mode: encoder CW");
                     self.enter_baseline_state();
-                    return;
                 }
                 InputEvent::EncoderButton => {
                     info!("Sending POST /stop (confirm-stop mode)");
                     self.apply_optimistic_stop_state();
                     self.queue_stop_action(now);
                     self.enter_baseline_state();
-                    return;
                 }
-            }
-        }
-
-        if active_cook && matches!(self.ui_state, UIState::ShowStatus) {
-            match event {
-                InputEvent::EncoderCCW => {
-                    info!("Entering stop-confirm mode: encoder CCW");
-                    self.ui_state = UIState::ConfirmStopCooking { last_input_at: now };
-                    return;
-                }
-                InputEvent::EncoderCW => {
-                    // Explicit no-op while cooking to keep this branch ready for future behavior.
-                    debug!("Ignoring encoder CW while active cook status is shown");
-                    return;
-                }
-                InputEvent::EncoderButton => {
-                    return;
-                }
-            }
-        }
-
-        if matches!(event, InputEvent::EncoderButton) {
-            if let UIState::BrowseRecipes { index } = self.ui_state {
-                if let Some(recipe) = self.recipes.get(index).cloned() {
-                    self.apply_optimistic_start_state(&recipe, now);
-                    self.queue_start_action(recipe.id.clone(), now);
-
-                    return;
-                }
-            }
-        }
-
-        let was_browse_recipes = matches!(self.ui_state, UIState::BrowseRecipes { .. });
-        handle_input_event(event, &mut self.ui_state, &self.recipes);
-
-        // If we transitioned from BrowseRecipes to ShowStatus via encoder CCW past index 0,
-        // reset baseline state (logging was already done in events.rs)
-        if was_browse_recipes && matches!(self.ui_state, UIState::ShowStatus) {
-            self.enter_baseline_state();
+            },
         }
     }
 
@@ -275,6 +289,7 @@ where
                 }
             }
             self.reconcile_current_cook_recipe_title();
+            self.sync_status_ui_state();
         }
 
         #[allow(static_mut_refs)]
@@ -292,6 +307,7 @@ where
                 self.server_online = true;
                 self.server_fail_count = 0;
                 self.latest_status = Some(status);
+                self.sync_status_ui_state();
             }
             Ok(None) => {
                 self.server_fail_count = self.server_fail_count.saturating_add(1);
@@ -308,6 +324,7 @@ where
                 // Clear stale data so the UI reflects that data is unavailable.
                 self.latest_status = None;
                 self.current_cook = None;
+                self.sync_status_ui_state();
             }
             Err(_) => {
                 warn!("GET /status: timed out");
@@ -324,6 +341,7 @@ where
                 self.server_online = false;
                 self.latest_status = None;
                 self.current_cook = None;
+                self.sync_status_ui_state();
             }
         }
 
@@ -339,7 +357,7 @@ where
         }
 
         match &self.ui_state {
-            UIState::ShowStatus => {
+            UIState::ShowIdle | UIState::ShowCook => {
                 self.lcd_controller
                     .render_status_display(
                         self.tick,
@@ -432,7 +450,7 @@ where
         );
         let baseline_elapsed_secs = self.baseline_reentered_at.map(|t| t.elapsed().as_secs());
         let should_dim = should_dim_backlight(
-            matches!(self.ui_state, UIState::ShowStatus),
+            matches!(self.ui_state, UIState::ShowIdle | UIState::ShowCook),
             baseline_elapsed_secs,
             active_cook,
             LED_DIM_TIMER_SECS,
@@ -441,7 +459,7 @@ where
         if should_dim {
             self.backlight_controller.set_dim();
             debug!("Setting backlight to dim: (idle baseline)");
-        } else if active_cook || !matches!(self.ui_state, UIState::ShowStatus) {
+        } else if active_cook || !matches!(self.ui_state, UIState::ShowIdle | UIState::ShowCook) {
             debug!("Setting backlight to full: (active state)");
             self.backlight_controller.set_full();
         }
@@ -471,6 +489,8 @@ where
             status.target_temperature_c = None;
             status.steam_target_pct = None;
         }
+
+        self.sync_status_ui_state();
     }
 
     fn apply_optimistic_start_state(&mut self, recipe: &anova_oven_api::Recipe, now: Instant) {
@@ -489,7 +509,7 @@ where
             total_stage_count: recipe.stages.len(),
         });
 
-        self.ui_state = UIState::ShowStatus;
+        self.ui_state = UIState::ShowCook;
         self.baseline_reentered_at = Some(now);
     }
 
@@ -518,6 +538,7 @@ where
             Ok(cook) => {
                 self.current_cook = cook;
                 self.reconcile_current_cook_recipe_title();
+                self.sync_status_ui_state();
             }
             Err(_) => {
                 warn!("GET /current-cook: timed out after action");
@@ -537,6 +558,7 @@ where
                 self.server_online = true;
                 self.server_fail_count = 0;
                 self.latest_status = Some(status);
+                self.sync_status_ui_state();
             }
             Ok(None) => {
                 warn!("GET /status: failed after action");
@@ -545,5 +567,24 @@ where
                 warn!("GET /status: timed out after action");
             }
         }
+    }
+
+    fn sync_status_ui_state(&mut self) {
+        if !matches!(self.ui_state, UIState::ShowIdle | UIState::ShowCook) {
+            return;
+        }
+
+        let active_cook = is_active_cook(
+            self.current_cook.is_some(),
+            self.latest_status
+                .as_ref()
+                .map(|status| status.mode.as_str()),
+        );
+
+        self.ui_state = if active_cook {
+            UIState::ShowCook
+        } else {
+            UIState::ShowIdle
+        };
     }
 }

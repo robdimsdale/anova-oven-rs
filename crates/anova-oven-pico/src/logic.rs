@@ -13,6 +13,10 @@ pub fn should_dim_backlight(
         && !active_cook
 }
 
+pub fn celcius_to_fahrenheit(c: f32) -> f32 {
+    c * 1.8 + 32.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::{is_active_cook, should_dim_backlight};

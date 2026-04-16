@@ -2,7 +2,10 @@ use hd44780_driver::non_blocking::{Cursor, CursorBlink, Display, DisplayMode, HD
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use embassy_rp::gpio::Output;
 use embassy_time::{Delay, Duration, Instant};
+
+use crate::logic::celcius_to_fahrenheit;
 
 const LCD_WIDTH: usize = 16;
 const SCROLL_STEP_MS: u64 = 350;
@@ -11,13 +14,20 @@ const END_PAUSE_MS: u64 = 1200;
 // Minimum time to display a slot whose content fits on-screen without scrolling.
 const MIN_SLOT_HOLD_MS: u64 = 3000;
 
-pub(crate) struct LcdController<B, M, C>
-where
-    B: hd44780_driver::non_blocking::bus::DataBus,
-    M: hd44780_driver::memory_map::DisplayMemoryMap,
-    C: hd44780_driver::charset::CharsetWithFallback,
-{
-    lcd: HD44780<B, M, C>,
+type LcdBus = hd44780_driver::non_blocking::bus::FourBitBus<
+    Output<'static>,
+    Output<'static>,
+    Output<'static>,
+    Output<'static>,
+    Output<'static>,
+    Output<'static>,
+>;
+type LcdMemoryMap = hd44780_driver::memory_map::MemoryMap1602;
+type LcdCharset = hd44780_driver::charset::EmptyFallback<hd44780_driver::charset::CharsetUniversal>;
+type LcdDriver = HD44780<LcdBus, LcdMemoryMap, LcdCharset>;
+
+pub(crate) struct LcdController {
+    lcd: LcdDriver,
     delay: Delay,
     row0_scroll_state: Option<RowScrollState>,
     row1_scroll_state: Option<RowScrollState>,
@@ -35,13 +45,8 @@ struct RowScrollState {
     cycle_complete: bool,
 }
 
-impl<B, M, C> LcdController<B, M, C>
-where
-    B: hd44780_driver::non_blocking::bus::DataBus,
-    M: hd44780_driver::memory_map::DisplayMemoryMap,
-    C: hd44780_driver::charset::CharsetWithFallback,
-{
-    pub(crate) fn new(lcd: HD44780<B, M, C>, delay: Delay) -> Self {
+impl LcdController {
+    pub(crate) fn new(lcd: LcdDriver, delay: Delay) -> Self {
         Self {
             lcd,
             delay,
@@ -384,8 +389,4 @@ where
             &mut self.row1_last_rendered
         }
     }
-}
-
-pub fn celcius_to_fahrenheit(c: f32) -> f32 {
-    c * 1.8 + 32.0
 }

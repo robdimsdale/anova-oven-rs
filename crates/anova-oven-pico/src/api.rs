@@ -5,7 +5,7 @@ use reqwless::client::HttpClient;
 use reqwless::headers::ContentType;
 use reqwless::request::{Method, RequestBuilder};
 
-use crate::display::celcius_to_fahrenheit;
+use crate::logic::celcius_to_fahrenheit;
 use crate::SERVER_URL;
 
 fn normalize_server_url(url: &str) -> alloc::string::String {
