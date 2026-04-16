@@ -5,11 +5,12 @@ use alloc::vec::Vec;
 use embassy_rp::gpio::Output;
 use embassy_time::{Delay, Duration, Instant};
 
+use crate::display::ViewSpec;
+
 const LCD_WIDTH: usize = 16;
 const SCROLL_STEP_MS: u64 = 350;
 const CHAR_SCROLL_COUNT: usize = 3;
 const END_PAUSE_MS: u64 = 1200;
-// Minimum time to display a slot whose content fits on-screen without scrolling.
 const MIN_SLOT_HOLD_MS: u64 = 3000;
 
 type LcdBus = hd44780_driver::non_blocking::bus::FourBitBus<
@@ -76,54 +77,72 @@ impl LcdController {
     /// long text: after completing one full scroll AND the end-pause has elapsed;
     /// short text: after MIN_SLOT_HOLD_MS has elapsed.
     fn row1_animation_done(&self) -> bool {
-        self.row1_scroll_state.as_ref().map_or(false, |s| {
-            s.cycle_complete && Instant::now() >= s.pause_until
+        self.row1_scroll_state.as_ref().map_or(false, |state| {
+            state.cycle_complete && Instant::now() >= state.pause_until
         })
     }
 
-    pub(crate) async fn render_wifi_init(&mut self) {
-        self.write_row(0, "Anova Oven", 0).await;
-        self.write_row(1, "Init: WIFI...", 0).await;
+    pub(crate) async fn render(&mut self, view: &ViewSpec) {
+        match view {
+            ViewSpec::WifiInit => {
+                self.write_row(0, "Anova Oven").await;
+                self.write_row(1, "Init: WIFI...").await;
+            }
+            ViewSpec::DhcpInit => {
+                self.write_row(0, "Anova Oven").await;
+                self.write_row(1, "Init: DHCP...").await;
+            }
+            ViewSpec::Connecting => {
+                self.write_row(0, "Anova Oven").await;
+                self.write_row(1, "Connecting...").await;
+            }
+            ViewSpec::ServerOffline => {
+                self.write_row(0, "Server Offline").await;
+                self.write_row(1, "Check backend").await;
+            }
+            ViewSpec::Status { status, cook } => {
+                self.render_status_display(status.as_ref(), cook.as_ref())
+                    .await;
+            }
+            ViewSpec::RecipeBrowser { recipes, index } => {
+                self.render_recipe_browser(recipes, *index).await;
+            }
+            ViewSpec::StopConfirmation { status, cook } => {
+                self.render_stop_confirmation(status.as_ref(), cook.as_ref())
+                    .await;
+            }
+            ViewSpec::StartingCook { recipe_title } => {
+                self.write_row(0, recipe_title).await;
+                self.write_row(1, "Starting...").await;
+            }
+        }
     }
 
-    pub(crate) async fn render_dhcp_init(&mut self) {
-        self.write_row(0, "Anova Oven", 0).await;
-        self.write_row(1, "Init: DHCP...", 0).await;
-    }
-
-    pub(crate) async fn render_server_offline(&mut self, tick: u64) {
-        self.write_row(0, "Server Offline", tick).await;
-        self.write_row(1, "Check backend", tick).await;
-    }
-
-    pub(crate) async fn render_status_display(
+    async fn render_status_display(
         &mut self,
-        tick: u64,
         status: Option<&anova_oven_api::OvenStatus>,
         current_cook: Option<&anova_oven_api::CurrentCook>,
     ) {
         let Some(status) = status else {
-            self.write_row(0, "", tick).await;
-            self.write_row(1, "Status: N/A", tick).await;
+            self.write_row(0, "").await;
+            self.write_row(1, "Status: N/A").await;
             return;
         };
 
         let is_cooking = current_cook.is_some() || status.is_cooking();
 
         if let Some(cook) = current_cook {
-            let name = cook.display_name();
-            self.write_row(0, name, tick).await;
+            self.write_row(0, cook.display_name()).await;
 
             let current_stage = cook.current_stage(status);
             let phase = status.phase();
-            let stage_title = current_stage.and_then(|s| s.title.as_deref());
+            let stage_title = current_stage.and_then(|stage| stage.title.as_deref());
             let show_phase = stage_title.is_some_and(|title| !title.eq_ignore_ascii_case(phase));
             let has_timer_or_probe =
                 status.timer_remaining_secs().is_some() || status.probe_temperature_c.is_some();
 
             let num_items: u64 = 2 + u64::from(show_phase) + u64::from(has_timer_or_probe);
 
-            // Advance slot only after the current slot's animation is done.
             if self.row1_animation_done() {
                 let current = self.row1_slot.unwrap_or(0);
                 let next = (current + 1) % num_items;
@@ -139,12 +158,10 @@ impl LcdController {
             if slot == slot_idx {
                 let row1 = match stage_title {
                     Some(title) => alloc::format!("Stage: {title}"),
-                    None if cook.recipe_title == "[manual]" => {
-                        alloc::string::String::from("Manual stage")
-                    }
+                    None if cook.recipe_title == "[manual]" => String::from("Manual stage"),
                     None => alloc::format!("Stage: {phase}"),
                 };
-                self.write_row(1, &row1, tick).await;
+                self.write_row(1, &row1).await;
             }
             slot_idx += 1;
 
@@ -155,14 +172,14 @@ impl LcdController {
                     let target_f = celcius_to_fahrenheit(target_c);
                     row1.push_str(&alloc::format!(">{:.0}F", target_f));
                 }
-                self.write_row(1, &row1, tick).await;
+                self.write_row(1, &row1).await;
             }
             slot_idx += 1;
 
             if show_phase {
                 if slot == slot_idx {
                     let row1 = alloc::format!("Phase: {phase}");
-                    self.write_row(1, &row1, tick).await;
+                    self.write_row(1, &row1).await;
                 }
                 slot_idx += 1;
             }
@@ -177,26 +194,26 @@ impl LcdController {
                     } else {
                         alloc::format!("Timer: {m:02}:{s:02}")
                     };
-                    self.write_row(1, &row1, tick).await;
+                    self.write_row(1, &row1).await;
                 } else if let Some(probe_c) = status.probe_temperature_c {
                     let probe_f = celcius_to_fahrenheit(probe_c);
                     let mut row1 = alloc::format!("P:{:.0}F", probe_f);
-                    if let Some(target_c) = current_stage.and_then(|st| st.probe_target_c) {
+                    if let Some(target_c) = current_stage.and_then(|stage| stage.probe_target_c) {
                         let target_f = celcius_to_fahrenheit(target_c);
                         row1.push_str(&alloc::format!(">{:.0}F", target_f));
                     }
-                    self.write_row(1, &row1, tick).await;
+                    self.write_row(1, &row1).await;
                 }
             }
         } else if is_cooking {
-            self.write_row(0, "Manual cook", tick).await;
+            self.write_row(0, "Manual cook").await;
 
             let row1 = if let Some(steam) = status.steam_target_pct {
                 alloc::format!("{} S:{:.0}%", status.phase(), steam)
             } else {
-                alloc::string::String::from(status.phase())
+                String::from(status.phase())
             };
-            self.write_row(1, &row1, tick).await;
+            self.write_row(1, &row1).await;
         } else {
             // Row 0 is rendered via direct LCD byte writes below (for degree glyph),
             // so invalidate cached state to keep transition redraws correct.
@@ -228,45 +245,39 @@ impl LcdController {
             } else {
                 status.mode.clone()
             };
-            self.write_row(1, &row1, tick).await;
+            self.write_row(1, &row1).await;
         }
     }
 
-    pub(crate) async fn render_recipe_browser(
-        &mut self,
-        recipes: &[anova_oven_api::Recipe],
-        index: usize,
-        tick: u64,
-    ) {
+    async fn render_recipe_browser(&mut self, recipes: &[anova_oven_api::Recipe], index: usize) {
         if recipes.is_empty() {
-            self.write_row(0, "No recipes", tick).await;
-            self.write_row(1, "", tick).await;
+            self.write_row(0, "No recipes").await;
+            self.write_row(1, "").await;
             return;
         }
 
         let header = alloc::format!("Recipe {}/{}", index + 1, recipes.len());
-        self.write_row(0, &header, tick).await;
-        self.write_row(1, &recipes[index].title, tick).await;
+        self.write_row(0, &header).await;
+        self.write_row(1, &recipes[index].title).await;
     }
 
-    pub(crate) async fn render_stop_confirmation(
+    async fn render_stop_confirmation(
         &mut self,
-        tick: u64,
         status: Option<&anova_oven_api::OvenStatus>,
         current_cook: Option<&anova_oven_api::CurrentCook>,
     ) {
         if let Some(cook) = current_cook {
-            self.write_row(0, cook.display_name(), tick).await;
+            self.write_row(0, cook.display_name()).await;
         } else if let Some(status) = status {
-            self.write_row(0, status.phase(), tick).await;
+            self.write_row(0, status.phase()).await;
         } else {
-            self.write_row(0, "Active cook", tick).await;
+            self.write_row(0, "Active cook").await;
         }
 
-        self.write_row(1, "Stop cooking?", tick).await;
+        self.write_row(1, "Stop cooking?").await;
     }
 
-    async fn write_row(&mut self, row: u8, text: &str, _tick: u64) {
+    async fn write_row(&mut self, row: u8, text: &str) {
         let now = Instant::now();
         let row_state = self.row_scroll_state_mut(row);
 
@@ -356,15 +367,12 @@ impl LcdController {
                 changed = true;
                 if state.offset >= overflow {
                     state.offset = overflow;
-                    // Pause at the right edge before wrapping to the start.
                     state.pause_until = now + Duration::from_millis(END_PAUSE_MS);
-                    // Signal done; slot advancement waits for pause_until to elapse.
                     state.cycle_complete = true;
                 }
             } else {
                 state.offset = 0;
                 changed = true;
-                // Keep the existing pause at the left edge after wrapping.
                 state.pause_until = now + Duration::from_millis(END_PAUSE_MS);
             }
         }

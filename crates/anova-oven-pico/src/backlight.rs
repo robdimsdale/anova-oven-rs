@@ -1,6 +1,8 @@
 use defmt::debug;
 use embassy_rp::pwm::{Config as PwmConfig, Pwm};
 
+use crate::state::BacklightPolicy;
+
 const DEFAULT_FULL_LEVEL: u8 = 255;
 const DEFAULT_DIM_LEVEL: u8 = 64;
 
@@ -66,6 +68,18 @@ impl BacklightController {
             debug!("Backlight already dimmed, no action required");
         }
         self.set_gray(self.dim_level);
+    }
+
+    pub(crate) fn apply(&mut self, policy: BacklightPolicy) {
+        match policy {
+            BacklightPolicy::Full => self.set_full(),
+            BacklightPolicy::Dim => self.set_dim(),
+            // The dim timeout is managed by the Idle state handler; this just applies
+            // entry intent immediately and keeps hardware control side-effect free.
+            BacklightPolicy::FullThenDimAfter(_) => {
+                self.set_full();
+            }
+        }
     }
 
     fn set_gray(&mut self, level: u8) {
