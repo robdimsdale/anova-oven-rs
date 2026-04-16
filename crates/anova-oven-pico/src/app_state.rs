@@ -17,6 +17,19 @@ const SERVER_RETRY_LOG_INTERVAL: u64 = 5;
 const API_CALL_TIMEOUT_SECS: u64 = 3;
 const POST_ACTION_COOK_REFRESH_DELAY_SECS: u64 = 1;
 
+// Polling backoff. Without this, repeated failed connections pile up sockets
+// in smoltcp and packets in cyw43's tiny rx channel (4 buffers, hardcoded in
+// cyw43 0.7.0). Slowing the poll cadence as failures accumulate gives those
+// queues time to drain, which is what actually unsticks things — the cyw43
+// driver itself can't be safely re-initialized at runtime.
+pub(crate) const NORMAL_POLL_INTERVAL_SECS: u64 = 1;
+const POLL_BACKOFF_TIER1_FAILS: u64 = 5;
+const POLL_BACKOFF_TIER2_FAILS: u64 = 10;
+const POLL_BACKOFF_TIER3_FAILS: u64 = 15;
+const POLL_BACKOFF_TIER1_SECS: u64 = 5;
+const POLL_BACKOFF_TIER2_SECS: u64 = 15;
+const POLL_BACKOFF_TIER3_SECS: u64 = 30;
+
 enum PendingApiAction {
     Stop,
     Start { recipe_id: alloc::string::String },
@@ -126,6 +139,15 @@ where
         }
 
         self.reconcile_current_cook_recipe_title();
+    }
+
+    pub(crate) fn next_poll_interval_secs(&self) -> u64 {
+        match self.server_fail_count {
+            n if n >= POLL_BACKOFF_TIER3_FAILS => POLL_BACKOFF_TIER3_SECS,
+            n if n >= POLL_BACKOFF_TIER2_FAILS => POLL_BACKOFF_TIER2_SECS,
+            n if n >= POLL_BACKOFF_TIER1_FAILS => POLL_BACKOFF_TIER1_SECS,
+            _ => NORMAL_POLL_INTERVAL_SECS,
+        }
     }
 
     pub(crate) fn update_inactivity_timeout(&mut self) {
