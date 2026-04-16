@@ -46,13 +46,20 @@ const DEFAULT_CURRENT_COOK_TIMEOUT_SECS: u64 = 4;
 const DEFAULT_CURRENT_COOK_RESOLUTION_TIMEOUT_SECS: u64 = 1;
 const DEFAULT_CURRENT_COOK_REFRESH_INTERVAL_SECS: u64 = 60;
 const DEFAULT_RECIPES_REFRESH_INTERVAL_SECS: u64 = 3600;
+const DEFAULT_RECIPES_REFRESH_TIMEOUT_SECS: u64 = 15;
 const DEFAULT_HISTORY_REFRESH_INTERVAL_SECS: u64 = 3600;
+const DEFAULT_HISTORY_REFRESH_TIMEOUT_SECS: u64 = 15;
+const DEFAULT_HISTORY_ON_TRANSITION_MAX_WAIT_SECS: u64 = 10;
+const DEFAULT_HISTORY_ON_TRANSITION_POLL_INTERVAL_SECS: u64 = 2;
 
 // ─── Shared application state ─────────────────────────────────────────────────
 
 enum WsCommand {
     Stop,
-    Start(Vec<anova_oven_api::Stage>),
+    Start {
+        recipe_id: String,
+        stages: Vec<anova_oven_api::Stage>,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -118,6 +125,8 @@ struct AppState {
     current_cook_refresh_interval: Duration,
     recipes_refresh_interval: Duration,
     history_refresh_interval: Duration,
+    history_on_transition_max_wait: Duration,
+    history_on_transition_poll_interval: Duration,
 }
 
 // ─── Entry point ──────────────────────────────────────────────────────────────
@@ -142,8 +151,11 @@ fn env_duration_secs(var: &str, default_secs: u64) -> Duration {
 }
 
 fn init_tracing() -> WorkerGuard {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("anova_oven_server=info,anova_oven_server::ws=debug"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new(
+            "anova_oven_server=info,anova_oven_server::ws=debug,anova_oven_server::firestore=debug",
+        )
+    });
 
     let (non_blocking, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
         .lossy(true)
@@ -229,17 +241,23 @@ async fn main() {
             "ANOVA_HISTORY_REFRESH_INTERVAL_SECS",
             DEFAULT_HISTORY_REFRESH_INTERVAL_SECS,
         ),
+        history_on_transition_max_wait: env_duration_secs(
+            "ANOVA_HISTORY_ON_TRANSITION_MAX_WAIT_SECS",
+            DEFAULT_HISTORY_ON_TRANSITION_MAX_WAIT_SECS,
+        ),
+        history_on_transition_poll_interval: env_duration_secs(
+            "ANOVA_HISTORY_ON_TRANSITION_POLL_INTERVAL_SECS",
+            DEFAULT_HISTORY_ON_TRANSITION_POLL_INTERVAL_SECS,
+        ),
     });
 
-    match tokio::time::timeout(Duration::from_secs(15), refresh_recipes_cache(&state)).await {
-        Ok(Ok(recipes)) => info!(count = recipes.len(), "[recipes] preloaded"),
-        Ok(Err(e)) => warn!(error = %e, "[recipes] startup preload failed"),
-        Err(_) => warn!("[recipes] startup preload timed out after 15s"),
+    match refresh_recipes_cache_with_timeout(&state).await {
+        Ok(recipes) => info!(count = recipes.len(), "[recipes] preloaded"),
+        Err(e) => warn!(error = %e, "[recipes] startup preload failed"),
     }
-    match tokio::time::timeout(Duration::from_secs(15), refresh_history_cache(&state)).await {
-        Ok(Ok(entries)) => info!(count = entries.len(), "[history] preloaded"),
-        Ok(Err(e)) => warn!(error = %e, "[history] startup preload failed"),
-        Err(_) => warn!("[history] startup preload timed out after 15s"),
+    match refresh_history_cache_with_timeout(&state).await {
+        Ok(entries) => info!(count = entries.len(), "[history] preloaded"),
+        Err(e) => warn!(error = %e, "[history] startup preload failed"),
     }
 
     // Spawn WebSocket background task.
@@ -299,9 +317,8 @@ fn stop_command_json(cooker_id: &str) -> String {
     .to_string()
 }
 
-fn start_command_json(cooker_id: &str, stages: &[anova_oven_api::Stage]) -> String {
+fn start_command_json(cooker_id: &str, cook_id: &str, stages: &[anova_oven_api::Stage]) -> String {
     let request_id = Uuid::new_v4();
-    let cook_id = format!("server-{}", Uuid::new_v4());
 
     // Convert recipe stages to WebSocket stage format
     let ws_stages: Vec<serde_json::Value> = stages
@@ -541,18 +558,24 @@ async fn ws_connect_and_run(
                             None => warn!("[ws] stop requested before cooker id known"),
                         }
                     }
-                    Some(WsCommand::Start(stages)) => {
+                    Some(WsCommand::Start { recipe_id, stages }) => {
                         let cooker_id = state.cooker_id.lock().await.clone();
                         match cooker_id {
                             Some(id) => {
-                                let cmd_json = start_command_json(&id, &stages);
-                                info!(cooker_id = %id, "[ws] sending CMD_APO_START");
+                                let cook_id = format!("server-{}", Uuid::new_v4());
+                                let cmd_json = start_command_json(&id, &cook_id, &stages);
+                                info!(cooker_id = %id, cook_id = %cook_id, "[ws] sending CMD_APO_START");
                                 trace!(command_json = %cmd_json, "[ws] start payload");
                                 sink.send(Message::text(cmd_json)).await?;
                                 request_current_cook_refresh(
                                     &state.current_cook_refresh_tx,
                                     CurrentCookRefreshReason::StartCommandAccepted,
                                 );
+                                tokio::spawn(set_cook_recipe_ref_with_retry(
+                                    state.clone(),
+                                    cook_id,
+                                    recipe_id,
+                                ));
                             }
                             None => warn!("[ws] start requested before cooker id known"),
                         }
@@ -678,19 +701,20 @@ async fn history_refresh_task(
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                match tokio::time::timeout(Duration::from_secs(15), refresh_history_cache(&state)).await {
-                    Ok(Ok(entries)) => info!(count = entries.len(), "[history] periodic refresh"),
-                    Ok(Err(e)) => warn!(error = %e, "[history] periodic refresh failed"),
-                    Err(_) => warn!("[history] periodic refresh timed out after 15s"),
+                match refresh_history_cache_with_timeout(&state).await {
+                    Ok(entries) => info!(count = entries.len(), "[history] periodic refresh"),
+                    Err(e) => warn!(error = %e, "[history] periodic refresh failed"),
                 }
             }
             reason = refresh_rx.recv() => {
                 match reason {
                     Some(reason) => {
-                        match tokio::time::timeout(Duration::from_secs(15), refresh_history_cache(&state)).await {
-                            Ok(Ok(entries)) => info!(reason = reason.as_str(), count = entries.len(), "[history] refreshed"),
-                            Ok(Err(e)) => warn!(reason = reason.as_str(), error = %e, "[history] refresh failed"),
-                            Err(_) => warn!(reason = reason.as_str(), "[history] refresh timed out after 15s"),
+                        let refresh_result =
+                            refresh_history_until_new_entry_after_transition(&state, reason).await;
+
+                        match refresh_result {
+                            Ok(entries) => info!(reason = reason.as_str(), count = entries.len(), "[history] refreshed"),
+                            Err(e) => warn!(reason = reason.as_str(), error = %e, "[history] refresh failed"),
                         }
                     }
                     None => {
@@ -703,6 +727,104 @@ async fn history_refresh_task(
     }
 }
 
+fn history_head_signature(entries: &[anova_oven_api::HistoryEntry]) -> Option<String> {
+    entries.first().map(|entry| {
+        format!(
+            "{}|{}|{}",
+            entry.ended_at, entry.recipe_title, entry.stage_count
+        )
+    })
+}
+
+async fn refresh_history_cache_with_timeout(
+    state: &AppState,
+) -> Result<Vec<anova_oven_api::HistoryEntry>, String> {
+    match tokio::time::timeout(
+        Duration::from_secs(DEFAULT_HISTORY_REFRESH_TIMEOUT_SECS),
+        refresh_history_cache(state),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "History refresh timed out after {}s",
+            DEFAULT_HISTORY_REFRESH_TIMEOUT_SECS
+        )),
+    }
+}
+
+async fn refresh_history_until_new_entry_after_transition(
+    state: &AppState,
+    reason: HistoryRefreshReason,
+) -> Result<Vec<anova_oven_api::HistoryEntry>, String> {
+    let baseline_head = {
+        let cache = state.history.lock().await;
+        cache
+            .as_ref()
+            .and_then(|history| history_head_signature(history.as_slice()))
+    };
+
+    let poll_interval = if state.history_on_transition_poll_interval.is_zero() {
+        Duration::from_secs(1)
+    } else {
+        state.history_on_transition_poll_interval
+    };
+    let deadline = tokio::time::Instant::now() + state.history_on_transition_max_wait;
+
+    let mut attempts: u32 = 0;
+    let mut last_entries: Option<Vec<anova_oven_api::HistoryEntry>> = None;
+    let mut last_error: Option<String> = None;
+
+    loop {
+        attempts += 1;
+
+        match refresh_history_cache_with_timeout(state).await {
+            Ok(entries) => {
+                let refreshed_head = history_head_signature(entries.as_slice());
+                let changed = baseline_head != refreshed_head;
+                let should_accept = baseline_head.is_none() || changed;
+
+                if should_accept {
+                    info!(
+                        attempts,
+                        reason = reason.as_str(),
+                        baseline_head = ?baseline_head,
+                        refreshed_head = ?refreshed_head,
+                        "[history] transition refresh observed updated history"
+                    );
+                    return Ok(entries);
+                }
+
+                last_entries = Some(entries);
+            }
+            Err(e) => {
+                last_error = Some(e);
+            }
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            if let Some(entries) = last_entries {
+                info!(
+                    attempts,
+                    reason = reason.as_str(),
+                    "[history] transition refresh window elapsed without new head entry"
+                );
+                return Ok(entries);
+            }
+
+            let error = last_error.unwrap_or_else(|| {
+                format!(
+                    "History refresh did not succeed before transition wait elapsed ({})",
+                    reason.as_str()
+                )
+            });
+            return Err(error);
+        }
+
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
 async fn recipes_refresh_task(state: Arc<AppState>) {
     let mut interval = tokio::time::interval(state.recipes_refresh_interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -710,10 +832,9 @@ async fn recipes_refresh_task(state: Arc<AppState>) {
 
     loop {
         interval.tick().await;
-        match tokio::time::timeout(Duration::from_secs(15), refresh_recipes_cache(&state)).await {
-            Ok(Ok(recipes)) => info!(count = recipes.len(), "[recipes] periodic refresh"),
-            Ok(Err(e)) => warn!(error = %e, "[recipes] periodic refresh failed"),
-            Err(_) => warn!("[recipes] periodic refresh timed out after 15s"),
+        match refresh_recipes_cache_with_timeout(&state).await {
+            Ok(recipes) => info!(count = recipes.len(), "[recipes] periodic refresh"),
+            Err(e) => warn!(error = %e, "[recipes] periodic refresh failed"),
         }
     }
 }
@@ -898,7 +1019,14 @@ async fn handle_start(
         }
     };
 
-    match state.cmd_tx.send(WsCommand::Start(recipe.stages)).await {
+    match state
+        .cmd_tx
+        .send(WsCommand::Start {
+            recipe_id: recipe.id,
+            stages: recipe.stages,
+        })
+        .await
+    {
         Ok(()) => {
             info!("[http] POST /start -> NO_CONTENT");
             empty_response(StatusCode::NO_CONTENT)
@@ -1048,6 +1176,23 @@ async fn refresh_recipes_cache(state: &AppState) -> Result<Vec<anova_oven_api::R
     Ok(recipes)
 }
 
+async fn refresh_recipes_cache_with_timeout(
+    state: &AppState,
+) -> Result<Vec<anova_oven_api::Recipe>, String> {
+    match tokio::time::timeout(
+        Duration::from_secs(DEFAULT_RECIPES_REFRESH_TIMEOUT_SECS),
+        refresh_recipes_cache(state),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "Recipes refresh timed out after {}s",
+            DEFAULT_RECIPES_REFRESH_TIMEOUT_SECS
+        )),
+    }
+}
+
 async fn refresh_history_cache(
     state: &AppState,
 ) -> Result<Vec<anova_oven_api::HistoryEntry>, String> {
@@ -1069,6 +1214,72 @@ async fn refresh_history_cache(
         }
         Err(e) => Err(e),
     }
+}
+
+/// Best-effort background task: after a `CMD_APO_START` is sent, set
+/// `recipeRef` on the `users/{uid}/oven-cooks/{cook_id}` Firestore document so
+/// that phones recognize the cook as a specific recipe. Anova's cloud creates
+/// the document asynchronously from the WebSocket command, so we retry a few
+/// times with a short delay to win the race without blocking `/start`.
+async fn set_cook_recipe_ref_with_retry(state: Arc<AppState>, cook_id: String, recipe_id: String) {
+    const ATTEMPTS: u32 = 4;
+    const INITIAL_DELAY_MS: u64 = 500;
+    const RETRY_DELAY_MS: u64 = 750;
+
+    tokio::time::sleep(Duration::from_millis(INITIAL_DELAY_MS)).await;
+
+    for attempt in 1..=ATTEMPTS {
+        let session = state.session.lock().await.clone();
+        let result =
+            match firestore::patch_cook_recipe_ref(&state.http, &session, &cook_id, &recipe_id)
+                .await
+            {
+                Ok(()) => Ok(()),
+                Err(err) => match maybe_refresh_session(&state, err).await {
+                    Ok(fresh) => {
+                        firestore::patch_cook_recipe_ref(&state.http, &fresh, &cook_id, &recipe_id)
+                            .await
+                            .map_err(|e| e.to_string())
+                    }
+                    Err(e) => Err(e),
+                },
+            };
+
+        match result {
+            Ok(()) => {
+                info!(
+                    cook_id = %cook_id,
+                    recipe_id = %recipe_id,
+                    attempt,
+                    "[current-cook] recipeRef patched"
+                );
+                request_current_cook_refresh(
+                    &state.current_cook_refresh_tx,
+                    CurrentCookRefreshReason::StartCommandAccepted,
+                );
+                return;
+            }
+            Err(e) => {
+                warn!(
+                    cook_id = %cook_id,
+                    recipe_id = %recipe_id,
+                    attempt,
+                    error = %e,
+                    "[current-cook] recipeRef patch attempt failed"
+                );
+            }
+        }
+
+        if attempt < ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
+        }
+    }
+
+    warn!(
+        cook_id = %cook_id,
+        recipe_id = %recipe_id,
+        "[current-cook] recipeRef patch gave up after all retries"
+    );
 }
 
 async fn fetch_current_cook_from_firebase(
