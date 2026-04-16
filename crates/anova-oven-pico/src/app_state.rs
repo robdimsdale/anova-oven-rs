@@ -179,7 +179,6 @@ impl AppState {
         let now = Instant::now();
 
         self.last_input_at = Some(now);
-        self.baseline_reentered_at = None;
 
         debug!("Setting backlight to full: (input activity)");
         self.backlight_controller.set_full();
@@ -200,10 +199,9 @@ impl AppState {
             },
             UIState::ShowIdle => match event {
                 InputEvent::EncoderCW => {
-                    if self.recipes.is_empty() {
-                        return;
+                    if !self.recipes.is_empty() {
+                        self.ui_state = UIState::BrowseRecipes { index: 0 };
                     }
-                    self.ui_state = UIState::BrowseRecipes { index: 0 };
                 }
                 InputEvent::EncoderCCW => {
                     // No-op while at the top-level idle status view.
@@ -254,6 +252,8 @@ impl AppState {
                 }
             },
         }
+
+        self.update_baseline_timer_for_current_view(now);
     }
 
     pub(crate) async fn poll_status_if_due(&mut self, stack: embassy_net::Stack<'static>) {
@@ -440,7 +440,7 @@ impl AppState {
         );
         let baseline_elapsed_secs = self.baseline_reentered_at.map(|t| t.elapsed().as_secs());
         let should_dim = should_dim_backlight(
-            matches!(self.ui_state, UIState::ShowIdle | UIState::ShowCook),
+            self.is_status_view(),
             baseline_elapsed_secs,
             active_cook,
             LED_DIM_TIMER_SECS,
@@ -449,10 +449,22 @@ impl AppState {
         if should_dim {
             self.backlight_controller.set_dim();
             debug!("Setting backlight to dim: (idle baseline)");
-        } else if active_cook || !matches!(self.ui_state, UIState::ShowIdle | UIState::ShowCook) {
+        } else if active_cook || !self.is_status_view() {
             debug!("Setting backlight to full: (active state)");
             self.backlight_controller.set_full();
         }
+    }
+
+    fn update_baseline_timer_for_current_view(&mut self, now: Instant) {
+        self.baseline_reentered_at = if self.is_status_view() {
+            Some(now)
+        } else {
+            None
+        };
+    }
+
+    fn is_status_view(&self) -> bool {
+        matches!(self.ui_state, UIState::ShowIdle | UIState::ShowCook)
     }
 
     fn reconcile_current_cook_recipe_title(&mut self) {
