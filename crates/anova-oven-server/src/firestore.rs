@@ -460,7 +460,7 @@ fn parse_recipe_doc(doc: Document) -> anova_oven_api::Recipe {
                 .map(|t| t == "stage")
                 .unwrap_or(false)
         })
-        .map(|s| stage_from_json(s))
+        .map(stage_from_json)
         .collect();
     let stage_count = stages.len();
 
@@ -1134,8 +1134,7 @@ pub async fn fetch_current_cook(
             .cloned()
             .unwrap_or_default();
 
-        let stages: Vec<anova_oven_api::Stage> =
-            raw_stages.iter().map(|s| stage_from_json(s)).collect();
+        let stages: Vec<anova_oven_api::Stage> = raw_stages.iter().map(stage_from_json).collect();
 
         let cook_stage_count = stages.iter().filter(|s| s.kind == "cook").count();
         let total_stage_count = stages.len();
@@ -1200,6 +1199,12 @@ pub async fn patch_cook_recipe_ref(
 
 /// Convert a raw Firestore stage JSON object into [`anova_oven_api::Stage`].
 fn stage_from_json(s: &JsonValue) -> anova_oven_api::Stage {
+    let id = s
+        .get("id")
+        .and_then(|v| v.as_str())
+        .filter(|t| !t.is_empty())
+        .map(String::from);
+
     let kind = s
         .get("type")
         .and_then(|v| v.as_str())
@@ -1291,6 +1296,7 @@ fn stage_from_json(s: &JsonValue) -> anova_oven_api::Stage {
         .map(String::from);
 
     anova_oven_api::Stage {
+        id,
         kind,
         temperature_c,
         temperature_bulbs_mode,

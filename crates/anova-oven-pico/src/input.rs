@@ -1,11 +1,11 @@
-use defmt::info;
+use defmt::{info, warn};
 use embassy_executor::{SpawnError, Spawner};
 use embassy_rp::gpio::Input as GpioInput;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Timer};
 
-pub type InputChannel = Channel<CriticalSectionRawMutex, InputEvent, 4>;
+pub type InputChannel = Channel<CriticalSectionRawMutex, InputEvent, 16>;
 
 #[derive(Clone, Copy, defmt::Format)]
 pub enum InputEvent {
@@ -44,7 +44,9 @@ pub async fn rot_enc_button_task(
     loop {
         button.wait_for_falling_edge().await;
         info!("Rotary encoder button pressed");
-        channel.send(InputEvent::EncoderButton).await;
+        if channel.try_send(InputEvent::EncoderButton).is_err() {
+            warn!("Input channel full; dropping encoder button event");
+        }
 
         Timer::after(Duration::from_millis(500)).await;
     }
@@ -82,11 +84,15 @@ pub async fn rotary_encoder_task(
 
         if accum >= TRANSITIONS_PER_DETENT {
             info!("Rotary encoder: CW");
-            channel.send(InputEvent::EncoderCW).await;
+            if channel.try_send(InputEvent::EncoderCW).is_err() {
+                warn!("Input channel full; dropping encoder CW event");
+            }
             accum = 0;
         } else if accum <= -TRANSITIONS_PER_DETENT {
             info!("Rotary encoder: CCW");
-            channel.send(InputEvent::EncoderCCW).await;
+            if channel.try_send(InputEvent::EncoderCCW).is_err() {
+                warn!("Input channel full; dropping encoder CCW event");
+            }
             accum = 0;
         }
     }
