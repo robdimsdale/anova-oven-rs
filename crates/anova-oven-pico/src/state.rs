@@ -277,8 +277,9 @@ async fn execute_browse(mut index: usize, ctx: &mut Ctx<'_>) -> AppState {
 
         index = index.min(snap.recipes.len() - 1);
         ctx.display.render(ViewSpec::RecipeBrowser {
-            recipes: snap.recipes.clone(),
+            count: snap.recipes.len(),
             index,
+            title: snap.recipes[index].title.clone(),
         });
 
         match select3(ctx.input.recv(), ctx.api_changed(), Timer::at(deadline)).await {

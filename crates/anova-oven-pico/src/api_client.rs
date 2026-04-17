@@ -9,6 +9,7 @@ use embassy_sync::channel::Channel;
 use embassy_sync::watch::{Receiver, Sender, Watch};
 use embassy_time::{with_timeout, Duration, Instant, Timer};
 use heapless::Vec as HeaplessVec;
+use portable_atomic_util::Arc;
 
 use crate::api::{fetch_current_cook, fetch_recipes, fetch_status, send_start, send_stop};
 
@@ -43,13 +44,25 @@ pub enum ApiCommand {
     Stop,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ApiSnapshot {
     pub status: Option<anova_oven_api::OvenStatus>,
     pub current_cook: Option<anova_oven_api::CurrentCook>,
-    pub recipes: Vec<anova_oven_api::Recipe>,
+    pub recipes: Arc<Vec<anova_oven_api::Recipe>>,
     pub fail_count: u64,
     pub last_success_at: Option<Instant>,
+}
+
+impl Default for ApiSnapshot {
+    fn default() -> Self {
+        Self {
+            status: None,
+            current_cook: None,
+            recipes: Arc::new(Vec::new()),
+            fail_count: 0,
+            last_success_at: None,
+        }
+    }
 }
 
 impl ApiSnapshot {
@@ -426,16 +439,17 @@ impl<'a> ApiRuntime<'a> {
     }
 
     async fn handle_poll_recipes(&mut self) {
-        self.snapshot.recipes = match with_timeout(
+        match with_timeout(
             Duration::from_secs(API_CALL_TIMEOUT_SECS),
             fetch_recipes(self.stack),
         )
         .await
         {
-            Ok(recipes) => recipes,
+            Ok(recipes) => {
+                self.snapshot.recipes = Arc::new(recipes);
+            }
             Err(_) => {
                 warn!("GET /recipes: timed out");
-                core::mem::take(&mut self.snapshot.recipes)
             }
         };
 
