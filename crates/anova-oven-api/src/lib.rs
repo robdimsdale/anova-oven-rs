@@ -83,6 +83,49 @@ pub struct OvenStatus {
     pub door_open: bool,
     /// Whether the water tank is empty.
     pub water_tank_empty: bool,
+
+    /// Zero-based index of the stage the oven currently considers active, as
+    /// reported by `state.cook.activeStageIndex`. Authoritative source for
+    /// "which stage is the oven on right now"; prefer this over heuristic
+    /// inference from mode/timer/target.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_stage_index: Option<usize>,
+    /// Stage id the oven currently considers active, as reported by
+    /// `state.cook.activeStageId`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_stage_id: Option<String>,
+
+    /// Server-derived cook progression (present only while cooking).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cook_progress: Option<CookProgress>,
+}
+
+/// Server-derived cook progression, included in `GET /status` while a cook is
+/// active.
+///
+/// Kept separate from [`CurrentCook`] so clients (the pico in particular) can
+/// poll `/status` at 1 Hz without re-deserializing static stage configuration
+/// each tick.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CookProgress {
+    /// Human-readable recipe name (mirrors [`CurrentCook::recipe_title`]).
+    pub recipe_title: String,
+    /// Zero-based index of the currently-running stage within
+    /// [`CurrentCook::stages`].
+    pub current_stage_index: usize,
+    /// Total number of stages in the cook.
+    pub total_stage_count: usize,
+    /// Short description of the current stage (title or derived summary).
+    pub current_stage_description: String,
+    /// Current stage kind: `"preheat"` or `"cook"`.
+    pub current_stage_kind: String,
+    /// `true` when the current stage is complete and the next stage requires
+    /// explicit user action. Clients should show a "start next stage" prompt.
+    pub next_stage_ready: bool,
+    /// Short description of the next stage (present only when
+    /// [`next_stage_ready`] is `true`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_stage_description: Option<String>,
 }
 
 impl OvenStatus {
@@ -153,6 +196,11 @@ pub struct Recipe {
 /// A single cook stage within a recipe.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Stage {
+    /// Firestore stage document ID (e.g. `android-<uuid>`). Used as the
+    /// `stageId` in `CMD_APO_START_STAGE`. Optional to tolerate older
+    /// fixtures / hand-built stages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     /// Stage type: `"preheat"` or `"cook"`.
     pub kind: String,
     /// Target temperature in Celsius.
@@ -226,6 +274,48 @@ impl Stage {
         }
     }
 
+    /// Short human-readable description, suitable for a narrow (≤ 16 char
+    /// after scrolling) LCD second row. Used when prompting the user to start
+    /// the next stage.
+    ///
+    /// Rules (first match wins):
+    /// 1. Non-empty [`title`] → use as-is.
+    /// 2. Otherwise build from kind + temperature + steam + probe + duration.
+    /// 3. Fall back to `"Next stage"` when nothing useful is available.
+    pub fn short_description(&self) -> String {
+        if let Some(title) = self.title.as_deref() {
+            if !title.is_empty() {
+                return title.into();
+            }
+        }
+
+        let mut parts: alloc::vec::Vec<String> = alloc::vec::Vec::new();
+        if self.kind == "preheat" {
+            parts.push("Preheat".into());
+        }
+        if self.temperature_c > 0.0 {
+            parts.push(alloc::format!("{:.0}\u{B0}", self.temperature_c));
+        }
+        if self.steam_pct > 0.0 {
+            parts.push(alloc::format!("{:.0}% steam", self.steam_pct));
+        }
+        if let Some(target) = self.probe_target_c {
+            parts.push(alloc::format!("probe {:.0}\u{B0}", target));
+        }
+        if let Some(secs) = self.duration_secs {
+            if secs > 0 {
+                let minutes = (secs + 30) / 60;
+                parts.push(alloc::format!("{minutes}m"));
+            }
+        }
+
+        if parts.is_empty() {
+            "Next stage".into()
+        } else {
+            parts.join(" \u{B7} ")
+        }
+    }
+
     /// Normalize fan speed for Anova compatibility.
     ///
     /// The Anova requires fan speed to be 100% when:
@@ -295,6 +385,11 @@ impl CurrentCook {
     }
 
     /// Find the stage matching the oven's current phase.
+    ///
+    /// This heuristic is broken for multi-stage cooks where multiple stages
+    /// share the same [`Stage::kind`]. Prefer reading
+    /// [`OvenStatus::cook_progress`] (`current_stage_index`) when available.
+    #[deprecated(note = "use OvenStatus::cook_progress.current_stage_index instead")]
     pub fn current_stage(&self, status: &OvenStatus) -> Option<&Stage> {
         let kind = status.stage_kind();
         self.stages.iter().find(|s| s.kind == kind)
@@ -340,6 +435,9 @@ mod tests {
             vent_open: false,
             door_open: false,
             water_tank_empty: false,
+            active_stage_index: None,
+            active_stage_id: None,
+            cook_progress: None,
         };
         let json = serde_json::to_string(&status).unwrap();
         let parsed: OvenStatus = serde_json::from_str(&json).unwrap();
@@ -360,6 +458,7 @@ mod tests {
             stage_count: 2,
             stages: vec![
                 Stage {
+                    id: None,
                     kind: "preheat".into(),
                     temperature_c: 220.0,
                     temperature_bulbs_mode: Some("dry".into()),
@@ -378,6 +477,7 @@ mod tests {
                     title: None,
                 },
                 Stage {
+                    id: None,
                     kind: "cook".into(),
                     temperature_c: 190.0,
                     temperature_bulbs_mode: Some("dry".into()),

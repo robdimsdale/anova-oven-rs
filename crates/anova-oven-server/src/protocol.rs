@@ -27,19 +27,18 @@ pub fn parse_message(data: &[u8]) -> Result<Event, serde_json::Error> {
                 status: msg.payload.status,
             })
         }
-        _ => Ok(Event::Unknown {
-            command: envelope.command,
-        }),
+        _ => Ok(Event::Unknown),
     }
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum Event {
     ApoState(ApoStatePayload),
     ApoWifiList { cooker_id: Option<String> },
     UserState,
     Response { request_id: String, status: String },
-    Unknown { command: String },
+    Unknown,
 }
 
 // --- Wire format types ---
@@ -71,6 +70,7 @@ struct ResponsePayload {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApoStatePayload {
+    #[allow(dead_code)]
     pub cooker_id: String,
     pub state: OvenState,
 }
@@ -80,6 +80,16 @@ pub struct ApoStatePayload {
 pub struct OvenState {
     pub nodes: Nodes,
     pub state: StateInfo,
+    /// Present when the oven is mid-cook. Carries the authoritative active
+    /// stage index/id so the server doesn't need to infer them heuristically.
+    pub cook: Option<Cook>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Cook {
+    pub active_stage_index: Option<usize>,
+    pub active_stage_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -225,6 +235,10 @@ pub fn to_oven_status(payload: &ApoStatePayload) -> anova_oven_api::OvenStatus {
         .filter(|p| p.connected)
         .and_then(|p| p.current.as_ref())
         .map(|t| t.celsius as f32);
+    let (active_stage_index, active_stage_id) = match &payload.state.cook {
+        Some(cook) => (cook.active_stage_index, cook.active_stage_id.clone()),
+        None => (None, None),
+    };
     anova_oven_api::OvenStatus {
         mode: payload.state.state.mode.clone(),
         temperature_unit: payload.state.state.temperature_unit.clone(),
@@ -265,5 +279,8 @@ pub fn to_oven_status(payload: &ApoStatePayload) -> anova_oven_api::OvenStatus {
         vent_open: nodes.vent.open,
         door_open: !nodes.door.closed,
         water_tank_empty: nodes.water_tank.empty,
+        active_stage_index,
+        active_stage_id,
+        cook_progress: None,
     }
 }

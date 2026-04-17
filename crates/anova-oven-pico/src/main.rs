@@ -69,6 +69,20 @@ async fn cyw43_task(
 }
 
 #[embassy_executor::task]
+async fn heap_monitor_task() -> ! {
+    let mut peak_used = 0usize;
+    loop {
+        let used = HEAP.used();
+        let free = HEAP.free();
+        if used > peak_used {
+            peak_used = used;
+        }
+        info!("heap: used={} free={} peak_used={}", used, free, peak_used);
+        Timer::after(Duration::from_secs(60)).await;
+    }
+}
+
+#[embassy_executor::task]
 async fn net_task(mut runner: embassy_net::Runner<'static, cyw43::NetDriver<'static>>) -> ! {
     runner.run().await
 }
@@ -84,6 +98,8 @@ async fn main(spawner: Spawner) {
     unsafe {
         HEAP.init(HEAP_MEM.as_ptr() as usize, HEAP_SIZE);
     }
+
+    spawner.spawn(heap_monitor_task().unwrap());
 
     let p = embassy_rp::init(Default::default());
 
@@ -146,11 +162,11 @@ async fn main(spawner: Spawner) {
 
     control.init(CLM).await;
     control
-        .set_power_management(cyw43::PowerManagementMode::PowerSave)
+        .set_power_management(cyw43::PowerManagementMode::None)
         .await;
 
     let config = Config::dhcpv4(Default::default());
-    static RESOURCES: StaticCell<StackResources<8>> = StaticCell::new();
+    static RESOURCES: StaticCell<StackResources<16>> = StaticCell::new();
     let seed: u64 = 0x0123_4567_89ab_cdef;
     let (stack, runner) = embassy_net::new(
         net_device,

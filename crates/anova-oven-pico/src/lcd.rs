@@ -119,6 +119,15 @@ impl LcdController {
                 self.write_row(0, recipe_title).await;
                 self.write_row(1, "Starting...").await;
             }
+            ViewSpec::NextStagePrompt { recipe_title } => {
+                let row0 = if recipe_title.is_empty() {
+                    "Active cook"
+                } else {
+                    recipe_title.as_str()
+                };
+                self.write_row(0, row0).await;
+                self.write_row(1, "Next stage ready").await;
+            }
         }
     }
 
@@ -138,6 +147,7 @@ impl LcdController {
         if let Some(cook) = current_cook {
             self.write_row(0, cook.display_name()).await;
 
+            #[allow(deprecated)]
             let current_stage = cook.current_stage(status);
             let phase = status.phase();
             let stage_title = current_stage.and_then(|stage| stage.title.as_deref());
