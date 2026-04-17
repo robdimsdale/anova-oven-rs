@@ -57,6 +57,9 @@
   cyw43-pio = { version = "0.10.0", features = ["defmt"] }
 
   portable-atomic = { version = "1", features = ["critical-section"] }
+  portable-atomic-util = { version = "0.2", default-features = false, features = [
+    "alloc",
+  ] }
   cortex-m = "0.7"
   cortex-m-rt = "0.7"
   defmt = "1.0"

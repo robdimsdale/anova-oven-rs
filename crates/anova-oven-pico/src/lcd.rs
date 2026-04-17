@@ -104,8 +104,12 @@ impl LcdController {
                 self.render_status_display(status.as_ref(), cook.as_ref())
                     .await;
             }
-            ViewSpec::RecipeBrowser { recipes, index } => {
-                self.render_recipe_browser(recipes, *index).await;
+            ViewSpec::RecipeBrowser {
+                count,
+                index,
+                title,
+            } => {
+                self.render_recipe_browser(*count, *index, title).await;
             }
             ViewSpec::StopConfirmation { status, cook } => {
                 self.render_stop_confirmation(status.as_ref(), cook.as_ref())
@@ -249,16 +253,16 @@ impl LcdController {
         }
     }
 
-    async fn render_recipe_browser(&mut self, recipes: &[anova_oven_api::Recipe], index: usize) {
-        if recipes.is_empty() {
+    async fn render_recipe_browser(&mut self, count: usize, index: usize, title: &str) {
+        if count == 0 {
             self.write_row(0, "No recipes").await;
             self.write_row(1, "").await;
             return;
         }
 
-        let header = alloc::format!("Recipe {}/{}", index + 1, recipes.len());
+        let header = alloc::format!("Recipe {}/{}", index + 1, count);
         self.write_row(0, &header).await;
-        self.write_row(1, &recipes[index].title).await;
+        self.write_row(1, title).await;
     }
 
     async fn render_stop_confirmation(

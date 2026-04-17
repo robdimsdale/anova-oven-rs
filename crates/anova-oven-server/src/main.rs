@@ -317,14 +317,25 @@ fn stop_command_json(cooker_id: &str) -> String {
     .to_string()
 }
 
-fn start_command_json(cooker_id: &str, cook_id: &str, stages: &[anova_oven_api::Stage]) -> String {
+/// Build the `CMD_APO_START` payload. Returns the JSON string and the
+/// generated ID of the first stage (needed to issue a follow-up
+/// `CMD_APO_START_STAGE` so the oven actually begins cooking).
+fn start_command_json(
+    cooker_id: &str,
+    cook_id: &str,
+    stages: &[anova_oven_api::Stage],
+) -> (String, Option<String>) {
     let request_id = Uuid::new_v4();
+    let mut first_stage_id: Option<String> = None;
 
     // Convert recipe stages to WebSocket stage format
     let ws_stages: Vec<serde_json::Value> = stages
         .iter()
         .map(|stage| {
             let stage_id = format!("stage-{}", Uuid::new_v4());
+            if first_stage_id.is_none() {
+                first_stage_id = Some(stage_id.clone());
+            }
 
             // Apply sensible defaults for fan speed (Anova requires fan to run)
             let fan_speed = if stage.fan_speed == 0 {
@@ -358,7 +369,6 @@ fn start_command_json(cooker_id: &str, cook_id: &str, stages: &[anova_oven_api::
                 "title": stage.title.as_deref().unwrap_or(""),
                 "type": stage.kind.as_str(),
                 "userActionRequired": stage.user_action_required.unwrap_or(false),
-                "stageTransitionType": "automatic",
                 "temperatureBulbs": temperature_bulbs,
                 "heatingElements": {
                     "top": { "on": stage.heating_element_top.unwrap_or(true) },
@@ -396,7 +406,7 @@ fn start_command_json(cooker_id: &str, cook_id: &str, stages: &[anova_oven_api::
         })
         .collect();
 
-    serde_json::json!({
+    let json = serde_json::json!({
         "command": "CMD_APO_START",
         "payload": {
             "type": "CMD_APO_START",
@@ -404,6 +414,24 @@ fn start_command_json(cooker_id: &str, cook_id: &str, stages: &[anova_oven_api::
             "payload": {
                 "cookId": cook_id,
                 "stages": ws_stages
+            }
+        },
+        "requestId": request_id
+    })
+    .to_string();
+
+    (json, first_stage_id)
+}
+
+fn start_stage_command_json(cooker_id: &str, stage_id: &str) -> String {
+    let request_id = Uuid::new_v4();
+    serde_json::json!({
+        "command": "CMD_APO_START_STAGE",
+        "payload": {
+            "type": "CMD_APO_START_STAGE",
+            "id": cooker_id,
+            "payload": {
+                "stageId": stage_id,
             }
         },
         "requestId": request_id
@@ -563,10 +591,20 @@ async fn ws_connect_and_run(
                         match cooker_id {
                             Some(id) => {
                                 let cook_id = format!("server-{}", Uuid::new_v4());
-                                let cmd_json = start_command_json(&id, &cook_id, &stages);
+                                let (cmd_json, first_stage_id) =
+                                    start_command_json(&id, &cook_id, &stages);
                                 info!(cooker_id = %id, cook_id = %cook_id, "[ws] sending CMD_APO_START");
                                 trace!(command_json = %cmd_json, "[ws] start payload");
                                 sink.send(Message::text(cmd_json)).await?;
+
+                                // CMD_APO_START queues the cook but doesn't begin the first
+                                // stage; the phone app issues CMD_APO_START_STAGE to start it.
+                                if let Some(stage_id) = first_stage_id {
+                                    let stage_cmd = start_stage_command_json(&id, &stage_id);
+                                    info!(stage_id = %stage_id, "[ws] sending CMD_APO_START_STAGE");
+                                    trace!(command_json = %stage_cmd, "[ws] start-stage payload");
+                                    sink.send(Message::text(stage_cmd)).await?;
+                                }
                                 request_current_cook_refresh(
                                     &state.current_cook_refresh_tx,
                                     CurrentCookRefreshReason::StartCommandAccepted,

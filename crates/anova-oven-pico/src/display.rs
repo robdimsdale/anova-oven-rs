@@ -1,5 +1,4 @@
 use alloc::string::String;
-use alloc::vec::Vec;
 
 use embassy_executor::{SpawnError, Spawner};
 use embassy_futures::select::{select, Either};
@@ -26,8 +25,9 @@ pub enum ViewSpec {
         cook: Option<anova_oven_api::CurrentCook>,
     },
     RecipeBrowser {
-        recipes: Vec<anova_oven_api::Recipe>,
+        count: usize,
         index: usize,
+        title: String,
     },
     StopConfirmation {
         status: Option<anova_oven_api::OvenStatus>,
