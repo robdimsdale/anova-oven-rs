@@ -7,7 +7,12 @@ use reqwless::request::{Method, RequestBuilder};
 
 use crate::SERVER_URL;
 
-static mut HTTP_RX_BUF: [u8; 16384] = [0u8; 16384];
+// cyw43's SPI/DMA layer requires 4-byte aligned buffers (asserts addr % 4 == 0).
+// [u8; N] only guarantees 1-byte alignment, so we use a repr(align(4)) wrapper.
+#[repr(align(4))]
+struct Aligned<const N: usize>([u8; N]);
+
+static mut HTTP_RX_BUF: Aligned<16384> = Aligned([0u8; 16384]);
 
 fn normalize_server_url(url: &str) -> alloc::string::String {
     let trimmed = url.trim_end_matches('/');
@@ -22,7 +27,7 @@ pub async fn fetch_status(
     stack: embassy_net::Stack<'static>,
 ) -> Option<anova_oven_api::OvenStatus> {
     #[allow(static_mut_refs)]
-    let rx_buf = unsafe { &mut HTTP_RX_BUF };
+    let rx_buf = unsafe { &mut HTTP_RX_BUF.0 };
 
     let client_state = TcpClientState::<1, 1024, 1024>::new();
     let tcp = TcpClient::new(stack, &client_state);
@@ -89,7 +94,7 @@ pub async fn fetch_current_cook(
     stack: embassy_net::Stack<'static>,
 ) -> Option<anova_oven_api::CurrentCook> {
     #[allow(static_mut_refs)]
-    let rx_buf = unsafe { &mut HTTP_RX_BUF };
+    let rx_buf = unsafe { &mut HTTP_RX_BUF.0 };
 
     let client_state = TcpClientState::<1, 1024, 1024>::new();
     let tcp = TcpClient::new(stack, &client_state);
@@ -148,7 +153,7 @@ pub async fn fetch_current_cook(
 
 pub async fn send_stop(stack: embassy_net::Stack<'static>) {
     #[allow(static_mut_refs)]
-    let rx_buf = unsafe { &mut HTTP_RX_BUF };
+    let rx_buf = unsafe { &mut HTTP_RX_BUF.0 };
 
     let client_state = TcpClientState::<1, 1024, 1024>::new();
     let tcp = TcpClient::new(stack, &client_state);
@@ -182,7 +187,7 @@ pub async fn send_stop(stack: embassy_net::Stack<'static>) {
 
 pub async fn send_start(stack: embassy_net::Stack<'static>, recipe_id: &str) {
     #[allow(static_mut_refs)]
-    let rx_buf = unsafe { &mut HTTP_RX_BUF };
+    let rx_buf = unsafe { &mut HTTP_RX_BUF.0 };
 
     let client_state = TcpClientState::<1, 1024, 1024>::new();
     let tcp = TcpClient::new(stack, &client_state);
@@ -224,7 +229,7 @@ pub async fn fetch_recipes(
     stack: embassy_net::Stack<'static>,
 ) -> alloc::vec::Vec<anova_oven_api::Recipe> {
     #[allow(static_mut_refs)]
-    let rx_buf = unsafe { &mut HTTP_RX_BUF };
+    let rx_buf = unsafe { &mut HTTP_RX_BUF.0 };
 
     let client_state = TcpClientState::<1, 4096, 4096>::new();
     let tcp = TcpClient::new(stack, &client_state);

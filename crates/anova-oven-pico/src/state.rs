@@ -33,6 +33,9 @@ pub enum AppState {
     StopPending {
         since: Instant,
     },
+    AwaitNextStage {
+        next_description: String,
+    },
 }
 
 impl Default for AppState {
@@ -79,6 +82,9 @@ impl AppState {
             } => execute_start_pending(recipe_title, recipe_id, since, ctx).await,
             AppState::ConfirmStop => execute_confirm_stop(ctx).await,
             AppState::StopPending { since } => execute_stop_pending(since, ctx).await,
+            AppState::AwaitNextStage { next_description } => {
+                execute_await_next_stage(next_description, ctx).await
+            }
         }
     }
 
@@ -91,7 +97,8 @@ impl AppState {
             | AppState::BrowseRecipes { .. }
             | AppState::StartPending { .. }
             | AppState::ConfirmStop
-            | AppState::StopPending { .. } => BacklightPolicy::Full,
+            | AppState::StopPending { .. }
+            | AppState::AwaitNextStage { .. } => BacklightPolicy::Full,
         }
     }
 
@@ -168,10 +175,17 @@ async fn execute_offline(ctx: &mut Ctx<'_>) -> AppState {
     ctx.display.render(ViewSpec::ServerOffline);
 
     loop {
-        ctx.api_changed().await;
-        let snap = ctx.api.snapshot();
-        if !snap.is_offline() {
-            return baseline_state_for(&snap);
+        match select(ctx.input.recv(), ctx.api_changed()).await {
+            Either::First(_) => {
+                // Keep draining local input while offline so encoder bursts do not
+                // fill the queue during network outages.
+            }
+            Either::Second(()) => {
+                let snap = ctx.api.snapshot();
+                if !snap.is_offline() {
+                    return baseline_state_for(&snap);
+                }
+            }
         }
     }
 }
@@ -228,6 +242,31 @@ async fn execute_idle(ctx: &mut Ctx<'_>) -> AppState {
     }
 }
 
+fn next_stage_prompt(snap: &ApiSnapshot) -> Option<String> {
+    let progress = snap.status.as_ref()?.cook_progress.as_ref()?;
+    if !progress.next_stage_ready {
+        return None;
+    }
+    Some(
+        progress
+            .next_stage_description
+            .clone()
+            .unwrap_or_else(|| String::from("Next stage")),
+    )
+}
+
+fn active_recipe_title(snap: &ApiSnapshot) -> String {
+    if let Some(cook) = snap.current_cook.as_ref() {
+        return String::from(cook.display_name());
+    }
+    if let Some(progress) = snap.status.as_ref().and_then(|s| s.cook_progress.as_ref()) {
+        if !progress.recipe_title.is_empty() && progress.recipe_title != "[manual]" {
+            return progress.recipe_title.clone();
+        }
+    }
+    String::from("Active cook")
+}
+
 async fn execute_cooking(
     mut optimistic_recipe_title: Option<String>,
     ctx: &mut Ctx<'_>,
@@ -241,6 +280,11 @@ async fn execute_cooking(
         if !snap.is_cooking() {
             return AppState::Idle;
         }
+        if let Some(description) = next_stage_prompt(&snap) {
+            return AppState::AwaitNextStage {
+                next_description: description,
+            };
+        }
 
         if snap.current_cook.is_some() {
             optimistic_recipe_title = None;
@@ -248,6 +292,36 @@ async fn execute_cooking(
 
         ctx.display
             .render(cooking_view(&snap, optimistic_recipe_title.as_deref()));
+
+        match select(ctx.input.recv(), ctx.api_changed()).await {
+            Either::First(InputEvent::EncoderCCW) => return AppState::ConfirmStop,
+            Either::First(_) => {}
+            Either::Second(()) => {}
+        }
+    }
+}
+
+async fn execute_await_next_stage(_next_description: String, ctx: &mut Ctx<'_>) -> AppState {
+    loop {
+        let snap = ctx.api.snapshot();
+
+        if snap.is_offline() {
+            return AppState::Offline;
+        }
+        if !snap.is_cooking() {
+            return AppState::Idle;
+        }
+        // Server cleared next_stage_ready (e.g. another client advanced the
+        // cook, or the flag was transient) — fall back to the cooking view.
+        if next_stage_prompt(&snap).is_none() {
+            return AppState::Cooking {
+                optimistic_recipe_title: None,
+            };
+        }
+
+        ctx.display.render(ViewSpec::NextStagePrompt {
+            recipe_title: active_recipe_title(&snap),
+        });
 
         match select(ctx.input.recv(), ctx.api_changed()).await {
             Either::First(InputEvent::EncoderCCW) => return AppState::ConfirmStop,
@@ -322,8 +396,9 @@ async fn execute_start_pending(
     let deadline = since + Duration::from_secs(START_STOP_CONFIRM_TIMEOUT_SECS);
 
     loop {
-        match select(ctx.api_changed(), Timer::at(deadline)).await {
-            Either::First(()) => {
+        match select3(ctx.input.recv(), ctx.api_changed(), Timer::at(deadline)).await {
+            Either3::First(_) => {}
+            Either3::Second(()) => {
                 let snap = ctx.api.snapshot();
                 if snap.is_offline() {
                     return AppState::Offline;
@@ -334,7 +409,7 @@ async fn execute_start_pending(
                     };
                 }
             }
-            Either::Second(()) => {
+            Either3::Third(()) => {
                 warn!("StartPending timed out without cook confirmation");
                 return AppState::Idle;
             }
@@ -390,8 +465,9 @@ async fn execute_stop_pending(since: Instant, ctx: &mut Ctx<'_>) -> AppState {
     let deadline = since + Duration::from_secs(START_STOP_CONFIRM_TIMEOUT_SECS);
 
     loop {
-        match select(ctx.api_changed(), Timer::at(deadline)).await {
-            Either::First(()) => {
+        match select3(ctx.input.recv(), ctx.api_changed(), Timer::at(deadline)).await {
+            Either3::First(_) => {}
+            Either3::Second(()) => {
                 let snap = ctx.api.snapshot();
                 if snap.is_offline() {
                     return AppState::Offline;
@@ -400,7 +476,7 @@ async fn execute_stop_pending(since: Instant, ctx: &mut Ctx<'_>) -> AppState {
                     return AppState::Idle;
                 }
             }
-            Either::Second(()) => {
+            Either3::Third(()) => {
                 warn!("StopPending timed out without idle confirmation");
                 return AppState::Cooking {
                     optimistic_recipe_title: None,

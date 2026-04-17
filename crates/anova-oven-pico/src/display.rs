@@ -36,6 +36,9 @@ pub enum ViewSpec {
     StartingCook {
         recipe_title: String,
     },
+    NextStagePrompt {
+        recipe_title: String,
+    },
 }
 
 impl<'a> Display<'a> {
