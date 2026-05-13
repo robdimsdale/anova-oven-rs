@@ -39,6 +39,11 @@ pub enum ViewSpec {
     NextStagePrompt {
         recipe_title: String,
     },
+    Recovery {
+        reset_count: u32,
+        panic_count: u32,
+        message: Option<String>,
+    },
 }
 
 impl<'a> Display<'a> {

@@ -9,6 +9,7 @@ mod backlight;
 mod display;
 mod input;
 mod lcd;
+mod persist;
 mod state;
 
 use embedded_alloc::LlffHeap as Heap;
@@ -18,22 +19,23 @@ static HEAP: Heap = Heap::empty();
 
 use cyw43_pio::PioSpi;
 use defmt::{info, warn};
+use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_net::{Config, StackResources};
 use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::{Input as GpioInput, Level, Output, Pull};
 use embassy_rp::peripherals::{DMA_CH0, PIO0};
 use embassy_rp::pio::Pio;
+use embassy_rp::watchdog::Watchdog;
 use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
 use embassy_sync::watch::Watch;
-use embassy_time::{Delay, Duration, Timer};
+use embassy_time::{Delay, Duration, Instant, Timer};
 use hd44780_driver::{
     bus::FourBitBusPins, memory_map::MemoryMap1602, non_blocking::HD44780,
     setup::DisplayOptions4Bit,
 };
 use static_cell::StaticCell;
-use {defmt_rtt as _, panic_probe as _};
 
 use crate::api_client::{ApiClient, CommandChannel, StateWatch};
 use crate::backlight::BacklightController;
@@ -45,6 +47,11 @@ use crate::state::{AppState, Ctx};
 const WIFI_SSID: &str = env!("ANOVA_WIFI_SSID");
 const WIFI_PASSWORD: &str = env!("ANOVA_WIFI_PASSWORD");
 pub(crate) const SERVER_URL: &str = env!("ANOVA_SERVER_URL");
+
+const WATCHDOG_TIMEOUT_SECS: u64 = 8;
+const WATCHDOG_FEED_INTERVAL_SECS: u64 = 2;
+const RECOVERY_DISPLAY_SECS: u64 = 30;
+const RECOVERY_RENDER_TICK_MS: u64 = 50;
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO0>;
@@ -68,6 +75,7 @@ async fn cyw43_task(
     runner.run().await
 }
 
+#[cfg(feature = "verbose-logs")]
 #[embassy_executor::task]
 async fn heap_monitor_task() -> ! {
     let mut peak_used = 0usize;
@@ -87,6 +95,14 @@ async fn net_task(mut runner: embassy_net::Runner<'static, cyw43::NetDriver<'sta
     runner.run().await
 }
 
+#[embassy_executor::task]
+async fn watchdog_feeder_task(mut watchdog: Watchdog) -> ! {
+    loop {
+        watchdog.feed(Duration::from_secs(WATCHDOG_TIMEOUT_SECS));
+        Timer::after(Duration::from_secs(WATCHDOG_FEED_INTERVAL_SECS)).await;
+    }
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     use core::mem::MaybeUninit;
@@ -99,7 +115,13 @@ async fn main(spawner: Spawner) {
         HEAP.init(HEAP_MEM.as_ptr() as usize, HEAP_SIZE);
     }
 
-    spawner.spawn(heap_monitor_task().unwrap());
+    // Read persisted reset/panic counters and any stored panic message.
+    // This bumps reset_count so subsequent boots can tell if the previous
+    // run ended cleanly or not. Must run after the allocator is up because
+    // the snapshot owns a heapless::String backed by stack memory only, but
+    // before peripheral init so we record the boot regardless of what comes
+    // next.
+    let recovery = persist::init_at_boot();
 
     let p = embassy_rp::init(Default::default());
 
@@ -123,7 +145,35 @@ async fn main(spawner: Spawner) {
 
     let mut lcd_controller = LcdController::new(lcd, lcd_delay);
     lcd_controller.configure().await;
+
+    if recovery.had_prior_failure() {
+        warn!(
+            "Recovered from prior failure: panic_count={} reset_count={} msg_len={}",
+            recovery.panic_count,
+            recovery.reset_count,
+            recovery.message.as_deref().map(|s| s.len()).unwrap_or(0),
+        );
+        if let Some(msg) = recovery.message.as_deref() {
+            warn!("Prior panic message: {}", msg);
+        }
+        show_recovery_view(&mut lcd_controller, &recovery).await;
+    }
+
+    // Start the hardware watchdog only after the recovery display window
+    // has expired so a human has time to read it. The feeder task fires
+    // every WATCHDOG_FEED_INTERVAL_SECS and the timeout is set to
+    // WATCHDOG_TIMEOUT_SECS, giving a comfortable margin under normal load
+    // while still catching freezes within seconds.
+    let mut watchdog = Watchdog::new(p.WATCHDOG);
+    watchdog.enable_tick_generation(12); // clk_ref is 12 MHz
+    watchdog.pause_on_debug(true);
+    watchdog.start(Duration::from_secs(WATCHDOG_TIMEOUT_SECS));
+    spawner.spawn(watchdog_feeder_task(watchdog).unwrap());
+
     let display = Display::new(lcd_controller, &DISPLAY_NOTIFIER, spawner).unwrap();
+
+    #[cfg(feature = "verbose-logs")]
+    spawner.spawn(heap_monitor_task().unwrap());
 
     let backlight_controller =
         BacklightController::new(p.PWM_SLICE3, p.PIN_6, p.PIN_7, p.PWM_SLICE4, p.PIN_8);
@@ -191,7 +241,7 @@ async fn main(spawner: Spawner) {
                 break;
             }
             Err(err) => {
-                warn!("WiFi join failed: {}", err);
+                warn!("WiFi join failed: {}", defmt::Debug2Format(&err));
                 Timer::after(Duration::from_secs(1)).await;
             }
         }
@@ -205,7 +255,7 @@ async fn main(spawner: Spawner) {
     }
     info!("Network is up");
     if let Some(config) = stack.config_v4() {
-        info!("IP address: {}", config.address);
+        info!("IP address: {}", defmt::Display2Format(&config.address));
     }
 
     let api = ApiClient::new(stack, &API_COMMANDS, &API_STATE, spawner).unwrap();
@@ -223,5 +273,18 @@ async fn main(spawner: Spawner) {
 
     loop {
         state = state.execute(&mut ctx).await;
+    }
+}
+
+async fn show_recovery_view(lcd: &mut LcdController, recovery: &persist::Snapshot) {
+    let view = ViewSpec::Recovery {
+        reset_count: recovery.reset_count,
+        panic_count: recovery.panic_count,
+        message: recovery.message.as_deref().map(alloc::string::String::from),
+    };
+    let deadline = Instant::now() + Duration::from_secs(RECOVERY_DISPLAY_SECS);
+    while Instant::now() < deadline {
+        lcd.render(&view).await;
+        Timer::after(Duration::from_millis(RECOVERY_RENDER_TICK_MS)).await;
     }
 }

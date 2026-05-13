@@ -128,6 +128,26 @@ impl LcdController {
                 self.write_row(0, row0).await;
                 self.write_row(1, "Next stage ready").await;
             }
+            ViewSpec::Recovery {
+                reset_count,
+                panic_count,
+                message,
+            } => {
+                self.render_recovery(*reset_count, *panic_count, message.as_deref())
+                    .await;
+            }
+        }
+    }
+
+    async fn render_recovery(&mut self, reset_count: u32, panic_count: u32, message: Option<&str>) {
+        use core::fmt::Write as _;
+        let mut row0: heapless::String<32> = heapless::String::new();
+        let label = if panic_count > 0 { "Panic" } else { "Reset" };
+        let _ = write!(row0, "{label} p={panic_count} r={reset_count}");
+        self.write_row(0, row0.as_str()).await;
+        match message {
+            Some(msg) if !msg.is_empty() => self.write_row(1, msg).await,
+            _ => self.write_row(1, "no msg").await,
         }
     }
 
