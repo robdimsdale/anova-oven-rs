@@ -44,7 +44,10 @@ pub async fn fetch_status(
     let mut request = match client.request(Method::GET, &url).await {
         Ok(r) => r,
         Err(e) => {
-            warn!("GET /status: connection failed: {:?}", e);
+            warn!(
+                "GET /status: connection failed: {}",
+                defmt::Debug2Format(&e)
+            );
             return None;
         }
     };
@@ -52,7 +55,7 @@ pub async fn fetch_status(
     let response = match request.send(rx_buf).await {
         Ok(r) => r,
         Err(e) => {
-            warn!("GET /status: send failed: {:?}", e);
+            warn!("GET /status: send failed: {}", defmt::Debug2Format(&e));
             return None;
         }
     };
@@ -137,6 +140,7 @@ pub async fn fetch_current_cook(
 
     match serde_json::from_slice::<anova_oven_api::CurrentCook>(body) {
         Ok(cook) => {
+            #[cfg(feature = "verbose-logs")]
             info!(
                 "Current cook: {} ({} stages)",
                 cook.recipe_title.as_str(),
