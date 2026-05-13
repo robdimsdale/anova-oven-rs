@@ -99,6 +99,8 @@ async fn net_task(mut runner: embassy_net::Runner<'static, cyw43::NetDriver<'sta
 async fn watchdog_feeder_task(mut watchdog: Watchdog) -> ! {
     loop {
         watchdog.feed(Duration::from_secs(WATCHDOG_TIMEOUT_SECS));
+        persist::bump_watchdog_heartbeat();
+        persist::record_uptime_secs(Instant::now().as_secs() as u32);
         Timer::after(Duration::from_secs(WATCHDOG_FEED_INTERVAL_SECS)).await;
     }
 }
@@ -146,17 +148,40 @@ async fn main(spawner: Spawner) {
     let mut lcd_controller = LcdController::new(lcd, lcd_delay);
     lcd_controller.configure().await;
 
-    if recovery.had_prior_failure() {
+    // Log the persisted counters, breadcrumbs, and message every boot so
+    // an attached probe sees them immediately, regardless of whether
+    // this boot is doing a recovery flash.
+    info!(
+        "persist: reset_reason={} reset_count={} panic_count={} message_is_new={} msg_len={}",
+        recovery.reset_reason,
+        recovery.reset_count,
+        recovery.panic_count,
+        recovery.message_is_new,
+        recovery.message.as_deref().map(|s| s.len()).unwrap_or(0),
+    );
+    info!(
+        "persist: last_app_state={} last_uptime_secs={} api_hb={} display_hb={} watchdog_hb={}",
+        recovery.last_app_state,
+        recovery.last_uptime_secs,
+        recovery.api_heartbeat,
+        recovery.display_heartbeat,
+        recovery.watchdog_heartbeat,
+    );
+    if let Some(msg) = recovery.message.as_deref() {
+        info!("persist: last panic message: {}", msg);
+    }
+
+    // Only flash the LCD recovery view when a new panic has occurred
+    // since we last displayed one. Watchdog/external resets without a
+    // fresh panic message don't get a 30-second display — the counters
+    // are still readable via probe-rs at any time.
+    if recovery.message_is_new {
         warn!(
-            "Recovered from prior failure: panic_count={} reset_count={} msg_len={}",
-            recovery.panic_count,
-            recovery.reset_count,
-            recovery.message.as_deref().map(|s| s.len()).unwrap_or(0),
+            "New panic since last display: panic_count={} reset_count={}",
+            recovery.panic_count, recovery.reset_count,
         );
-        if let Some(msg) = recovery.message.as_deref() {
-            warn!("Prior panic message: {}", msg);
-        }
         show_recovery_view(&mut lcd_controller, &recovery).await;
+        persist::mark_displayed();
     }
 
     // Start the hardware watchdog only after the recovery display window

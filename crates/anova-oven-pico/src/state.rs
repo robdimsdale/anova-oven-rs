@@ -65,7 +65,24 @@ impl<'a> Ctx<'a> {
 }
 
 impl AppState {
+    /// Stable numeric identifier persisted across resets via the persist
+    /// region. Add new variants here when extending `AppState`; never
+    /// renumber existing ones.
+    pub fn discriminant(&self) -> u32 {
+        match self {
+            AppState::Offline => 1,
+            AppState::Idle => 2,
+            AppState::Cooking { .. } => 3,
+            AppState::BrowseRecipes { .. } => 4,
+            AppState::StartPending { .. } => 5,
+            AppState::ConfirmStop => 6,
+            AppState::StopPending { .. } => 7,
+            AppState::AwaitNextStage { .. } => 8,
+        }
+    }
+
     pub async fn execute(self, ctx: &mut Ctx<'_>) -> AppState {
+        crate::persist::record_app_state(self.discriminant());
         ctx.backlight.apply(self.backlight_policy());
 
         match self {
