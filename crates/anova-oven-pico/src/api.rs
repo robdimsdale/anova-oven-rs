@@ -277,13 +277,16 @@ pub async fn fetch_recipes(
             for recipe in &mut recipes {
                 recipe.normalize();
             }
-            info!("Recipes: {} found", recipes.len());
-            for recipe in &recipes {
-                info!(
-                    "  - {} ({} stages)",
-                    recipe.title.as_str(),
-                    recipe.stage_count
-                );
+            #[cfg(feature = "verbose-logs")]
+            {
+                info!("Recipes: {} found", recipes.len());
+                for recipe in &recipes {
+                    info!(
+                        "  - {} ({} stages)",
+                        recipe.title.as_str(),
+                        recipe.stage_count
+                    );
+                }
             }
             recipes
         }

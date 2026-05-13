@@ -493,6 +493,7 @@ async fn api_client_task(
     let mut runtime = ApiRuntime::new(stack, state.sender());
 
     loop {
+        crate::persist::bump_api_heartbeat();
         if let Some(next_due) = runtime.event_queue.next_due_at() {
             match select(Timer::at(next_due), commands.receive()).await {
                 Either::First(()) => {
