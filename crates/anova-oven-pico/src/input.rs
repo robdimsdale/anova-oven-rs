@@ -43,6 +43,7 @@ pub async fn rot_enc_button_task(
 ) -> ! {
     loop {
         button.wait_for_falling_edge().await;
+        #[cfg(feature = "verbose-logs")]
         info!("Rotary encoder button pressed");
         if channel.try_send(InputEvent::EncoderButton).is_err() {
             warn!("Input channel full; dropping encoder button event");
@@ -83,12 +84,14 @@ pub async fn rotary_encoder_task(
         accum += dir;
 
         if accum >= TRANSITIONS_PER_DETENT {
+            #[cfg(feature = "verbose-logs")]
             info!("Rotary encoder: CW");
             if channel.try_send(InputEvent::EncoderCW).is_err() {
                 warn!("Input channel full; dropping encoder CW event");
             }
             accum = 0;
         } else if accum <= -TRANSITIONS_PER_DETENT {
+            #[cfg(feature = "verbose-logs")]
             info!("Rotary encoder: CCW");
             if channel.try_send(InputEvent::EncoderCCW).is_err() {
                 warn!("Input channel full; dropping encoder CCW event");

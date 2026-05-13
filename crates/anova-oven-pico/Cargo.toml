@@ -2,12 +2,28 @@
 # and cannot share a workspace with host-target crates due to conflicting
 # critical-section features. Build from this directory:
 #   cargo build --release
+#
+# For development with verbose logging from cyw43/embassy-net/reqwless and
+# per-event INFO logs from the encoder/heap tasks, add:
+#   cargo build --release --features verbose-logs
 [workspace]
 
 [package]
   name = "anova-oven-pico"
   version = "0.1.0"
   edition = "2021"
+
+[features]
+  default = []
+  # Enables defmt on chatty third-party deps and per-event INFO logs in our
+  # own code. Off by default so the RTT buffer stays drainable when no probe
+  # is attached. Warnings and errors are always emitted unconditionally.
+  verbose-logs = [
+    "cyw43/defmt",
+    "cyw43-pio/defmt",
+    "embassy-net/defmt",
+    "reqwless/defmt",
+  ]
 
 [dependencies]
   # Main branch uses embedded-hal 1.0 but is not yet published to crates.io.
@@ -32,8 +48,7 @@
     "critical-section-impl",
     "rp2040",
   ] }
-  embassy-net = { version = "0.9.0", features = [
-    "defmt",
+  embassy-net = { version = "0.9.0", default-features = false, features = [
     "tcp",
     "dhcpv4",
     "dns",
@@ -49,12 +64,12 @@
   heapless = { version = "0.9", default-features = false }
 
   # Plain HTTP client (no TLS needed — server is on local network)
-  reqwless = { version = "0.14", default-features = false, features = [
-    "defmt",
-  ] }
+  reqwless = { version = "0.14", default-features = false }
 
-  cyw43 = { version = "0.7.0", features = ["defmt", "firmware-logs"] }
-  cyw43-pio = { version = "0.10.0", features = ["defmt"] }
+  cyw43 = { version = "0.7.0", default-features = false, features = [
+    "firmware-logs",
+  ] }
+  cyw43-pio = { version = "0.10.0", default-features = false }
 
   portable-atomic = { version = "1", features = ["critical-section"] }
   portable-atomic-util = { version = "0.2", default-features = false, features = [
@@ -63,8 +78,7 @@
   cortex-m = "0.7"
   cortex-m-rt = "0.7"
   defmt = "1.0"
-  defmt-rtt = "1.1"
-  panic-probe = { version = "1.0", features = ["print-defmt"] }
+  defmt-rtt = { version = "1.1", features = ["disable-blocking-mode"] }
   static_cell = "2"
 
 [profile.release]
