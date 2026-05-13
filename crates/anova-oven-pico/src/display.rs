@@ -76,6 +76,7 @@ async fn display_task(mut lcd: LcdController, notifier: &'static DisplayNotifier
             Either::Second(_) => {}
         }
 
+        crate::persist::bump_display_heartbeat();
         lcd.render(&current).await;
     }
 }
