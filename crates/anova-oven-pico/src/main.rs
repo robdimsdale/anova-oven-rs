@@ -101,6 +101,7 @@ async fn watchdog_feeder_task(mut watchdog: Watchdog) -> ! {
         watchdog.feed(Duration::from_secs(WATCHDOG_TIMEOUT_SECS));
         persist::bump_watchdog_heartbeat();
         persist::record_uptime_secs(Instant::now().as_secs() as u32);
+        persist::record_free_heap(HEAP.free() as u32);
         Timer::after(Duration::from_secs(WATCHDOG_FEED_INTERVAL_SECS)).await;
     }
 }
@@ -169,8 +170,14 @@ async fn main(spawner: Spawner) {
     );
     for (i, entry) in recovery.reset_history.iter().enumerate() {
         info!(
-            "persist: reset_history[{}]: reason={} uptime_secs={}",
-            i, entry.reset_reason, entry.uptime_secs,
+            "persist: reset_history[{}]: reason={} uptime_secs={} api_hb={} free_heap={} net_up={} api_fail={}",
+            i,
+            entry.reset_reason,
+            entry.uptime_secs,
+            entry.api_heartbeat,
+            entry.free_heap,
+            entry.network_up,
+            entry.api_fail_count,
         );
     }
     if let Some(msg) = recovery.message.as_deref() {
@@ -285,6 +292,7 @@ async fn main(spawner: Spawner) {
         Timer::after(Duration::from_millis(100)).await;
     }
     info!("Network is up");
+    persist::record_network_up();
     if let Some(config) = stack.config_v4() {
         info!("IP address: {}", defmt::Display2Format(&config.address));
     }
