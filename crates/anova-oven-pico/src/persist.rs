@@ -8,18 +8,31 @@
 //!
 //! Layout (`#[repr(C)]`, all fields naturally u32-aligned):
 //!
-//!   offset  0:  magic                       (u32)
-//!   offset  4:  reset_count                 (u32)
-//!   offset  8:  panic_count                 (u32)
-//!   offset 12:  last_displayed_panic_count  (u32)
-//!   offset 16:  reset_reason                (u32)  // ResetReason enum
-//!   offset 20:  last_app_state              (u32)
-//!   offset 24:  last_uptime_secs            (u32)
-//!   offset 28:  api_heartbeat               (u32)
-//!   offset 32:  display_heartbeat           (u32)
-//!   offset 36:  watchdog_heartbeat          (u32)
-//!   offset 40:  msg_len                     (u32)
-//!   offset 44:  msg_buf                     ([u8; 512])
+//!   offset   0:  magic                       (u32)
+//!   offset   4:  reset_count                 (u32)
+//!   offset   8:  panic_count                 (u32)
+//!   offset  12:  last_displayed_panic_count  (u32)
+//!   offset  16:  reset_reason                (u32)  // ResetReason enum
+//!   offset  20:  last_app_state              (u32)
+//!   offset  24:  last_uptime_secs            (u32)
+//!   offset  28:  api_heartbeat               (u32)
+//!   offset  32:  display_heartbeat           (u32)
+//!   offset  36:  watchdog_heartbeat          (u32)
+//!   offset  40:  ring_head                   (u32)  // monotonic; index = head % RING_SIZE
+//!   offset  44:  ring                        ([RingEntry; 8] = 64 bytes)
+//!   offset 108:  msg_len                     (u32)
+//!   offset 112:  msg_buf                     ([u8; 512])
+//!
+//! Each `RingEntry` is `(reset_reason: u32, uptime_secs: u32)` describing
+//! one reset that happened *before* the boot that wrote the entry. The
+//! ring stores the most recent RING_SIZE resets; older ones are
+//! overwritten. The current boot's reason lives in the standalone
+//! `reset_reason` field at offset 16 (and is also the head of the ring
+//! after `init_at_boot` runs).
+//!
+//! When this layout changes, bump `MAGIC` so old in-RAM data fails the
+//! magic check after a firmware update and we re-initialize cleanly
+//! instead of decoding stale bytes against the new field offsets.
 //!
 //! Tasks update their heartbeat fields directly via raw volatile writes
 //! (u32 writes are atomic on Cortex-M0+; no critical section needed).
@@ -36,13 +49,26 @@ use core::panic::PanicInfo;
 use cortex_m::peripheral::SCB;
 use cortex_m_rt::{exception, ExceptionFrame};
 
-const MAGIC: u32 = 0xA9B0_C1D2;
+// Bump this when changing the PersistRegion layout. Old in-RAM data
+// from before the firmware update will then fail the magic check and we
+// re-initialize cleanly instead of mis-decoding stale bytes.
+//   v1 = 0xA9B0_C1D2 — original layout, no ring buffer
+//   v2 = 0xA9B0_C1D3 — added ring_head + ring (8 entries)
+const MAGIC: u32 = 0xA9B0_C1D3;
 const MSG_BUF_SIZE: usize = 512;
+const RING_SIZE: usize = 8;
 
 /// RP2040 WATCHDOG.REASON register. Bit 0 = TIMER (timed out), bit 1 =
 /// FORCE (TRIGGER bit set in CTRL). Bits clear when the watchdog is
 /// enabled, so we must read this before `Watchdog::start()`.
 const WATCHDOG_REASON_ADDR: *const u32 = 0x4005_8008 as *const u32;
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct RingEntry {
+    reset_reason: u32,
+    uptime_secs: u32,
+}
 
 #[repr(C)]
 struct PersistRegion {
@@ -56,6 +82,8 @@ struct PersistRegion {
     api_heartbeat: u32,
     display_heartbeat: u32,
     watchdog_heartbeat: u32,
+    ring_head: u32,
+    ring: [RingEntry; RING_SIZE],
     msg_len: u32,
     msg_buf: [u8; MSG_BUF_SIZE],
 }
@@ -66,10 +94,9 @@ static mut PERSIST: MaybeUninit<PersistRegion> = MaybeUninit::uninit();
 /// What caused the boot we're currently in.
 #[derive(Copy, Clone, defmt::Format)]
 #[repr(u32)]
-#[allow(dead_code)] // Unknown is observable via probe-rs before init_at_boot runs.
 pub enum ResetReason {
-    /// Reserved for invalid stored values. Should never appear in a
-    /// freshly-computed snapshot.
+    /// Reserved for invalid stored values — used when decoding old ring
+    /// entries with values outside the known enum range.
     Unknown = 0,
     /// Magic word was invalid — first boot since power-on, or RAM lost.
     ColdBoot = 1,
@@ -86,6 +113,25 @@ pub enum ResetReason {
     OtherSoftReset = 5,
 }
 
+impl ResetReason {
+    fn from_u32(v: u32) -> Self {
+        match v {
+            1 => Self::ColdBoot,
+            2 => Self::Panic,
+            3 => Self::WatchdogTimeout,
+            4 => Self::WatchdogForced,
+            5 => Self::OtherSoftReset,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+#[derive(Copy, Clone, defmt::Format)]
+pub struct ResetHistoryEntry {
+    pub reset_reason: ResetReason,
+    pub uptime_secs: u32,
+}
+
 #[derive(Clone)]
 pub struct Snapshot {
     pub reset_count: u32,
@@ -100,6 +146,9 @@ pub struct Snapshot {
     pub api_heartbeat: u32,
     pub display_heartbeat: u32,
     pub watchdog_heartbeat: u32,
+    /// The last RING_SIZE resets, newest first. Includes the reset that
+    /// produced *this* boot at index 0 (unless it was a cold boot).
+    pub reset_history: heapless::Vec<ResetHistoryEntry, RING_SIZE>,
 }
 
 fn region_ptr() -> *mut PersistRegion {
@@ -128,8 +177,62 @@ unsafe fn zero_region() {
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr).api_heartbeat), 0);
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr).display_heartbeat), 0);
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr).watchdog_heartbeat), 0);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr).ring_head), 0);
+        let ring_ptr = core::ptr::addr_of_mut!((*ptr).ring) as *mut u32;
+        // RingEntry is 2x u32, so RING_SIZE * 2 u32s total.
+        for i in 0..(RING_SIZE * 2) {
+            core::ptr::write_volatile(ring_ptr.add(i), 0);
+        }
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr).msg_len), 0);
     }
+}
+
+/// Append one entry to the ring buffer. `ring_head` is a monotonic
+/// counter; the actual slot is `ring_head % RING_SIZE`.
+unsafe fn ring_append(reason: ResetReason, uptime_secs: u32) {
+    let ptr = region_ptr();
+    unsafe {
+        let head = core::ptr::read_volatile(core::ptr::addr_of!((*ptr).ring_head));
+        let idx = (head as usize) % RING_SIZE;
+        let entry_ptr = core::ptr::addr_of_mut!((*ptr).ring[idx]);
+        core::ptr::write_volatile(
+            core::ptr::addr_of_mut!((*entry_ptr).reset_reason),
+            reason as u32,
+        );
+        core::ptr::write_volatile(
+            core::ptr::addr_of_mut!((*entry_ptr).uptime_secs),
+            uptime_secs,
+        );
+        core::ptr::write_volatile(
+            core::ptr::addr_of_mut!((*ptr).ring_head),
+            head.wrapping_add(1),
+        );
+    }
+}
+
+/// Read the ring buffer in newest-first order. Returns up to RING_SIZE
+/// entries (fewer if the ring hasn't been filled yet).
+unsafe fn ring_read() -> heapless::Vec<ResetHistoryEntry, RING_SIZE> {
+    let ptr = region_ptr();
+    let mut out: heapless::Vec<ResetHistoryEntry, RING_SIZE> = heapless::Vec::new();
+    unsafe {
+        let head = core::ptr::read_volatile(core::ptr::addr_of!((*ptr).ring_head)) as usize;
+        let count = head.min(RING_SIZE);
+        for i in 0..count {
+            // i=0 → most recent (head - 1), i=1 → head - 2, ...
+            let idx = (head + RING_SIZE - 1 - i) % RING_SIZE;
+            let entry_ptr = core::ptr::addr_of!((*ptr).ring[idx]);
+            let reason_raw =
+                core::ptr::read_volatile(core::ptr::addr_of!((*entry_ptr).reset_reason));
+            let uptime_secs =
+                core::ptr::read_volatile(core::ptr::addr_of!((*entry_ptr).uptime_secs));
+            let _ = out.push(ResetHistoryEntry {
+                reset_reason: ResetReason::from_u32(reason_raw),
+                uptime_secs,
+            });
+        }
+    }
+    out
 }
 
 /// Read WATCHDOG.REASON directly from MMIO. Doesn't require ownership of
@@ -229,6 +332,18 @@ pub fn init_at_boot() -> Snapshot {
         );
     }
 
+    // Append this boot's reset to the ring buffer (excluding cold boot —
+    // there's no meaningful "previous run" duration to record). The
+    // uptime we log is the previous run's `last_uptime_secs`, i.e. how
+    // long the run that just ended had been alive at its last watchdog
+    // feed.
+    if !matches!(reset_reason, ResetReason::ColdBoot) {
+        unsafe {
+            ring_append(reset_reason, last_uptime_secs);
+        }
+    }
+    let reset_history = unsafe { ring_read() };
+
     Snapshot {
         reset_count,
         panic_count,
@@ -240,6 +355,7 @@ pub fn init_at_boot() -> Snapshot {
         api_heartbeat,
         display_heartbeat,
         watchdog_heartbeat,
+        reset_history,
     }
 }
 

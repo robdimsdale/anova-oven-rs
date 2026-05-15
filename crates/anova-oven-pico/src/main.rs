@@ -167,6 +167,12 @@ async fn main(spawner: Spawner) {
         recovery.display_heartbeat,
         recovery.watchdog_heartbeat,
     );
+    for (i, entry) in recovery.reset_history.iter().enumerate() {
+        info!(
+            "persist: reset_history[{}]: reason={} uptime_secs={}",
+            i, entry.reset_reason, entry.uptime_secs,
+        );
+    }
     if let Some(msg) = recovery.message.as_deref() {
         info!("persist: last panic message: {}", msg);
     }
