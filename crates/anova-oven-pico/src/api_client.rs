@@ -261,10 +261,12 @@ impl<'a> ApiRuntime<'a> {
     fn record_fast_poll_success(&mut self) {
         self.snapshot.fail_count = 0;
         self.snapshot.last_success_at = Some(Instant::now());
+        crate::persist::record_api_fail_count(0);
     }
 
     fn record_fast_poll_failure(&mut self, message: &'static str) {
         self.snapshot.fail_count = self.snapshot.fail_count.saturating_add(1);
+        crate::persist::record_api_fail_count(self.snapshot.fail_count as u32);
         warn!(
             "{} ({} consecutive fast-poll failures)",
             message, self.snapshot.fail_count

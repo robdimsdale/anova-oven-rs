@@ -20,6 +20,7 @@
   # is attached. Warnings and errors are always emitted unconditionally.
   verbose-logs = [
     "cyw43/defmt",
+    "cyw43/firmware-logs",
     "cyw43-pio/defmt",
     "embassy-net/defmt",
     "reqwless/defmt",
@@ -66,9 +67,15 @@
   # Plain HTTP client (no TLS needed — server is on local network)
   reqwless = { version = "0.14", default-features = false }
 
-  cyw43 = { version = "0.7.0", default-features = false, features = [
-    "firmware-logs",
-  ] }
+  # NOTE: "firmware-logs" is only enabled via the verbose-logs feature,
+  # never by default. Its log_read path calls bp_read with a
+  # chip-firmware-provided pointer and asserts `addr % 4 == 0`; when the
+  # chip's log ring wraps to an unaligned address the assertion panics
+  # the whole MCU (observed in cyw43-0.7.0/src/spi.rs:272). Default
+  # builds don't need the chip's internal debug log; dev builds accept
+  # the risk in exchange for the extra visibility (and have a probe
+  # attached to see the panic anyway).
+  cyw43 = { version = "0.7.0", default-features = false }
   cyw43-pio = { version = "0.10.0", default-features = false }
 
   portable-atomic = { version = "1", features = ["critical-section"] }

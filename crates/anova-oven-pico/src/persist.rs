@@ -18,17 +18,22 @@
 //!   offset  28:  api_heartbeat               (u32)
 //!   offset  32:  display_heartbeat           (u32)
 //!   offset  36:  watchdog_heartbeat          (u32)
-//!   offset  40:  ring_head                   (u32)  // monotonic; index = head % RING_SIZE
-//!   offset  44:  ring                        ([RingEntry; 8] = 64 bytes)
-//!   offset 108:  msg_len                     (u32)
-//!   offset 112:  msg_buf                     ([u8; 512])
+//!   offset  40:  last_free_heap              (u32)  // bytes, by feeder
+//!   offset  44:  network_up                  (u32)  // 0/1, this run
+//!   offset  48:  last_api_fail_count         (u32)
+//!   offset  52:  ring_head                   (u32)  // monotonic; index = head % RING_SIZE
+//!   offset  56:  ring                        ([RingEntry; 8] = 192 bytes)
+//!   offset 248:  msg_len                     (u32)
+//!   offset 252:  msg_buf                     ([u8; 512])
 //!
-//! Each `RingEntry` is `(reset_reason: u32, uptime_secs: u32)` describing
-//! one reset that happened *before* the boot that wrote the entry. The
-//! ring stores the most recent RING_SIZE resets; older ones are
-//! overwritten. The current boot's reason lives in the standalone
-//! `reset_reason` field at offset 16 (and is also the head of the ring
-//! after `init_at_boot` runs).
+//! Each `RingEntry` (6x u32 = 24 bytes) describes one reset that
+//! happened *before* the boot that wrote the entry: the reset reason,
+//! how long the run lasted, and the run's last-known api_heartbeat,
+//! free heap, network-up flag and api fail-count. The ring stores the
+//! most recent RING_SIZE resets; older ones are overwritten. The
+//! current boot's reason lives in the standalone `reset_reason` field
+//! at offset 16 (and is also the head of the ring after `init_at_boot`
+//! runs).
 //!
 //! When this layout changes, bump `MAGIC` so old in-RAM data fails the
 //! magic check after a firmware update and we re-initialize cleanly
@@ -53,8 +58,10 @@ use cortex_m_rt::{exception, ExceptionFrame};
 // from before the firmware update will then fail the magic check and we
 // re-initialize cleanly instead of mis-decoding stale bytes.
 //   v1 = 0xA9B0_C1D2 — original layout, no ring buffer
-//   v2 = 0xA9B0_C1D3 — added ring_head + ring (8 entries)
-const MAGIC: u32 = 0xA9B0_C1D3;
+//   v2 = 0xA9B0_C1D3 — added ring_head + ring (8 entries, 2 u32 each)
+//   v3 = 0xA9B0_C1D4 — added last_free_heap/network_up/last_api_fail_count
+//                      live fields; RingEntry grown to 6 u32
+const MAGIC: u32 = 0xA9B0_C1D4;
 const MSG_BUF_SIZE: usize = 512;
 const RING_SIZE: usize = 8;
 
@@ -68,7 +75,13 @@ const WATCHDOG_REASON_ADDR: *const u32 = 0x4005_8008 as *const u32;
 struct RingEntry {
     reset_reason: u32,
     uptime_secs: u32,
+    api_heartbeat: u32,
+    free_heap: u32,
+    network_up: u32,
+    api_fail_count: u32,
 }
+
+const RING_ENTRY_WORDS: usize = 6;
 
 #[repr(C)]
 struct PersistRegion {
@@ -82,6 +95,9 @@ struct PersistRegion {
     api_heartbeat: u32,
     display_heartbeat: u32,
     watchdog_heartbeat: u32,
+    last_free_heap: u32,
+    network_up: u32,
+    last_api_fail_count: u32,
     ring_head: u32,
     ring: [RingEntry; RING_SIZE],
     msg_len: u32,
@@ -130,6 +146,10 @@ impl ResetReason {
 pub struct ResetHistoryEntry {
     pub reset_reason: ResetReason,
     pub uptime_secs: u32,
+    pub api_heartbeat: u32,
+    pub free_heap: u32,
+    pub network_up: bool,
+    pub api_fail_count: u32,
 }
 
 #[derive(Clone)]
@@ -177,10 +197,12 @@ unsafe fn zero_region() {
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr).api_heartbeat), 0);
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr).display_heartbeat), 0);
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr).watchdog_heartbeat), 0);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr).last_free_heap), 0);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr).network_up), 0);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr).last_api_fail_count), 0);
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr).ring_head), 0);
         let ring_ptr = core::ptr::addr_of_mut!((*ptr).ring) as *mut u32;
-        // RingEntry is 2x u32, so RING_SIZE * 2 u32s total.
-        for i in 0..(RING_SIZE * 2) {
+        for i in 0..(RING_SIZE * RING_ENTRY_WORDS) {
             core::ptr::write_volatile(ring_ptr.add(i), 0);
         }
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr).msg_len), 0);
@@ -188,10 +210,18 @@ unsafe fn zero_region() {
 }
 
 /// Append one entry to the ring buffer. `ring_head` is a monotonic
-/// counter; the actual slot is `ring_head % RING_SIZE`.
+/// counter; the actual slot is `ring_head % RING_SIZE`. The non-reason
+/// fields are snapshotted from the live persist fields (i.e. the last
+/// values the run that just ended managed to write).
 unsafe fn ring_append(reason: ResetReason, uptime_secs: u32) {
     let ptr = region_ptr();
     unsafe {
+        let api_heartbeat = core::ptr::read_volatile(core::ptr::addr_of!((*ptr).api_heartbeat));
+        let free_heap = core::ptr::read_volatile(core::ptr::addr_of!((*ptr).last_free_heap));
+        let network_up = core::ptr::read_volatile(core::ptr::addr_of!((*ptr).network_up));
+        let api_fail_count =
+            core::ptr::read_volatile(core::ptr::addr_of!((*ptr).last_api_fail_count));
+
         let head = core::ptr::read_volatile(core::ptr::addr_of!((*ptr).ring_head));
         let idx = (head as usize) % RING_SIZE;
         let entry_ptr = core::ptr::addr_of_mut!((*ptr).ring[idx]);
@@ -202,6 +232,16 @@ unsafe fn ring_append(reason: ResetReason, uptime_secs: u32) {
         core::ptr::write_volatile(
             core::ptr::addr_of_mut!((*entry_ptr).uptime_secs),
             uptime_secs,
+        );
+        core::ptr::write_volatile(
+            core::ptr::addr_of_mut!((*entry_ptr).api_heartbeat),
+            api_heartbeat,
+        );
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*entry_ptr).free_heap), free_heap);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*entry_ptr).network_up), network_up);
+        core::ptr::write_volatile(
+            core::ptr::addr_of_mut!((*entry_ptr).api_fail_count),
+            api_fail_count,
         );
         core::ptr::write_volatile(
             core::ptr::addr_of_mut!((*ptr).ring_head),
@@ -226,9 +266,20 @@ unsafe fn ring_read() -> heapless::Vec<ResetHistoryEntry, RING_SIZE> {
                 core::ptr::read_volatile(core::ptr::addr_of!((*entry_ptr).reset_reason));
             let uptime_secs =
                 core::ptr::read_volatile(core::ptr::addr_of!((*entry_ptr).uptime_secs));
+            let api_heartbeat =
+                core::ptr::read_volatile(core::ptr::addr_of!((*entry_ptr).api_heartbeat));
+            let free_heap = core::ptr::read_volatile(core::ptr::addr_of!((*entry_ptr).free_heap));
+            let network_up =
+                core::ptr::read_volatile(core::ptr::addr_of!((*entry_ptr).network_up)) != 0;
+            let api_fail_count =
+                core::ptr::read_volatile(core::ptr::addr_of!((*entry_ptr).api_fail_count));
             let _ = out.push(ResetHistoryEntry {
                 reset_reason: ResetReason::from_u32(reason_raw),
                 uptime_secs,
+                api_heartbeat,
+                free_heap,
+                network_up,
+                api_fail_count,
             });
         }
     }
@@ -247,16 +298,22 @@ fn read_watchdog_reason_raw() -> (bool, bool) {
 
 /// Combine WATCHDOG.REASON with our persist state to decide what kind of
 /// reset just happened. Called only by `init_at_boot()`.
+///
+/// A panic is checked *before* the watchdog timer bit on purpose: a
+/// panic is the root cause, and if a slow/hung panic handler lets the
+/// watchdog fire too (WATCHDOG.REASON.TIMER set), we still want the
+/// reset attributed to the panic rather than masked as a plain
+/// watchdog timeout.
 fn classify_reset(magic_was_valid: bool, panic_count_advanced: bool) -> ResetReason {
     let (timer, force) = read_watchdog_reason_raw();
     if !magic_was_valid {
         ResetReason::ColdBoot
+    } else if panic_count_advanced {
+        ResetReason::Panic
     } else if timer {
         ResetReason::WatchdogTimeout
     } else if force {
         ResetReason::WatchdogForced
-    } else if panic_count_advanced {
-        ResetReason::Panic
     } else {
         ResetReason::OtherSoftReset
     }
@@ -344,6 +401,16 @@ pub fn init_at_boot() -> Snapshot {
     }
     let reset_history = unsafe { ring_read() };
 
+    // Reset per-run breadcrumbs now that the previous run's values have
+    // been snapshotted into the ring. These describe the *current* run
+    // and must start clean so a freeze before the network comes up (or
+    // before the first feed) is distinguishable from one after.
+    unsafe {
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr).network_up), 0);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr).last_api_fail_count), 0);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr).last_free_heap), 0);
+    }
+
     Snapshot {
         reset_count,
         panic_count,
@@ -389,6 +456,34 @@ pub fn record_uptime_secs(secs: u32) {
     let ptr = region_ptr();
     unsafe {
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr).last_uptime_secs), secs);
+    }
+}
+
+/// Update the "free heap at last watchdog feed" breadcrumb. Called from
+/// the watchdog feeder so it's recorded regardless of the verbose-logs
+/// feature (the heap monitor task is gated behind it).
+pub fn record_free_heap(bytes: u32) {
+    let ptr = region_ptr();
+    unsafe {
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr).last_free_heap), bytes);
+    }
+}
+
+/// Mark that the network came up during this run. Called once from
+/// `main` after DHCP completes. Reset to 0 each boot by `init_at_boot`.
+pub fn record_network_up() {
+    let ptr = region_ptr();
+    unsafe {
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr).network_up), 1);
+    }
+}
+
+/// Record the API client's current consecutive fail count. Called from
+/// `api_client` whenever it changes. Reset to 0 each boot.
+pub fn record_api_fail_count(n: u32) {
+    let ptr = region_ptr();
+    unsafe {
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr).last_api_fail_count), n);
     }
 }
 
@@ -458,8 +553,11 @@ fn record_and_reset(args: core::fmt::Arguments) -> ! {
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr).msg_len), writer.pos as u32);
     }
 
-    defmt::error!("panic recorded; resetting");
-
+    // Deliberately NO defmt here. If the panic interrupted code holding
+    // defmt's global logger, calling into defmt now re-enters it and
+    // double-panics, hanging the handler until the watchdog fires (which
+    // mis-attributes the reset as a watchdog timeout). The persisted
+    // message is the durable record; init_at_boot logs it next boot.
     cortex_m::asm::dsb();
 
     SCB::sys_reset();
