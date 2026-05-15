@@ -241,9 +241,20 @@ impl<'a> ApiRuntime<'a> {
     ) -> Self {
         let now = Instant::now();
         let mut event_queue = EventQueue::new();
+        // Stagger the three initial polls so the first drain isn't ~15 s of
+        // back-to-back network I/O during which a user Stop sits unserviced
+        // (review §1.2).
         event_queue.enqueue(EventKind::PollStatus, now, EnqueueMode::PreferEarlier);
-        event_queue.enqueue(EventKind::PollCurrentCook, now, EnqueueMode::PreferEarlier);
-        event_queue.enqueue(EventKind::PollRecipes, now, EnqueueMode::PreferEarlier);
+        event_queue.enqueue(
+            EventKind::PollCurrentCook,
+            now + Duration::from_millis(250),
+            EnqueueMode::PreferEarlier,
+        );
+        event_queue.enqueue(
+            EventKind::PollRecipes,
+            now + Duration::from_millis(500),
+            EnqueueMode::PreferEarlier,
+        );
 
         Self {
             stack,
@@ -490,6 +501,14 @@ impl<'a> ApiRuntime<'a> {
 
         match command {
             ApiCommand::Start { recipe_id } => {
+                // If two Start commands for different recipes arrive before the
+                // drain loop services them, this overwrites the first recipe id
+                // and the two ApiStart events coalesce (enqueue dedups by
+                // kind), so recipe A is silently dropped in favour of B. This
+                // is acceptable: two back-to-back starts for different recipes
+                // would be rejected by the upstream Anova oven server (not our
+                // intermediary server) anyway, so only the latter could ever
+                // have taken effect.
                 self.pending_start_recipe_id = Some(recipe_id);
                 self.event_queue
                     .enqueue(EventKind::ApiStart, now, EnqueueMode::PreferEarlier);
@@ -517,11 +536,22 @@ async fn api_client_task(
         crate::persist::bump_api_heartbeat();
         if let Some(next_due) = runtime.event_queue.next_due_at() {
             match select(Timer::at(next_due), commands.receive()).await {
-                Either::First(()) => {
-                    while let Some(event) = runtime.event_queue.pop_due(Instant::now()) {
-                        runtime.handle_event(event).await;
+                Either::First(()) => loop {
+                    // Service pending commands before each event so a user
+                    // Stop/Start isn't stuck behind a multi-second poll drain
+                    // (review §1.2). handle_command enqueues ApiStop/ApiStart
+                    // at `now` with priority 0, so the following pop_due
+                    // tie-breaks it ahead of any other poll due at the same
+                    // instant. Exit once nothing is due and park in the outer
+                    // select.
+                    while let Ok(command) = commands.try_receive() {
+                        runtime.handle_command(command);
                     }
-                }
+                    match runtime.event_queue.pop_due(Instant::now()) {
+                        Some(event) => runtime.handle_event(event).await,
+                        None => break,
+                    }
+                },
                 Either::Second(command) => runtime.handle_command(command),
             }
         } else {
