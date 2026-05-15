@@ -430,10 +430,17 @@ impl<'a> ApiRuntime<'a> {
         )
         .await
         {
-            Ok(current_cook) => {
-                self.snapshot.current_cook = current_cook;
+            Ok(Ok(Some(cook))) => {
+                self.snapshot.current_cook = Some(cook);
                 self.record_fast_poll_success();
                 self.reconcile_current_cook_recipe_title();
+            }
+            Ok(Ok(None)) => {
+                self.snapshot.current_cook = None;
+                self.record_fast_poll_success();
+            }
+            Ok(Err(())) => {
+                self.record_fast_poll_failure("GET /current-cook failed");
             }
             Err(_) => {
                 self.record_fast_poll_failure("GET /current-cook timed out");

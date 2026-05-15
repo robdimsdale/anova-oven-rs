@@ -91,10 +91,16 @@ pub async fn fetch_status(
     }
 }
 
+/// Polls `/current-cook`. The two outcome axes are kept orthogonal:
+/// `Ok(Some)` = a cook is in progress, `Ok(None)` = HTTP 204 / no cook (still a
+/// successful poll), `Err(())` = transport/HTTP/body/parse failure. This stops
+/// a persistently malformed body from being counted as a successful poll
+/// (review §1.8). The `()` error is a deliberate placeholder; a typed error
+/// preserving the failure cause is deferred to the §6.1 error-handling refactor.
 pub async fn fetch_current_cook(
     stack: embassy_net::Stack<'static>,
     rx_buf: &mut [u8],
-) -> Option<anova_oven_api::CurrentCook> {
+) -> Result<Option<anova_oven_api::CurrentCook>, ()> {
     let client_state = TcpClientState::<1, 1024, 1024>::new();
     let tcp = TcpClient::new(stack, &client_state);
     let dns = DnsSocket::new(stack);
@@ -106,7 +112,7 @@ pub async fn fetch_current_cook(
         Ok(r) => r,
         Err(_) => {
             warn!("GET /current-cook: connection failed");
-            return None;
+            return Err(());
         }
     };
 
@@ -114,23 +120,23 @@ pub async fn fetch_current_cook(
         Ok(r) => r,
         Err(_) => {
             warn!("GET /current-cook: send failed");
-            return None;
+            return Err(());
         }
     };
 
     if response.status.0 == 204 {
-        return None;
+        return Ok(None);
     }
     if response.status.0 != 200 {
         warn!("GET /current-cook: HTTP {}", response.status.0);
-        return None;
+        return Err(());
     }
 
     let body = match response.body().read_to_end().await {
         Ok(b) => b,
         Err(_) => {
             warn!("GET /current-cook: failed to read body");
-            return None;
+            return Err(());
         }
     };
 
@@ -142,11 +148,11 @@ pub async fn fetch_current_cook(
                 cook.recipe_title.as_str(),
                 cook.total_stage_count,
             );
-            Some(cook)
+            Ok(Some(cook))
         }
         Err(_) => {
             warn!("GET /current-cook: failed to parse JSON");
-            None
+            Err(())
         }
     }
 }
