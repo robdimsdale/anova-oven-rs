@@ -10,8 +10,12 @@ use embassy_sync::watch::{Receiver, Sender, Watch};
 use embassy_time::{with_timeout, Duration, Instant, Timer};
 use heapless::Vec as HeaplessVec;
 use portable_atomic_util::Arc;
+use static_cell::StaticCell;
 
-use crate::api::{fetch_current_cook, fetch_recipes, fetch_status, send_start, send_stop};
+use crate::api::{
+    fetch_current_cook, fetch_recipes, fetch_status, send_start, send_stop, Aligned,
+    HTTP_RX_BUF_LEN,
+};
 
 const API_CALL_TIMEOUT_SECS: u64 = 5;
 const POST_ACTION_COOK_REFRESH_DELAY_SECS: u64 = 1;
@@ -184,6 +188,10 @@ impl EventQueue {
 struct ApiRuntime<'a> {
     stack: embassy_net::Stack<'static>,
     state_tx: Sender<'a, CriticalSectionRawMutex, ApiSnapshot, 1>,
+    // 16 KB HTTP RX buffer, owned exclusively by this runtime. Taken once from a
+    // StaticCell in `api_client_task`, so the "one buffer, one user" invariant is
+    // a compile-time fact rather than an unenforced `static mut` convention.
+    rx_buf: &'a mut [u8],
     snapshot: ApiSnapshot,
     event_queue: EventQueue,
     pending_start_recipe_id: Option<String>,
@@ -229,6 +237,7 @@ impl<'a> ApiRuntime<'a> {
     fn new(
         stack: embassy_net::Stack<'static>,
         state_tx: Sender<'a, CriticalSectionRawMutex, ApiSnapshot, 1>,
+        rx_buf: &'a mut [u8],
     ) -> Self {
         let now = Instant::now();
         let mut event_queue = EventQueue::new();
@@ -239,6 +248,7 @@ impl<'a> ApiRuntime<'a> {
         Self {
             stack,
             state_tx,
+            rx_buf,
             snapshot: ApiSnapshot::default(),
             event_queue,
             pending_start_recipe_id: None,
@@ -331,7 +341,7 @@ impl<'a> ApiRuntime<'a> {
         info!("Sending POST /start with recipe id: {}", recipe_id.as_str());
         if with_timeout(
             Duration::from_secs(API_CALL_TIMEOUT_SECS),
-            send_start(self.stack, recipe_id.as_str()),
+            send_start(self.stack, &mut *self.rx_buf, recipe_id.as_str()),
         )
         .await
         .is_err()
@@ -355,7 +365,7 @@ impl<'a> ApiRuntime<'a> {
     async fn handle_api_stop(&mut self) {
         if with_timeout(
             Duration::from_secs(API_CALL_TIMEOUT_SECS),
-            send_stop(self.stack),
+            send_stop(self.stack, &mut *self.rx_buf),
         )
         .await
         .is_err()
@@ -376,7 +386,7 @@ impl<'a> ApiRuntime<'a> {
 
         match with_timeout(
             Duration::from_secs(API_CALL_TIMEOUT_SECS),
-            fetch_status(self.stack),
+            fetch_status(self.stack, &mut *self.rx_buf),
         )
         .await
         {
@@ -416,7 +426,7 @@ impl<'a> ApiRuntime<'a> {
 
         match with_timeout(
             Duration::from_secs(API_CALL_TIMEOUT_SECS),
-            fetch_current_cook(self.stack),
+            fetch_current_cook(self.stack, &mut *self.rx_buf),
         )
         .await
         {
@@ -443,7 +453,7 @@ impl<'a> ApiRuntime<'a> {
     async fn handle_poll_recipes(&mut self) {
         match with_timeout(
             Duration::from_secs(API_CALL_TIMEOUT_SECS),
-            fetch_recipes(self.stack),
+            fetch_recipes(self.stack, &mut *self.rx_buf),
         )
         .await
         {
@@ -492,7 +502,9 @@ async fn api_client_task(
     commands: &'static CommandChannel,
     state: &'static StateWatch,
 ) -> ! {
-    let mut runtime = ApiRuntime::new(stack, state.sender());
+    static RX_BUF: StaticCell<Aligned<HTTP_RX_BUF_LEN>> = StaticCell::new();
+    let rx_buf = &mut RX_BUF.init(Aligned([0u8; HTTP_RX_BUF_LEN])).0[..];
+    let mut runtime = ApiRuntime::new(stack, state.sender(), rx_buf);
 
     loop {
         crate::persist::bump_api_heartbeat();
