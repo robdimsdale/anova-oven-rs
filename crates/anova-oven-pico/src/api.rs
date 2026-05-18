@@ -188,11 +188,7 @@ pub async fn send_stop(stack: embassy_net::Stack<'static>, rx_buf: &mut [u8]) {
     }
 }
 
-pub async fn send_start(
-    stack: embassy_net::Stack<'static>,
-    rx_buf: &mut [u8],
-    recipe_id: &str,
-) {
+pub async fn send_start(stack: embassy_net::Stack<'static>, rx_buf: &mut [u8], recipe_id: &str) {
     let client_state = TcpClientState::<1, 1024, 1024>::new();
     let tcp = TcpClient::new(stack, &client_state);
     let dns = DnsSocket::new(stack);

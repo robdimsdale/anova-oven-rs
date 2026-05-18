@@ -127,6 +127,24 @@ pub enum ResetReason {
     /// `SCB::sys_reset()` (or external NRST) without a panic. Shouldn't
     /// happen in normal operation.
     OtherSoftReset = 5,
+    /// A bring-up stage (WiFi join / DHCP) didn't complete within its
+    /// deadline and `reboot_init_timeout()` deliberately reset the board.
+    /// Inferred from the `last_app_state` breadcrumb still being an
+    /// `INIT_STAGE_*` value at the next boot (see `classify_reset`).
+    InitTimeout = 6,
+}
+
+/// `last_app_state` breadcrumb values for the pre-`AppState` bring-up
+/// phases. Deliberately well clear of `AppState::discriminant()` (1..=8)
+/// so a reset *during* init is distinguishable from one in the running
+/// state machine. `main` records these before each bring-up wait; the
+/// state machine overwrites `last_app_state` with its own discriminants
+/// once it starts, so a non-init value means we got past bring-up.
+pub const INIT_STAGE_WIFI: u32 = 100;
+pub const INIT_STAGE_DHCP: u32 = 101;
+
+fn is_init_stage(s: u32) -> bool {
+    matches!(s, INIT_STAGE_WIFI | INIT_STAGE_DHCP)
 }
 
 impl ResetReason {
@@ -137,6 +155,7 @@ impl ResetReason {
             3 => Self::WatchdogTimeout,
             4 => Self::WatchdogForced,
             5 => Self::OtherSoftReset,
+            6 => Self::InitTimeout,
             _ => Self::Unknown,
         }
     }
@@ -304,7 +323,18 @@ fn read_watchdog_reason_raw() -> (bool, bool) {
 /// watchdog fire too (WATCHDOG.REASON.TIMER set), we still want the
 /// reset attributed to the panic rather than masked as a plain
 /// watchdog timeout.
-fn classify_reset(magic_was_valid: bool, panic_count_advanced: bool) -> ResetReason {
+///
+/// `InitTimeout` is what would otherwise be an `OtherSoftReset` (plain
+/// soft reset, no panic, no watchdog) but with `last_app_state` still in
+/// the `INIT_STAGE_*` range — i.e. the box reset while in WiFi/DHCP
+/// bring-up, which is our deliberate `reboot_init_timeout()`. (A stray
+/// NRST during bring-up lands here too; "reset during init" is a fair
+/// label either way.)
+fn classify_reset(
+    magic_was_valid: bool,
+    panic_count_advanced: bool,
+    last_app_state: u32,
+) -> ResetReason {
     let (timer, force) = read_watchdog_reason_raw();
     if !magic_was_valid {
         ResetReason::ColdBoot
@@ -314,6 +344,8 @@ fn classify_reset(magic_was_valid: bool, panic_count_advanced: bool) -> ResetRea
         ResetReason::WatchdogTimeout
     } else if force {
         ResetReason::WatchdogForced
+    } else if is_init_stage(last_app_state) {
+        ResetReason::InitTimeout
     } else {
         ResetReason::OtherSoftReset
     }
@@ -378,7 +410,7 @@ pub fn init_at_boot() -> Snapshot {
     }
 
     let message_is_new = panic_count > last_displayed_panic_count;
-    let reset_reason = classify_reset(magic_was_valid, message_is_new);
+    let reset_reason = classify_reset(magic_was_valid, message_is_new, last_app_state);
 
     // Persist the classified reason so it's readable via probe-rs at any
     // point in this boot's lifetime. (init_at_boot is the only writer.)
@@ -449,6 +481,20 @@ pub fn record_app_state(discriminant: u32) {
     unsafe {
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr).last_app_state), discriminant);
     }
+}
+
+/// Deliberately reboot because a bring-up stage (WiFi join / DHCP)
+/// didn't complete within its deadline. Caller must have set the
+/// `last_app_state` breadcrumb to the relevant `INIT_STAGE_*` value
+/// (via `record_app_state`) *before* the wait, so that this plain soft
+/// reset is attributed to `ResetReason::InitTimeout` next boot and the
+/// reset ring records which stage stalled. Never returns.
+///
+/// Safe to call from normal async context (unlike the panic path, this
+/// isn't re-entrancy-sensitive — the caller should `warn!` first).
+pub fn reboot_init_timeout() -> ! {
+    cortex_m::asm::dsb();
+    SCB::sys_reset();
 }
 
 /// Update the "uptime at last successful watchdog feed" breadcrumb.
