@@ -13,8 +13,8 @@ use portable_atomic_util::Arc;
 use static_cell::StaticCell;
 
 use crate::api::{
-    fetch_current_cook, fetch_recipes, fetch_status, send_start, send_stop, Aligned,
-    HTTP_RX_BUF_LEN,
+    fetch_current_cook, fetch_recipes, fetch_status, normalize_server_url, send_start,
+    send_stop, Aligned, HTTP_RX_BUF_LEN,
 };
 
 const API_CALL_TIMEOUT_SECS: u64 = 5;
@@ -192,6 +192,10 @@ struct ApiRuntime<'a> {
     // StaticCell in `api_client_task`, so the "one buffer, one user" invariant is
     // a compile-time fact rather than an unenforced `static mut` convention.
     rx_buf: &'a mut [u8],
+    // Normalized server base URL, computed once at construction. SERVER_URL is a
+    // compile-time `env!` constant, so re-normalizing it per request just churned
+    // the heap ~1/s forever (review §2.1).
+    server_url: String,
     snapshot: ApiSnapshot,
     event_queue: EventQueue,
     pending_start_recipe_id: Option<String>,
@@ -260,6 +264,7 @@ impl<'a> ApiRuntime<'a> {
             stack,
             state_tx,
             rx_buf,
+            server_url: normalize_server_url(crate::SERVER_URL),
             snapshot: ApiSnapshot::default(),
             event_queue,
             pending_start_recipe_id: None,
@@ -352,7 +357,7 @@ impl<'a> ApiRuntime<'a> {
         info!("Sending POST /start with recipe id: {}", recipe_id.as_str());
         if with_timeout(
             Duration::from_secs(API_CALL_TIMEOUT_SECS),
-            send_start(self.stack, &mut *self.rx_buf, recipe_id.as_str()),
+            send_start(self.stack, &mut *self.rx_buf, &self.server_url, recipe_id.as_str()),
         )
         .await
         .is_err()
@@ -376,7 +381,7 @@ impl<'a> ApiRuntime<'a> {
     async fn handle_api_stop(&mut self) {
         if with_timeout(
             Duration::from_secs(API_CALL_TIMEOUT_SECS),
-            send_stop(self.stack, &mut *self.rx_buf),
+            send_stop(self.stack, &mut *self.rx_buf, &self.server_url),
         )
         .await
         .is_err()
@@ -397,7 +402,7 @@ impl<'a> ApiRuntime<'a> {
 
         match with_timeout(
             Duration::from_secs(API_CALL_TIMEOUT_SECS),
-            fetch_status(self.stack, &mut *self.rx_buf),
+            fetch_status(self.stack, &mut *self.rx_buf, &self.server_url),
         )
         .await
         {
@@ -437,7 +442,7 @@ impl<'a> ApiRuntime<'a> {
 
         match with_timeout(
             Duration::from_secs(API_CALL_TIMEOUT_SECS),
-            fetch_current_cook(self.stack, &mut *self.rx_buf),
+            fetch_current_cook(self.stack, &mut *self.rx_buf, &self.server_url),
         )
         .await
         {
@@ -471,7 +476,7 @@ impl<'a> ApiRuntime<'a> {
     async fn handle_poll_recipes(&mut self) {
         match with_timeout(
             Duration::from_secs(API_CALL_TIMEOUT_SECS),
-            fetch_recipes(self.stack, &mut *self.rx_buf),
+            fetch_recipes(self.stack, &mut *self.rx_buf, &self.server_url),
         )
         .await
         {

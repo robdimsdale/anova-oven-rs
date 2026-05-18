@@ -5,7 +5,6 @@ use reqwless::client::HttpClient;
 use reqwless::headers::ContentType;
 use reqwless::request::{Method, RequestBuilder};
 
-use crate::SERVER_URL;
 
 // cyw43's SPI/DMA layer requires 4-byte aligned buffers (asserts addr % 4 == 0).
 // [u8; N] only guarantees 1-byte alignment, so we use a repr(align(4)) wrapper.
@@ -14,7 +13,11 @@ pub(crate) struct Aligned<const N: usize>(pub(crate) [u8; N]);
 
 pub(crate) const HTTP_RX_BUF_LEN: usize = 16384;
 
-fn normalize_server_url(url: &str) -> alloc::string::String {
+/// Normalizes the configured server URL (trim trailing `/`, default to
+/// `http://`). The result never changes, so the caller computes it once at
+/// startup and threads `&str` in rather than re-allocating per request
+/// (review §2.1).
+pub(crate) fn normalize_server_url(url: &str) -> alloc::string::String {
     let trimmed = url.trim_end_matches('/');
     if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
         trimmed.into()
@@ -26,13 +29,13 @@ fn normalize_server_url(url: &str) -> alloc::string::String {
 pub async fn fetch_status(
     stack: embassy_net::Stack<'static>,
     rx_buf: &mut [u8],
+    server: &str,
 ) -> Option<anova_oven_api::OvenStatus> {
     let client_state = TcpClientState::<1, 1024, 1024>::new();
     let tcp = TcpClient::new(stack, &client_state);
     let dns = DnsSocket::new(stack);
     let mut client = HttpClient::new(&tcp, &dns);
 
-    let server = normalize_server_url(SERVER_URL);
     let url = alloc::format!("{server}/status");
     debug!(
         "GET /status: link_up={} config_up={}",
@@ -100,13 +103,13 @@ pub async fn fetch_status(
 pub async fn fetch_current_cook(
     stack: embassy_net::Stack<'static>,
     rx_buf: &mut [u8],
+    server: &str,
 ) -> Result<Option<anova_oven_api::CurrentCook>, ()> {
     let client_state = TcpClientState::<1, 1024, 1024>::new();
     let tcp = TcpClient::new(stack, &client_state);
     let dns = DnsSocket::new(stack);
     let mut client = HttpClient::new(&tcp, &dns);
 
-    let server = normalize_server_url(SERVER_URL);
     let url = alloc::format!("{server}/current-cook");
     let mut request = match client.request(Method::GET, &url).await {
         Ok(r) => r,
@@ -157,13 +160,16 @@ pub async fn fetch_current_cook(
     }
 }
 
-pub async fn send_stop(stack: embassy_net::Stack<'static>, rx_buf: &mut [u8]) {
+pub async fn send_stop(
+    stack: embassy_net::Stack<'static>,
+    rx_buf: &mut [u8],
+    server: &str,
+) {
     let client_state = TcpClientState::<1, 1024, 1024>::new();
     let tcp = TcpClient::new(stack, &client_state);
     let dns = DnsSocket::new(stack);
     let mut client = HttpClient::new(&tcp, &dns);
 
-    let server = normalize_server_url(SERVER_URL);
     let url = alloc::format!("{server}/stop");
     let mut request = match client.request(Method::POST, &url).await {
         Ok(r) => r,
@@ -188,13 +194,17 @@ pub async fn send_stop(stack: embassy_net::Stack<'static>, rx_buf: &mut [u8]) {
     }
 }
 
-pub async fn send_start(stack: embassy_net::Stack<'static>, rx_buf: &mut [u8], recipe_id: &str) {
+pub async fn send_start(
+    stack: embassy_net::Stack<'static>,
+    rx_buf: &mut [u8],
+    server: &str,
+    recipe_id: &str,
+) {
     let client_state = TcpClientState::<1, 1024, 1024>::new();
     let tcp = TcpClient::new(stack, &client_state);
     let dns = DnsSocket::new(stack);
     let mut client = HttpClient::new(&tcp, &dns);
 
-    let server = normalize_server_url(SERVER_URL);
     let url = alloc::format!("{server}/start");
     let request = match client.request(Method::POST, &url).await {
         Ok(r) => r,
@@ -228,13 +238,13 @@ pub async fn send_start(stack: embassy_net::Stack<'static>, rx_buf: &mut [u8], r
 pub async fn fetch_recipes(
     stack: embassy_net::Stack<'static>,
     rx_buf: &mut [u8],
+    server: &str,
 ) -> alloc::vec::Vec<anova_oven_api::Recipe> {
     let client_state = TcpClientState::<1, 4096, 4096>::new();
     let tcp = TcpClient::new(stack, &client_state);
     let dns = DnsSocket::new(stack);
     let mut client = HttpClient::new(&tcp, &dns);
 
-    let server = normalize_server_url(SERVER_URL);
     let url = alloc::format!("{server}/recipes");
     let mut request = match client.request(Method::GET, &url).await {
         Ok(r) => r,
