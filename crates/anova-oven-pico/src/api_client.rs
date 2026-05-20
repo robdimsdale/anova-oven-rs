@@ -406,11 +406,11 @@ impl<'a> ApiRuntime<'a> {
         )
         .await
         {
-            Ok(Some(status)) => {
+            Ok(Ok(status)) => {
                 self.snapshot.status = Some(status);
                 self.record_fast_poll_success();
             }
-            Ok(None) => {
+            Ok(Err(_)) => {
                 self.record_fast_poll_failure("GET /status failed");
             }
             Err(_) => {
@@ -455,7 +455,7 @@ impl<'a> ApiRuntime<'a> {
                 self.snapshot.current_cook = None;
                 self.record_fast_poll_success();
             }
-            Ok(Err(())) => {
+            Ok(Err(_)) => {
                 self.record_fast_poll_failure("GET /current-cook failed");
             }
             Err(_) => {
@@ -480,8 +480,11 @@ impl<'a> ApiRuntime<'a> {
         )
         .await
         {
-            Ok(recipes) => {
+            Ok(Ok(recipes)) => {
                 self.snapshot.recipes = Arc::new(recipes);
+            }
+            Ok(Err(_)) => {
+                warn!("GET /recipes: fetch failed");
             }
             Err(_) => {
                 warn!("GET /recipes: timed out");
