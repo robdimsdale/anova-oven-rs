@@ -11,13 +11,14 @@ use embassy_time::{with_timeout, Duration, Instant, Timer};
 use portable_atomic_util::Arc;
 use static_cell::StaticCell;
 
+use anova_oven_pico_core::api::normalize_server_url;
 use anova_oven_pico_core::scheduler::{
     EnqueueMode, EventKind, EventQueue, ScheduledEvent, EVENT_QUEUE_CAPACITY,
 };
 
 use crate::api::{
-    fetch_current_cook, fetch_recipes, fetch_status, normalize_server_url, send_start,
-    send_stop, Aligned, HTTP_RX_BUF_LEN,
+    fetch_current_cook, fetch_recipes, fetch_status, send_start, send_stop, Aligned,
+    HTTP_RX_BUF_LEN,
 };
 
 const API_CALL_TIMEOUT_SECS: u64 = 5;

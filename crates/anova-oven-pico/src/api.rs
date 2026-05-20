@@ -33,19 +33,6 @@ pub enum ApiError {
     Json,
 }
 
-/// Normalizes the configured server URL (trim trailing `/`, default to
-/// `http://`). The result never changes, so the caller computes it once at
-/// startup and threads `&str` in rather than re-allocating per request
-/// (review §2.1).
-pub(crate) fn normalize_server_url(url: &str) -> alloc::string::String {
-    let trimmed = url.trim_end_matches('/');
-    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        trimmed.into()
-    } else {
-        alloc::format!("http://{trimmed}")
-    }
-}
-
 /// Shared transport for every API call (review §3.2). Does the boilerplate —
 /// build client / open request / optionally attach JSON body / send / read
 /// body — and hands the response off to `handler` *while the response is
