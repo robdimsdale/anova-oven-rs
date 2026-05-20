@@ -12,4 +12,5 @@
 extern crate alloc;
 
 pub mod api;
+pub mod reset;
 pub mod scheduler;

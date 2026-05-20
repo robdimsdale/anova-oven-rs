@@ -13,12 +13,21 @@ name = "anova-oven-pico-core"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+# Derives `defmt::Format` on the public types that the bin logs. Off by
+# default so host tests don't try to link against defmt (which needs a
+# global logger only the firmware provides). The bin enables this in its
+# path-dependency declaration.
+defmt = ["dep:defmt"]
+
 [dependencies]
 heapless = { version = "0.9", default-features = false }
 # `embassy-time` provides `Instant`/`Duration` as plain data types. The bin
 # supplies the time driver on-target via `embassy-rp`. For host tests we
 # enable the `mock-driver` feature via `dev-dependencies` below.
 embassy-time = "0.5"
+defmt = { version = "1.0", optional = true }
 
 [dev-dependencies]
 # Provides a no-op TimeDriver symbol so the lib's test binary links on the

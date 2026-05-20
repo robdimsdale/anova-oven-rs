@@ -107,59 +107,7 @@ struct PersistRegion {
 #[link_section = ".uninit.PERSIST"]
 static mut PERSIST: MaybeUninit<PersistRegion> = MaybeUninit::uninit();
 
-/// What caused the boot we're currently in.
-#[derive(Copy, Clone, defmt::Format)]
-#[repr(u32)]
-pub enum ResetReason {
-    /// Reserved for invalid stored values — used when decoding old ring
-    /// entries with values outside the known enum range.
-    Unknown = 0,
-    /// Magic word was invalid — first boot since power-on, or RAM lost.
-    ColdBoot = 1,
-    /// Previous run hit our `#[panic_handler]` (or HardFault) which then
-    /// called `SCB::sys_reset()`.
-    Panic = 2,
-    /// RP2040 watchdog timed out (no `feed()` within the timeout window).
-    WatchdogTimeout = 3,
-    /// `Watchdog::trigger_reset()` was called explicitly. Not used by our
-    /// firmware today; present for completeness.
-    WatchdogForced = 4,
-    /// `SCB::sys_reset()` (or external NRST) without a panic. Shouldn't
-    /// happen in normal operation.
-    OtherSoftReset = 5,
-    /// A bring-up stage (WiFi join / DHCP) didn't complete within its
-    /// deadline and `reboot_init_timeout()` deliberately reset the board.
-    /// Inferred from the `last_app_state` breadcrumb still being an
-    /// `INIT_STAGE_*` value at the next boot (see `classify_reset`).
-    InitTimeout = 6,
-}
-
-/// `last_app_state` breadcrumb values for the pre-`AppState` bring-up
-/// phases. Deliberately well clear of `AppState::discriminant()` (1..=8)
-/// so a reset *during* init is distinguishable from one in the running
-/// state machine. `main` records these before each bring-up wait; the
-/// state machine overwrites `last_app_state` with its own discriminants
-/// once it starts, so a non-init value means we got past bring-up.
-pub const INIT_STAGE_WIFI: u32 = 100;
-pub const INIT_STAGE_DHCP: u32 = 101;
-
-fn is_init_stage(s: u32) -> bool {
-    matches!(s, INIT_STAGE_WIFI | INIT_STAGE_DHCP)
-}
-
-impl ResetReason {
-    fn from_u32(v: u32) -> Self {
-        match v {
-            1 => Self::ColdBoot,
-            2 => Self::Panic,
-            3 => Self::WatchdogTimeout,
-            4 => Self::WatchdogForced,
-            5 => Self::OtherSoftReset,
-            6 => Self::InitTimeout,
-            _ => Self::Unknown,
-        }
-    }
-}
+pub use anova_oven_pico_core::reset::{ResetReason, INIT_STAGE_DHCP, INIT_STAGE_WIFI};
 
 #[derive(Copy, Clone, defmt::Format)]
 pub struct ResetHistoryEntry {
@@ -315,40 +263,23 @@ fn read_watchdog_reason_raw() -> (bool, bool) {
     (timer, force)
 }
 
-/// Combine WATCHDOG.REASON with our persist state to decide what kind of
-/// reset just happened. Called only by `init_at_boot()`.
-///
-/// A panic is checked *before* the watchdog timer bit on purpose: a
-/// panic is the root cause, and if a slow/hung panic handler lets the
-/// watchdog fire too (WATCHDOG.REASON.TIMER set), we still want the
-/// reset attributed to the panic rather than masked as a plain
-/// watchdog timeout.
-///
-/// `InitTimeout` is what would otherwise be an `OtherSoftReset` (plain
-/// soft reset, no panic, no watchdog) but with `last_app_state` still in
-/// the `INIT_STAGE_*` range — i.e. the box reset while in WiFi/DHCP
-/// bring-up, which is our deliberate `reboot_init_timeout()`. (A stray
-/// NRST during bring-up lands here too; "reset during init" is a fair
-/// label either way.)
+/// Thin wrapper around `pico_core::reset::classify_reset` that injects the
+/// MMIO read of WATCHDOG.REASON. The pure classification logic (with its
+/// panic-beats-watchdog precedence and `InitTimeout` inference) lives in
+/// the lib and is unit-tested there.
 fn classify_reset(
     magic_was_valid: bool,
     panic_count_advanced: bool,
     last_app_state: u32,
 ) -> ResetReason {
     let (timer, force) = read_watchdog_reason_raw();
-    if !magic_was_valid {
-        ResetReason::ColdBoot
-    } else if panic_count_advanced {
-        ResetReason::Panic
-    } else if timer {
-        ResetReason::WatchdogTimeout
-    } else if force {
-        ResetReason::WatchdogForced
-    } else if is_init_stage(last_app_state) {
-        ResetReason::InitTimeout
-    } else {
-        ResetReason::OtherSoftReset
-    }
+    anova_oven_pico_core::reset::classify_reset(
+        magic_was_valid,
+        panic_count_advanced,
+        last_app_state,
+        timer,
+        force,
+    )
 }
 
 /// Validate or initialize the region, bump `reset_count`, read all
