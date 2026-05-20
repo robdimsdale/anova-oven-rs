@@ -34,6 +34,9 @@
   embedded-hal = "1"
 
   anova-oven-api = { path = "../anova-oven-api", default-features = false }
+  # Pure-logic core extracted from this crate so it can be host-tested
+  # (see crates/anova-oven-pico-core, review §5.1).
+  anova-oven-pico-core = { path = "../anova-oven-pico-core" }
   serde_json = { version = "1.0", default-features = false, features = [
     "alloc",
   ] }

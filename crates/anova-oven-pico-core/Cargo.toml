@@ -1,0 +1,26 @@
+# Pure-logic library extracted from `anova-oven-pico` so it can be unit-tested
+# on the host (review §5.1). The bin crate (`anova-oven-pico`) is a standalone
+# workspace targeting `thumbv6m-none-eabi`; this crate lives in the root
+# workspace and builds for the host by default. Pico depends on it via a path
+# dependency the same way it depends on `anova-oven-api`.
+#
+# Keep this crate `#![no_std]` and dependency-light — no embassy-rp, no cyw43,
+# no reqwless, no defmt. The bin owns logging and hardware; the lib owns
+# decisions.
+
+[package]
+name = "anova-oven-pico-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+heapless = { version = "0.9", default-features = false }
+# `embassy-time` provides `Instant`/`Duration` as plain data types. The bin
+# supplies the time driver on-target via `embassy-rp`. For host tests we
+# enable the `mock-driver` feature via `dev-dependencies` below.
+embassy-time = "0.5"
+
+[dev-dependencies]
+# Provides a no-op TimeDriver symbol so the lib's test binary links on the
+# host. Only active during `cargo test`; the bin's embedded build never sees it.
+embassy-time = { version = "0.5", features = ["mock-driver"] }

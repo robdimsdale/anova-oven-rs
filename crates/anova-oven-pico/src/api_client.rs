@@ -8,9 +8,12 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::watch::{Receiver, Sender, Watch};
 use embassy_time::{with_timeout, Duration, Instant, Timer};
-use heapless::Vec as HeaplessVec;
 use portable_atomic_util::Arc;
 use static_cell::StaticCell;
+
+use anova_oven_pico_core::scheduler::{
+    EnqueueMode, EventKind, EventQueue, ScheduledEvent, EVENT_QUEUE_CAPACITY,
+};
 
 use crate::api::{
     fetch_current_cook, fetch_recipes, fetch_status, normalize_server_url, send_start,
@@ -29,7 +32,6 @@ const POLL_BACKOFF_TIER3_FAILS: u64 = 15;
 const POLL_BACKOFF_TIER1_SECS: u64 = 5;
 const POLL_BACKOFF_TIER2_SECS: u64 = 15;
 const POLL_BACKOFF_TIER3_SECS: u64 = 30;
-const EVENT_QUEUE_CAPACITY: usize = 16;
 
 pub const OFFLINE_THRESHOLD: u64 = 3;
 
@@ -84,104 +86,6 @@ impl ApiSnapshot {
                 .status
                 .as_ref()
                 .is_some_and(|status| status.mode.as_str() != "idle")
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum EventKind {
-    PollStatus,
-    PollCurrentCook,
-    PollRecipes,
-    ApiStart,
-    ApiStop,
-}
-
-#[derive(Clone, Copy)]
-struct ScheduledEvent {
-    kind: EventKind,
-    execution_time: Instant,
-    priority: u8,
-}
-
-impl EventKind {
-    fn priority(self) -> u8 {
-        match self {
-            EventKind::ApiStart | EventKind::ApiStop => 0,
-            _ => 1,
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-enum EnqueueMode {
-    PreferEarlier,
-    Replace,
-}
-
-struct EventQueue {
-    events: HeaplessVec<ScheduledEvent, EVENT_QUEUE_CAPACITY>,
-}
-
-impl EventQueue {
-    fn new() -> Self {
-        Self {
-            events: HeaplessVec::new(),
-        }
-    }
-
-    fn enqueue(&mut self, kind: EventKind, execution_time: Instant, mode: EnqueueMode) {
-        if let Some(existing) = self.events.iter_mut().find(|event| event.kind == kind) {
-            existing.execution_time = match mode {
-                EnqueueMode::PreferEarlier => existing.execution_time.min(execution_time),
-                EnqueueMode::Replace => execution_time,
-            };
-            return;
-        }
-
-        if self
-            .events
-            .push(ScheduledEvent {
-                kind,
-                execution_time,
-                priority: kind.priority(),
-            })
-            .is_err()
-        {
-            error!(
-                "Api event queue overflow (capacity {}); dropping event",
-                EVENT_QUEUE_CAPACITY
-            );
-        }
-    }
-
-    fn soonest_index(&self) -> Option<usize> {
-        self.events
-            .iter()
-            .enumerate()
-            .min_by(|(_, a), (_, b)| {
-                a.execution_time
-                    .cmp(&b.execution_time)
-                    .then(a.priority.cmp(&b.priority))
-            })
-            .map(|(idx, _)| idx)
-    }
-
-    fn next_due_at(&self) -> Option<Instant> {
-        self.soonest_index()
-            .map(|idx| self.events[idx].execution_time)
-    }
-
-    fn has_pending(&self, kind: EventKind) -> bool {
-        self.events.iter().any(|event| event.kind == kind)
-    }
-
-    fn pop_due(&mut self, now: Instant) -> Option<ScheduledEvent> {
-        let idx = self.soonest_index()?;
-        if self.events[idx].execution_time > now {
-            return None;
-        }
-
-        Some(self.events.swap_remove(idx))
     }
 }
 
@@ -247,14 +151,14 @@ impl<'a> ApiRuntime<'a> {
         let mut event_queue = EventQueue::new();
         // Stagger the three initial polls so the first drain isn't ~15 s of
         // back-to-back network I/O during which a user Stop sits unserviced
-        // (review §1.2).
-        event_queue.enqueue(EventKind::PollStatus, now, EnqueueMode::PreferEarlier);
-        event_queue.enqueue(
+        // (review §1.2). A fresh queue with three pushes can't overflow.
+        let _ = event_queue.enqueue(EventKind::PollStatus, now, EnqueueMode::PreferEarlier);
+        let _ = event_queue.enqueue(
             EventKind::PollCurrentCook,
             now + Duration::from_millis(250),
             EnqueueMode::PreferEarlier,
         );
-        event_queue.enqueue(
+        let _ = event_queue.enqueue(
             EventKind::PollRecipes,
             now + Duration::from_millis(500),
             EnqueueMode::PreferEarlier,
@@ -268,6 +172,22 @@ impl<'a> ApiRuntime<'a> {
             snapshot: ApiSnapshot::default(),
             event_queue,
             pending_start_recipe_id: None,
+        }
+    }
+
+    /// Enqueue + log on overflow. The lib's `EventQueue::enqueue` returns
+    /// `Result<(), QueueOverflow>` so it stays effect-free; the bin owns the
+    /// `error!` and the policy of dropping on overflow.
+    fn enqueue(&mut self, kind: EventKind, execution_time: Instant, mode: EnqueueMode) {
+        if self
+            .event_queue
+            .enqueue(kind, execution_time, mode)
+            .is_err()
+        {
+            error!(
+                "Api event queue overflow (capacity {}); dropping event",
+                EVENT_QUEUE_CAPACITY
+            );
         }
     }
 
@@ -301,12 +221,12 @@ impl<'a> ApiRuntime<'a> {
 
     fn queue_post_action_refresh(&mut self, now: Instant) {
         let refresh_at = now + Duration::from_secs(POST_ACTION_COOK_REFRESH_DELAY_SECS);
-        self.event_queue.enqueue(
+        self.enqueue(
             EventKind::PollStatus,
             refresh_at,
             EnqueueMode::PreferEarlier,
         );
-        self.event_queue.enqueue(
+        self.enqueue(
             EventKind::PollCurrentCook,
             refresh_at,
             EnqueueMode::PreferEarlier,
@@ -366,12 +286,12 @@ impl<'a> ApiRuntime<'a> {
         }
 
         let now = Instant::now();
-        self.event_queue.enqueue(
+        self.enqueue(
             EventKind::PollStatus,
             now + Duration::from_secs(POST_ACTION_COOK_REFRESH_DELAY_SECS),
             EnqueueMode::PreferEarlier,
         );
-        self.event_queue.enqueue(
+        self.enqueue(
             EventKind::PollCurrentCook,
             now + Duration::from_secs(POST_START_CURRENT_COOK_REFRESH_DELAY_SECS),
             EnqueueMode::PreferEarlier,
@@ -392,7 +312,7 @@ impl<'a> ApiRuntime<'a> {
 
     async fn handle_poll_status(&mut self) {
         if self.poll_action_in_flight() {
-            self.event_queue.enqueue(
+            self.enqueue(
                 EventKind::PollStatus,
                 Instant::now() + Duration::from_secs(POST_ACTION_COOK_REFRESH_DELAY_SECS),
                 EnqueueMode::PreferEarlier,
@@ -421,7 +341,7 @@ impl<'a> ApiRuntime<'a> {
         let interval = self
             .next_poll_interval_secs()
             .max(NORMAL_POLL_INTERVAL_SECS);
-        self.event_queue.enqueue(
+        self.enqueue(
             EventKind::PollStatus,
             Instant::now() + Duration::from_secs(interval),
             EnqueueMode::PreferEarlier,
@@ -432,7 +352,7 @@ impl<'a> ApiRuntime<'a> {
 
     async fn handle_poll_current_cook(&mut self) {
         if self.poll_action_in_flight() {
-            self.event_queue.enqueue(
+            self.enqueue(
                 EventKind::PollCurrentCook,
                 Instant::now() + Duration::from_secs(POST_ACTION_COOK_REFRESH_DELAY_SECS),
                 EnqueueMode::PreferEarlier,
@@ -464,7 +384,7 @@ impl<'a> ApiRuntime<'a> {
         }
 
         let interval = self.next_poll_interval_secs().max(COOK_POLL_INTERVAL_SECS);
-        self.event_queue.enqueue(
+        self.enqueue(
             EventKind::PollCurrentCook,
             Instant::now() + Duration::from_secs(interval),
             EnqueueMode::PreferEarlier,
@@ -496,7 +416,7 @@ impl<'a> ApiRuntime<'a> {
         let interval = self
             .next_poll_interval_secs()
             .max(RECIPE_POLL_INTERVAL_SECS);
-        self.event_queue.enqueue(
+        self.enqueue(
             EventKind::PollRecipes,
             Instant::now() + Duration::from_secs(interval),
             EnqueueMode::PreferEarlier,
@@ -518,12 +438,10 @@ impl<'a> ApiRuntime<'a> {
                 // intermediary server) anyway, so only the latter could ever
                 // have taken effect.
                 self.pending_start_recipe_id = Some(recipe_id);
-                self.event_queue
-                    .enqueue(EventKind::ApiStart, now, EnqueueMode::PreferEarlier);
+                self.enqueue(EventKind::ApiStart, now, EnqueueMode::PreferEarlier);
             }
             ApiCommand::Stop => {
-                self.event_queue
-                    .enqueue(EventKind::ApiStop, now, EnqueueMode::PreferEarlier);
+                self.enqueue(EventKind::ApiStop, now, EnqueueMode::PreferEarlier);
                 self.queue_post_action_refresh(now);
             }
         }
