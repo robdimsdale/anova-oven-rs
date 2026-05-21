@@ -13,5 +13,6 @@ extern crate alloc;
 
 pub mod api;
 pub mod encoder;
+pub mod fsm;
 pub mod reset;
 pub mod scheduler;

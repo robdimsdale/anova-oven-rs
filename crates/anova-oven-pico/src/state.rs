@@ -4,51 +4,20 @@ use defmt::warn;
 use embassy_futures::select::{select, select3, Either, Either3};
 use embassy_time::{Duration, Instant, Timer};
 
-use crate::api_client::{ApiClient, ApiSnapshot, StateReceiver};
+pub use anova_oven_pico_core::fsm::{AppState, BacklightPolicy};
+use anova_oven_pico_core::fsm::{
+    active_recipe_title, baseline_state_for, cooking_view, idle_view, next_stage_prompt,
+    optimistic_idle_view, ViewSpec,
+};
+
+use crate::api_client::{ApiClient, StateReceiver};
 use crate::backlight::BacklightController;
-use crate::display::{Display, ViewSpec};
+use crate::display::Display;
 use crate::input::{Input, InputEvent};
 
 const MENU_INACTIVITY_TIMEOUT_SECS: u64 = 15;
 const STOP_CONFIRM_TIMEOUT_SECS: u64 = 5;
 const START_STOP_CONFIRM_TIMEOUT_SECS: u64 = 10;
-const IDLE: &str = "idle";
-
-#[derive(Clone)]
-pub enum AppState {
-    Offline,
-    Idle,
-    Cooking {
-        optimistic_recipe_title: Option<String>,
-    },
-    BrowseRecipes {
-        index: usize,
-    },
-    StartPending {
-        recipe_title: String,
-        recipe_id: String,
-        since: Instant,
-    },
-    ConfirmStop,
-    StopPending {
-        since: Instant,
-    },
-    AwaitNextStage {
-        next_description: String,
-    },
-}
-
-impl Default for AppState {
-    fn default() -> Self {
-        Self::Idle
-    }
-}
-
-pub enum BacklightPolicy {
-    Full,
-    Dim,
-    FullThenDimAfter(Duration),
-}
 
 pub struct Ctx<'a> {
     pub input: &'a Input<'static>,
@@ -64,128 +33,33 @@ impl<'a> Ctx<'a> {
     }
 }
 
-impl AppState {
-    /// Stable numeric identifier persisted across resets via the persist
-    /// region. Add new variants here when extending `AppState`; never
-    /// renumber existing ones.
-    pub fn discriminant(&self) -> u32 {
-        match self {
-            AppState::Offline => 1,
-            AppState::Idle => 2,
-            AppState::Cooking { .. } => 3,
-            AppState::BrowseRecipes { .. } => 4,
-            AppState::StartPending { .. } => 5,
-            AppState::ConfirmStop => 6,
-            AppState::StopPending { .. } => 7,
-            AppState::AwaitNextStage { .. } => 8,
-        }
-    }
+/// Top-level FSM tick. Records the breadcrumb, applies the backlight
+/// policy, and dispatches to the per-state handler. Returns the next
+/// state. `AppState` and the per-state decision/view helpers are pure
+/// (in `anova-oven-pico-core::fsm`); the handlers below are where
+/// effects live.
+pub async fn execute(state: AppState, ctx: &mut Ctx<'_>) -> AppState {
+    crate::persist::record_app_state(state.discriminant());
+    ctx.backlight.apply(state.backlight_policy());
 
-    pub async fn execute(self, ctx: &mut Ctx<'_>) -> AppState {
-        crate::persist::record_app_state(self.discriminant());
-        ctx.backlight.apply(self.backlight_policy());
-
-        match self {
-            AppState::Offline => execute_offline(ctx).await,
-            AppState::Idle => execute_idle(ctx).await,
-            AppState::Cooking {
-                optimistic_recipe_title,
-            } => execute_cooking(optimistic_recipe_title, ctx).await,
-            AppState::BrowseRecipes { index } => execute_browse(index, ctx).await,
-            AppState::StartPending {
-                recipe_title,
-                recipe_id,
-                since,
-            } => execute_start_pending(recipe_title, recipe_id, since, ctx).await,
-            AppState::ConfirmStop => execute_confirm_stop(ctx).await,
-            AppState::StopPending { since } => execute_stop_pending(since, ctx).await,
-            AppState::AwaitNextStage { next_description } => {
-                execute_await_next_stage(next_description, ctx).await
-            }
-        }
-    }
-
-    fn backlight_policy(&self) -> BacklightPolicy {
-        match self {
-            AppState::Idle | AppState::Cooking { .. } => {
-                BacklightPolicy::FullThenDimAfter(Duration::from_secs(5))
-            }
-            AppState::Offline
-            | AppState::BrowseRecipes { .. }
-            | AppState::StartPending { .. }
-            | AppState::ConfirmStop
-            | AppState::StopPending { .. }
-            | AppState::AwaitNextStage { .. } => BacklightPolicy::Full,
-        }
-    }
-
-    fn idle_dim_delay(&self) -> Duration {
-        match self.backlight_policy() {
-            BacklightPolicy::FullThenDimAfter(delay) => delay,
-            BacklightPolicy::Full | BacklightPolicy::Dim => Duration::from_secs(5),
-        }
-    }
-}
-
-fn baseline_state_for(snap: &ApiSnapshot) -> AppState {
-    if snap.is_cooking() {
+    match state {
+        AppState::Offline => execute_offline(ctx).await,
+        AppState::Idle => execute_idle(ctx).await,
         AppState::Cooking {
-            optimistic_recipe_title: None,
-        }
-    } else {
-        AppState::Idle
-    }
-}
-
-fn idle_view(snap: &ApiSnapshot) -> ViewSpec {
-    if !snap.has_first_data() {
-        ViewSpec::Connecting
-    } else {
-        ViewSpec::Status {
-            status: snap.status.clone(),
-            cook: snap.current_cook.clone(),
+            optimistic_recipe_title,
+        } => execute_cooking(optimistic_recipe_title, ctx).await,
+        AppState::BrowseRecipes { index } => execute_browse(index, ctx).await,
+        AppState::StartPending {
+            recipe_title,
+            recipe_id,
+            since,
+        } => execute_start_pending(recipe_title, recipe_id, since, ctx).await,
+        AppState::ConfirmStop => execute_confirm_stop(ctx).await,
+        AppState::StopPending { since } => execute_stop_pending(since, ctx).await,
+        AppState::AwaitNextStage { next_description } => {
+            execute_await_next_stage(next_description, ctx).await
         }
     }
-}
-
-fn cooking_view(snap: &ApiSnapshot, optimistic_recipe_title: Option<&str>) -> ViewSpec {
-    let cook = if snap.current_cook.is_some() {
-        snap.current_cook.clone()
-    } else if snap
-        .status
-        .as_ref()
-        .is_some_and(|status| status.is_cooking())
-    {
-        optimistic_recipe_title.map(|title| anova_oven_api::CurrentCook {
-            recipe_title: title.into(),
-            recipe_id: None,
-            started_at: String::from("pending"),
-            stages: alloc::vec::Vec::new(),
-            cook_stage_count: 0,
-            total_stage_count: 0,
-        })
-    } else {
-        None
-    };
-
-    ViewSpec::Status {
-        status: snap.status.clone(),
-        cook,
-    }
-}
-
-fn optimistic_idle_view(snap: &ApiSnapshot) -> ViewSpec {
-    let status = snap.status.as_ref().map(|status| {
-        let mut optimistic = status.clone();
-        optimistic.mode = String::from(IDLE);
-        optimistic.timer_mode = String::from(IDLE);
-        optimistic.timer_current_secs = 0;
-        optimistic.target_temperature_c = None;
-        optimistic.steam_target_pct = None;
-        optimistic
-    });
-
-    ViewSpec::Status { status, cook: None }
 }
 
 async fn execute_offline(ctx: &mut Ctx<'_>) -> AppState {
@@ -257,31 +131,6 @@ async fn execute_idle(ctx: &mut Ctx<'_>) -> AppState {
             }
         }
     }
-}
-
-fn next_stage_prompt(snap: &ApiSnapshot) -> Option<String> {
-    let progress = snap.status.as_ref()?.cook_progress.as_ref()?;
-    if !progress.next_stage_ready {
-        return None;
-    }
-    Some(
-        progress
-            .next_stage_description
-            .clone()
-            .unwrap_or_else(|| String::from("Next stage")),
-    )
-}
-
-fn active_recipe_title(snap: &ApiSnapshot) -> String {
-    if let Some(cook) = snap.current_cook.as_ref() {
-        return String::from(cook.display_name());
-    }
-    if let Some(progress) = snap.status.as_ref().and_then(|s| s.cook_progress.as_ref()) {
-        if !progress.recipe_title.is_empty() && progress.recipe_title != "[manual]" {
-            return progress.recipe_title.clone();
-        }
-    }
-    String::from("Active cook")
 }
 
 async fn execute_cooking(

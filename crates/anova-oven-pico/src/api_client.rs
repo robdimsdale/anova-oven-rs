@@ -1,5 +1,4 @@
 use alloc::string::String;
-use alloc::vec::Vec;
 
 use defmt::{error, info, warn};
 use embassy_executor::{SpawnError, Spawner};
@@ -12,6 +11,7 @@ use portable_atomic_util::Arc;
 use static_cell::StaticCell;
 
 use anova_oven_pico_core::api::normalize_server_url;
+pub use anova_oven_pico_core::fsm::ApiSnapshot;
 use anova_oven_pico_core::scheduler::{
     EnqueueMode, EventKind, EventQueue, ScheduledEvent, EVENT_QUEUE_CAPACITY,
 };
@@ -34,8 +34,6 @@ const POLL_BACKOFF_TIER1_SECS: u64 = 5;
 const POLL_BACKOFF_TIER2_SECS: u64 = 15;
 const POLL_BACKOFF_TIER3_SECS: u64 = 30;
 
-pub const OFFLINE_THRESHOLD: u64 = 3;
-
 pub type CommandChannel = Channel<CriticalSectionRawMutex, ApiCommand, 4>;
 pub type StateWatch = Watch<CriticalSectionRawMutex, ApiSnapshot, 1>;
 pub type StateReceiver<'a> = Receiver<'a, CriticalSectionRawMutex, ApiSnapshot, 1>;
@@ -49,45 +47,6 @@ pub struct ApiClient<'a> {
 pub enum ApiCommand {
     Start { recipe_id: String },
     Stop,
-}
-
-#[derive(Clone)]
-pub struct ApiSnapshot {
-    pub status: Option<anova_oven_api::OvenStatus>,
-    pub current_cook: Option<anova_oven_api::CurrentCook>,
-    pub recipes: Arc<Vec<anova_oven_api::Recipe>>,
-    pub fail_count: u64,
-    pub last_success_at: Option<Instant>,
-}
-
-impl Default for ApiSnapshot {
-    fn default() -> Self {
-        Self {
-            status: None,
-            current_cook: None,
-            recipes: Arc::new(Vec::new()),
-            fail_count: 0,
-            last_success_at: None,
-        }
-    }
-}
-
-impl ApiSnapshot {
-    pub fn is_offline(&self) -> bool {
-        self.fail_count >= OFFLINE_THRESHOLD
-    }
-
-    pub fn has_first_data(&self) -> bool {
-        self.last_success_at.is_some()
-    }
-
-    pub fn is_cooking(&self) -> bool {
-        self.current_cook.is_some()
-            || self
-                .status
-                .as_ref()
-                .is_some_and(|status| status.mode.as_str() != "idle")
-    }
 }
 
 struct ApiRuntime<'a> {

@@ -28,8 +28,18 @@ heapless = { version = "0.9", default-features = false }
 # enable the `mock-driver` feature via `dev-dependencies` below.
 embassy-time = "0.5"
 defmt = { version = "1.0", optional = true }
+# `ApiSnapshot`/`ViewSpec` hold serde types from the shared API crate, and
+# `ApiSnapshot::recipes` is an `Arc<Vec<Recipe>>` so renders share a pointer
+# rather than deep-cloning the recipe list.
+anova-oven-api = { path = "../anova-oven-api", default-features = false }
+portable-atomic-util = { version = "0.2", default-features = false, features = [
+  "alloc",
+] }
 
 [dev-dependencies]
 # Provides a no-op TimeDriver symbol so the lib's test binary links on the
 # host. Only active during `cargo test`; the bin's embedded build never sees it.
 embassy-time = { version = "0.5", features = ["mock-driver"] }
+# Test fixtures construct `OvenStatus`/`CurrentCook`/`CookProgress` via JSON
+# round-trip rather than enumerating every field of the upstream structs.
+serde_json = { version = "1.0", default-features = false, features = ["alloc"] }

@@ -42,7 +42,7 @@ use crate::backlight::BacklightController;
 use crate::display::{Display, DisplayNotifier, ViewSpec};
 use crate::input::{Input, InputChannel};
 use crate::lcd::LcdController;
-use crate::state::{AppState, Ctx};
+use crate::state::{execute, AppState, Ctx};
 
 const WIFI_SSID: &str = env!("ANOVA_WIFI_SSID");
 const WIFI_PASSWORD: &str = env!("ANOVA_WIFI_PASSWORD");
@@ -346,7 +346,7 @@ async fn main(spawner: Spawner) {
     info!("Init complete, entering main loop");
 
     loop {
-        state = state.execute(&mut ctx).await;
+        state = execute(state, &mut ctx).await;
     }
 }
 
