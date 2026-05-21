@@ -66,11 +66,7 @@ where
     let req_init = match client.request(method, &url).await {
         Ok(r) => r,
         Err(e) => {
-            warn!(
-                "{}: connection failed: {}",
-                label,
-                defmt::Debug2Format(&e)
-            );
+            warn!("{}: connection failed: {}", label, defmt::Debug2Format(&e));
             return Err(ApiError::Connect);
         }
     };

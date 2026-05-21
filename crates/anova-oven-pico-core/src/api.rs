@@ -23,12 +23,18 @@ mod tests {
 
     #[test]
     fn preserves_http_scheme() {
-        assert_eq!(normalize_server_url("http://example.com"), "http://example.com");
+        assert_eq!(
+            normalize_server_url("http://example.com"),
+            "http://example.com"
+        );
     }
 
     #[test]
     fn preserves_https_scheme() {
-        assert_eq!(normalize_server_url("https://example.com"), "https://example.com");
+        assert_eq!(
+            normalize_server_url("https://example.com"),
+            "https://example.com"
+        );
     }
 
     #[test]
@@ -38,17 +44,26 @@ mod tests {
 
     #[test]
     fn adds_http_to_host_with_port() {
-        assert_eq!(normalize_server_url("192.168.1.10:8080"), "http://192.168.1.10:8080");
+        assert_eq!(
+            normalize_server_url("192.168.1.10:8080"),
+            "http://192.168.1.10:8080"
+        );
     }
 
     #[test]
     fn trims_single_trailing_slash() {
-        assert_eq!(normalize_server_url("http://example.com/"), "http://example.com");
+        assert_eq!(
+            normalize_server_url("http://example.com/"),
+            "http://example.com"
+        );
     }
 
     #[test]
     fn trims_multiple_trailing_slashes() {
-        assert_eq!(normalize_server_url("http://example.com///"), "http://example.com");
+        assert_eq!(
+            normalize_server_url("http://example.com///"),
+            "http://example.com"
+        );
         assert_eq!(normalize_server_url("example.com///"), "http://example.com");
     }
 

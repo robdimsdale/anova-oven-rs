@@ -278,7 +278,12 @@ impl<'a> ApiRuntime<'a> {
         info!("Sending POST /start with recipe id: {}", recipe_id.as_str());
         if with_timeout(
             Duration::from_secs(API_CALL_TIMEOUT_SECS),
-            send_start(self.stack, &mut *self.rx_buf, &self.server_url, recipe_id.as_str()),
+            send_start(
+                self.stack,
+                &mut *self.rx_buf,
+                &self.server_url,
+                recipe_id.as_str(),
+            ),
         )
         .await
         .is_err()

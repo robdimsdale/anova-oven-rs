@@ -105,27 +105,48 @@ mod tests {
     fn invalid_magic_is_cold_boot_regardless_of_other_bits() {
         // Even if every other indicator screams panic/watchdog, an invalid
         // magic word means RAM was lost — no signal from prior run is real.
-        assert_eq!(classify_reset(false, true, INIT_STAGE_WIFI, true, true), ResetReason::ColdBoot);
-        assert_eq!(classify_reset(false, false, 0, false, false), ResetReason::ColdBoot);
+        assert_eq!(
+            classify_reset(false, true, INIT_STAGE_WIFI, true, true),
+            ResetReason::ColdBoot
+        );
+        assert_eq!(
+            classify_reset(false, false, 0, false, false),
+            ResetReason::ColdBoot
+        );
     }
 
     #[test]
     fn panic_beats_watchdog() {
         // Documented precedence: a slow panic handler can let the watchdog
         // fire too; the panic is the root cause.
-        assert_eq!(classify_reset(true, true, 0, true, false), ResetReason::Panic);
-        assert_eq!(classify_reset(true, true, 0, false, true), ResetReason::Panic);
-        assert_eq!(classify_reset(true, true, 0, true, true), ResetReason::Panic);
+        assert_eq!(
+            classify_reset(true, true, 0, true, false),
+            ResetReason::Panic
+        );
+        assert_eq!(
+            classify_reset(true, true, 0, false, true),
+            ResetReason::Panic
+        );
+        assert_eq!(
+            classify_reset(true, true, 0, true, true),
+            ResetReason::Panic
+        );
     }
 
     #[test]
     fn watchdog_timer_classified_when_no_panic() {
-        assert_eq!(classify_reset(true, false, 0, true, false), ResetReason::WatchdogTimeout);
+        assert_eq!(
+            classify_reset(true, false, 0, true, false),
+            ResetReason::WatchdogTimeout
+        );
     }
 
     #[test]
     fn watchdog_force_classified_when_no_panic_and_no_timer() {
-        assert_eq!(classify_reset(true, false, 0, false, true), ResetReason::WatchdogForced);
+        assert_eq!(
+            classify_reset(true, false, 0, false, true),
+            ResetReason::WatchdogForced
+        );
     }
 
     #[test]
@@ -144,16 +165,28 @@ mod tests {
     fn other_soft_reset_when_nothing_else_matches() {
         // Past init, no panic, no watchdog — shouldn't happen in normal
         // operation but is the catch-all.
-        assert_eq!(classify_reset(true, false, 5, false, false), ResetReason::OtherSoftReset);
+        assert_eq!(
+            classify_reset(true, false, 5, false, false),
+            ResetReason::OtherSoftReset
+        );
     }
 
     #[test]
     fn init_timeout_only_for_known_init_stages() {
         // A non-init `last_app_state` (some AppState discriminant) with no
         // panic/watchdog falls into OtherSoftReset, not InitTimeout.
-        assert_eq!(classify_reset(true, false, 3, false, false), ResetReason::OtherSoftReset);
-        assert_eq!(classify_reset(true, false, 99, false, false), ResetReason::OtherSoftReset);
-        assert_eq!(classify_reset(true, false, 102, false, false), ResetReason::OtherSoftReset);
+        assert_eq!(
+            classify_reset(true, false, 3, false, false),
+            ResetReason::OtherSoftReset
+        );
+        assert_eq!(
+            classify_reset(true, false, 99, false, false),
+            ResetReason::OtherSoftReset
+        );
+        assert_eq!(
+            classify_reset(true, false, 102, false, false),
+            ResetReason::OtherSoftReset
+        );
     }
 
     #[test]

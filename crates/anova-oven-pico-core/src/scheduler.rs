@@ -159,7 +159,10 @@ mod tests {
     #[test]
     fn enqueue_adds_event() {
         let mut q = EventQueue::new();
-        assert_eq!(q.enqueue(EventKind::PollStatus, t(100), EnqueueMode::PreferEarlier), Ok(()));
+        assert_eq!(
+            q.enqueue(EventKind::PollStatus, t(100), EnqueueMode::PreferEarlier),
+            Ok(())
+        );
         assert_eq!(q.len(), 1);
         assert!(q.has_pending(EventKind::PollStatus));
     }
@@ -167,39 +170,66 @@ mod tests {
     #[test]
     fn enqueue_dedups_by_kind() {
         let mut q = EventQueue::new();
-        q.enqueue(EventKind::PollStatus, t(100), EnqueueMode::PreferEarlier).unwrap();
-        q.enqueue(EventKind::PollStatus, t(200), EnqueueMode::PreferEarlier).unwrap();
-        q.enqueue(EventKind::PollStatus, t(50), EnqueueMode::PreferEarlier).unwrap();
-        assert_eq!(q.len(), 1, "same kind enqueued thrice should occupy one slot");
-        assert_eq!(q.next_due_at(), Some(t(50)), "PreferEarlier keeps the minimum");
+        q.enqueue(EventKind::PollStatus, t(100), EnqueueMode::PreferEarlier)
+            .unwrap();
+        q.enqueue(EventKind::PollStatus, t(200), EnqueueMode::PreferEarlier)
+            .unwrap();
+        q.enqueue(EventKind::PollStatus, t(50), EnqueueMode::PreferEarlier)
+            .unwrap();
+        assert_eq!(
+            q.len(),
+            1,
+            "same kind enqueued thrice should occupy one slot"
+        );
+        assert_eq!(
+            q.next_due_at(),
+            Some(t(50)),
+            "PreferEarlier keeps the minimum"
+        );
     }
 
     #[test]
     fn prefer_earlier_picks_min_time() {
         let mut q = EventQueue::new();
-        q.enqueue(EventKind::PollStatus, t(100), EnqueueMode::PreferEarlier).unwrap();
-        q.enqueue(EventKind::PollStatus, t(50), EnqueueMode::PreferEarlier).unwrap();
-        q.enqueue(EventKind::PollStatus, t(200), EnqueueMode::PreferEarlier).unwrap();
+        q.enqueue(EventKind::PollStatus, t(100), EnqueueMode::PreferEarlier)
+            .unwrap();
+        q.enqueue(EventKind::PollStatus, t(50), EnqueueMode::PreferEarlier)
+            .unwrap();
+        q.enqueue(EventKind::PollStatus, t(200), EnqueueMode::PreferEarlier)
+            .unwrap();
         assert_eq!(q.next_due_at(), Some(t(50)));
     }
 
     #[test]
     fn replace_overwrites_existing_time() {
         let mut q = EventQueue::new();
-        q.enqueue(EventKind::PollStatus, t(100), EnqueueMode::PreferEarlier).unwrap();
-        q.enqueue(EventKind::PollStatus, t(50), EnqueueMode::Replace).unwrap();
+        q.enqueue(EventKind::PollStatus, t(100), EnqueueMode::PreferEarlier)
+            .unwrap();
+        q.enqueue(EventKind::PollStatus, t(50), EnqueueMode::Replace)
+            .unwrap();
         assert_eq!(q.next_due_at(), Some(t(50)));
-        q.enqueue(EventKind::PollStatus, t(200), EnqueueMode::Replace).unwrap();
-        assert_eq!(q.next_due_at(), Some(t(200)),
-            "Replace overwrites even when the new time is later");
+        q.enqueue(EventKind::PollStatus, t(200), EnqueueMode::Replace)
+            .unwrap();
+        assert_eq!(
+            q.next_due_at(),
+            Some(t(200)),
+            "Replace overwrites even when the new time is later"
+        );
     }
 
     #[test]
     fn soonest_index_orders_by_time_first() {
         let mut q = EventQueue::new();
-        q.enqueue(EventKind::PollStatus, t(500), EnqueueMode::PreferEarlier).unwrap();
-        q.enqueue(EventKind::PollCurrentCook, t(100), EnqueueMode::PreferEarlier).unwrap();
-        q.enqueue(EventKind::PollRecipes, t(300), EnqueueMode::PreferEarlier).unwrap();
+        q.enqueue(EventKind::PollStatus, t(500), EnqueueMode::PreferEarlier)
+            .unwrap();
+        q.enqueue(
+            EventKind::PollCurrentCook,
+            t(100),
+            EnqueueMode::PreferEarlier,
+        )
+        .unwrap();
+        q.enqueue(EventKind::PollRecipes, t(300), EnqueueMode::PreferEarlier)
+            .unwrap();
         let idx = q.soonest_index().unwrap();
         assert_eq!(q.next_due_at(), Some(t(100)));
         // PollCurrentCook (the one with time=100) should be at that index.
@@ -214,11 +244,16 @@ mod tests {
     fn tie_broken_by_priority_command_wins_over_poll_at_same_instant() {
         let mut q = EventQueue::new();
         // Enqueue the poll first to prove this isn't insertion-order winning.
-        q.enqueue(EventKind::PollStatus, t(100), EnqueueMode::PreferEarlier).unwrap();
-        q.enqueue(EventKind::ApiStop, t(100), EnqueueMode::PreferEarlier).unwrap();
+        q.enqueue(EventKind::PollStatus, t(100), EnqueueMode::PreferEarlier)
+            .unwrap();
+        q.enqueue(EventKind::ApiStop, t(100), EnqueueMode::PreferEarlier)
+            .unwrap();
         let popped = q.pop_due(t(100)).unwrap();
-        assert_eq!(popped.kind, EventKind::ApiStop,
-            "at equal execution_time, priority-0 command beats priority-1 poll");
+        assert_eq!(
+            popped.kind,
+            EventKind::ApiStop,
+            "at equal execution_time, priority-0 command beats priority-1 poll"
+        );
     }
 
     #[test]
@@ -226,17 +261,23 @@ mod tests {
         // This is the residual §1.2 latency: a command does NOT preempt an
         // already-overdue poll, because execution_time sorts before priority.
         let mut q = EventQueue::new();
-        q.enqueue(EventKind::PollStatus, t(50), EnqueueMode::PreferEarlier).unwrap();
-        q.enqueue(EventKind::ApiStop, t(100), EnqueueMode::PreferEarlier).unwrap();
+        q.enqueue(EventKind::PollStatus, t(50), EnqueueMode::PreferEarlier)
+            .unwrap();
+        q.enqueue(EventKind::ApiStop, t(100), EnqueueMode::PreferEarlier)
+            .unwrap();
         let popped = q.pop_due(t(100)).unwrap();
-        assert_eq!(popped.kind, EventKind::PollStatus,
-            "an overdue poll (t=50) outranks a just-enqueued command (t=100)");
+        assert_eq!(
+            popped.kind,
+            EventKind::PollStatus,
+            "an overdue poll (t=50) outranks a just-enqueued command (t=100)"
+        );
     }
 
     #[test]
     fn pop_due_returns_none_when_nothing_due() {
         let mut q = EventQueue::new();
-        q.enqueue(EventKind::PollStatus, t(1000), EnqueueMode::PreferEarlier).unwrap();
+        q.enqueue(EventKind::PollStatus, t(1000), EnqueueMode::PreferEarlier)
+            .unwrap();
         assert!(q.pop_due(t(500)).is_none(), "future events are not yet due");
         assert_eq!(q.len(), 1, "non-due event stays in the queue");
     }
@@ -250,8 +291,14 @@ mod tests {
     #[test]
     fn pop_due_removes_the_event() {
         let mut q = EventQueue::new();
-        q.enqueue(EventKind::PollStatus, t(100), EnqueueMode::PreferEarlier).unwrap();
-        q.enqueue(EventKind::PollCurrentCook, t(200), EnqueueMode::PreferEarlier).unwrap();
+        q.enqueue(EventKind::PollStatus, t(100), EnqueueMode::PreferEarlier)
+            .unwrap();
+        q.enqueue(
+            EventKind::PollCurrentCook,
+            t(200),
+            EnqueueMode::PreferEarlier,
+        )
+        .unwrap();
         q.pop_due(t(150)).unwrap();
         assert_eq!(q.len(), 1);
         assert!(!q.has_pending(EventKind::PollStatus));
@@ -262,7 +309,8 @@ mod tests {
     fn has_pending_reflects_state() {
         let mut q = EventQueue::new();
         assert!(!q.has_pending(EventKind::ApiStart));
-        q.enqueue(EventKind::ApiStart, t(100), EnqueueMode::PreferEarlier).unwrap();
+        q.enqueue(EventKind::ApiStart, t(100), EnqueueMode::PreferEarlier)
+            .unwrap();
         assert!(q.has_pending(EventKind::ApiStart));
         q.pop_due(t(100));
         assert!(!q.has_pending(EventKind::ApiStart));
@@ -278,9 +326,11 @@ mod tests {
         // would require a generic. Instead, prove the dedup path doesn't
         // overflow even when "trying" repeatedly:
         for _ in 0..(EVENT_QUEUE_CAPACITY * 2) {
-            assert!(q
-                .enqueue(EventKind::PollStatus, t(100), EnqueueMode::PreferEarlier)
-                .is_ok(), "repeated enqueues of same kind never overflow");
+            assert!(
+                q.enqueue(EventKind::PollStatus, t(100), EnqueueMode::PreferEarlier)
+                    .is_ok(),
+                "repeated enqueues of same kind never overflow"
+            );
         }
         assert_eq!(q.len(), 1);
     }
@@ -291,8 +341,12 @@ mod tests {
         // running (we use `from_ticks`, not `now`).
         let mut q = EventQueue::new();
         let now = t(1000);
-        q.enqueue(EventKind::PollStatus, now + Duration::from_millis(250), EnqueueMode::PreferEarlier)
-            .unwrap();
+        q.enqueue(
+            EventKind::PollStatus,
+            now + Duration::from_millis(250),
+            EnqueueMode::PreferEarlier,
+        )
+        .unwrap();
         assert!(q.pop_due(now).is_none());
         assert!(q.pop_due(now + Duration::from_millis(250)).is_some());
     }

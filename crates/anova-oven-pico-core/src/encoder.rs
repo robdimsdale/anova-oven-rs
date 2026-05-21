@@ -155,7 +155,10 @@ mod tests {
         assert!(ticks_partial.is_empty());
         // Now reverse: 11→10, 10→00 (CCW direction in QEM)
         let ticks_reverse = feed(&mut d, &[(true, false), (false, false)]);
-        assert!(ticks_reverse.is_empty(), "reversal mid-detent must not emit");
+        assert!(
+            ticks_reverse.is_empty(),
+            "reversal mid-detent must not emit"
+        );
     }
 
     #[test]
@@ -208,7 +211,7 @@ mod tests {
         // The illegal step should not change accum or emit a tick.
         let mut d = QuadratureDecoder::new(false, false);
         feed(&mut d, &CW_SEQUENCE[1..4]); // accum = +3
-        // From state 01 (last CW state before final 00), 01 → 10 is illegal.
+                                          // From state 01 (last CW state before final 00), 01 → 10 is illegal.
         assert_eq!(d.update(true, false), None);
     }
 
