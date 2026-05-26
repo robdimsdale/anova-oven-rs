@@ -1,5 +1,4 @@
 use alloc::string::String;
-use alloc::vec::Vec;
 
 use defmt::{error, info, warn};
 use embassy_executor::{SpawnError, Spawner};
@@ -8,10 +7,19 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::watch::{Receiver, Sender, Watch};
 use embassy_time::{with_timeout, Duration, Instant, Timer};
-use heapless::Vec as HeaplessVec;
 use portable_atomic_util::Arc;
+use static_cell::StaticCell;
 
-use crate::api::{fetch_current_cook, fetch_recipes, fetch_status, send_start, send_stop};
+use anova_oven_pico_core::api::normalize_server_url;
+pub use anova_oven_pico_core::fsm::ApiSnapshot;
+use anova_oven_pico_core::scheduler::{
+    EnqueueMode, EventKind, EventQueue, ScheduledEvent, EVENT_QUEUE_CAPACITY,
+};
+
+use crate::api::{
+    fetch_current_cook, fetch_recipes, fetch_status, send_start, send_stop, Aligned,
+    HTTP_RX_BUF_LEN,
+};
 
 const API_CALL_TIMEOUT_SECS: u64 = 5;
 const POST_ACTION_COOK_REFRESH_DELAY_SECS: u64 = 1;
@@ -25,9 +33,6 @@ const POLL_BACKOFF_TIER3_FAILS: u64 = 15;
 const POLL_BACKOFF_TIER1_SECS: u64 = 5;
 const POLL_BACKOFF_TIER2_SECS: u64 = 15;
 const POLL_BACKOFF_TIER3_SECS: u64 = 30;
-const EVENT_QUEUE_CAPACITY: usize = 16;
-
-pub const OFFLINE_THRESHOLD: u64 = 3;
 
 pub type CommandChannel = Channel<CriticalSectionRawMutex, ApiCommand, 4>;
 pub type StateWatch = Watch<CriticalSectionRawMutex, ApiSnapshot, 1>;
@@ -44,146 +49,17 @@ pub enum ApiCommand {
     Stop,
 }
 
-#[derive(Clone)]
-pub struct ApiSnapshot {
-    pub status: Option<anova_oven_api::OvenStatus>,
-    pub current_cook: Option<anova_oven_api::CurrentCook>,
-    pub recipes: Arc<Vec<anova_oven_api::Recipe>>,
-    pub fail_count: u64,
-    pub last_success_at: Option<Instant>,
-}
-
-impl Default for ApiSnapshot {
-    fn default() -> Self {
-        Self {
-            status: None,
-            current_cook: None,
-            recipes: Arc::new(Vec::new()),
-            fail_count: 0,
-            last_success_at: None,
-        }
-    }
-}
-
-impl ApiSnapshot {
-    pub fn is_offline(&self) -> bool {
-        self.fail_count >= OFFLINE_THRESHOLD
-    }
-
-    pub fn has_first_data(&self) -> bool {
-        self.last_success_at.is_some()
-    }
-
-    pub fn is_cooking(&self) -> bool {
-        self.current_cook.is_some()
-            || self
-                .status
-                .as_ref()
-                .is_some_and(|status| status.mode.as_str() != "idle")
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum EventKind {
-    PollStatus,
-    PollCurrentCook,
-    PollRecipes,
-    ApiStart,
-    ApiStop,
-}
-
-#[derive(Clone, Copy)]
-struct ScheduledEvent {
-    kind: EventKind,
-    execution_time: Instant,
-    priority: u8,
-}
-
-impl EventKind {
-    fn priority(self) -> u8 {
-        match self {
-            EventKind::ApiStart | EventKind::ApiStop => 0,
-            _ => 1,
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-enum EnqueueMode {
-    PreferEarlier,
-    Replace,
-}
-
-struct EventQueue {
-    events: HeaplessVec<ScheduledEvent, EVENT_QUEUE_CAPACITY>,
-}
-
-impl EventQueue {
-    fn new() -> Self {
-        Self {
-            events: HeaplessVec::new(),
-        }
-    }
-
-    fn enqueue(&mut self, kind: EventKind, execution_time: Instant, mode: EnqueueMode) {
-        if let Some(existing) = self.events.iter_mut().find(|event| event.kind == kind) {
-            existing.execution_time = match mode {
-                EnqueueMode::PreferEarlier => existing.execution_time.min(execution_time),
-                EnqueueMode::Replace => execution_time,
-            };
-            return;
-        }
-
-        if self
-            .events
-            .push(ScheduledEvent {
-                kind,
-                execution_time,
-                priority: kind.priority(),
-            })
-            .is_err()
-        {
-            error!(
-                "Api event queue overflow (capacity {}); dropping event",
-                EVENT_QUEUE_CAPACITY
-            );
-        }
-    }
-
-    fn soonest_index(&self) -> Option<usize> {
-        self.events
-            .iter()
-            .enumerate()
-            .min_by(|(_, a), (_, b)| {
-                a.execution_time
-                    .cmp(&b.execution_time)
-                    .then(a.priority.cmp(&b.priority))
-            })
-            .map(|(idx, _)| idx)
-    }
-
-    fn next_due_at(&self) -> Option<Instant> {
-        self.soonest_index()
-            .map(|idx| self.events[idx].execution_time)
-    }
-
-    fn has_pending(&self, kind: EventKind) -> bool {
-        self.events.iter().any(|event| event.kind == kind)
-    }
-
-    fn pop_due(&mut self, now: Instant) -> Option<ScheduledEvent> {
-        let idx = self.soonest_index()?;
-        if self.events[idx].execution_time > now {
-            return None;
-        }
-
-        Some(self.events.swap_remove(idx))
-    }
-}
-
 struct ApiRuntime<'a> {
     stack: embassy_net::Stack<'static>,
     state_tx: Sender<'a, CriticalSectionRawMutex, ApiSnapshot, 1>,
+    // 16 KB HTTP RX buffer, owned exclusively by this runtime. Taken once from a
+    // StaticCell in `api_client_task`, so the "one buffer, one user" invariant is
+    // a compile-time fact rather than an unenforced `static mut` convention.
+    rx_buf: &'a mut [u8],
+    // Normalized server base URL, computed once at construction. SERVER_URL is a
+    // compile-time `env!` constant, so re-normalizing it per request just churned
+    // the heap ~1/s forever (review §2.1).
+    server_url: String,
     snapshot: ApiSnapshot,
     event_queue: EventQueue,
     pending_start_recipe_id: Option<String>,
@@ -229,19 +105,49 @@ impl<'a> ApiRuntime<'a> {
     fn new(
         stack: embassy_net::Stack<'static>,
         state_tx: Sender<'a, CriticalSectionRawMutex, ApiSnapshot, 1>,
+        rx_buf: &'a mut [u8],
     ) -> Self {
         let now = Instant::now();
         let mut event_queue = EventQueue::new();
-        event_queue.enqueue(EventKind::PollStatus, now, EnqueueMode::PreferEarlier);
-        event_queue.enqueue(EventKind::PollCurrentCook, now, EnqueueMode::PreferEarlier);
-        event_queue.enqueue(EventKind::PollRecipes, now, EnqueueMode::PreferEarlier);
+        // Stagger the three initial polls so the first drain isn't ~15 s of
+        // back-to-back network I/O during which a user Stop sits unserviced
+        // (review §1.2). A fresh queue with three pushes can't overflow.
+        let _ = event_queue.enqueue(EventKind::PollStatus, now, EnqueueMode::PreferEarlier);
+        let _ = event_queue.enqueue(
+            EventKind::PollCurrentCook,
+            now + Duration::from_millis(250),
+            EnqueueMode::PreferEarlier,
+        );
+        let _ = event_queue.enqueue(
+            EventKind::PollRecipes,
+            now + Duration::from_millis(500),
+            EnqueueMode::PreferEarlier,
+        );
 
         Self {
             stack,
             state_tx,
+            rx_buf,
+            server_url: normalize_server_url(crate::SERVER_URL),
             snapshot: ApiSnapshot::default(),
             event_queue,
             pending_start_recipe_id: None,
+        }
+    }
+
+    /// Enqueue + log on overflow. The lib's `EventQueue::enqueue` returns
+    /// `Result<(), QueueOverflow>` so it stays effect-free; the bin owns the
+    /// `error!` and the policy of dropping on overflow.
+    fn enqueue(&mut self, kind: EventKind, execution_time: Instant, mode: EnqueueMode) {
+        if self
+            .event_queue
+            .enqueue(kind, execution_time, mode)
+            .is_err()
+        {
+            error!(
+                "Api event queue overflow (capacity {}); dropping event",
+                EVENT_QUEUE_CAPACITY
+            );
         }
     }
 
@@ -275,12 +181,12 @@ impl<'a> ApiRuntime<'a> {
 
     fn queue_post_action_refresh(&mut self, now: Instant) {
         let refresh_at = now + Duration::from_secs(POST_ACTION_COOK_REFRESH_DELAY_SECS);
-        self.event_queue.enqueue(
+        self.enqueue(
             EventKind::PollStatus,
             refresh_at,
             EnqueueMode::PreferEarlier,
         );
-        self.event_queue.enqueue(
+        self.enqueue(
             EventKind::PollCurrentCook,
             refresh_at,
             EnqueueMode::PreferEarlier,
@@ -331,7 +237,12 @@ impl<'a> ApiRuntime<'a> {
         info!("Sending POST /start with recipe id: {}", recipe_id.as_str());
         if with_timeout(
             Duration::from_secs(API_CALL_TIMEOUT_SECS),
-            send_start(self.stack, recipe_id.as_str()),
+            send_start(
+                self.stack,
+                &mut *self.rx_buf,
+                &self.server_url,
+                recipe_id.as_str(),
+            ),
         )
         .await
         .is_err()
@@ -340,12 +251,12 @@ impl<'a> ApiRuntime<'a> {
         }
 
         let now = Instant::now();
-        self.event_queue.enqueue(
+        self.enqueue(
             EventKind::PollStatus,
             now + Duration::from_secs(POST_ACTION_COOK_REFRESH_DELAY_SECS),
             EnqueueMode::PreferEarlier,
         );
-        self.event_queue.enqueue(
+        self.enqueue(
             EventKind::PollCurrentCook,
             now + Duration::from_secs(POST_START_CURRENT_COOK_REFRESH_DELAY_SECS),
             EnqueueMode::PreferEarlier,
@@ -355,7 +266,7 @@ impl<'a> ApiRuntime<'a> {
     async fn handle_api_stop(&mut self) {
         if with_timeout(
             Duration::from_secs(API_CALL_TIMEOUT_SECS),
-            send_stop(self.stack),
+            send_stop(self.stack, &mut *self.rx_buf, &self.server_url),
         )
         .await
         .is_err()
@@ -366,7 +277,7 @@ impl<'a> ApiRuntime<'a> {
 
     async fn handle_poll_status(&mut self) {
         if self.poll_action_in_flight() {
-            self.event_queue.enqueue(
+            self.enqueue(
                 EventKind::PollStatus,
                 Instant::now() + Duration::from_secs(POST_ACTION_COOK_REFRESH_DELAY_SECS),
                 EnqueueMode::PreferEarlier,
@@ -376,15 +287,15 @@ impl<'a> ApiRuntime<'a> {
 
         match with_timeout(
             Duration::from_secs(API_CALL_TIMEOUT_SECS),
-            fetch_status(self.stack),
+            fetch_status(self.stack, &mut *self.rx_buf, &self.server_url),
         )
         .await
         {
-            Ok(Some(status)) => {
+            Ok(Ok(status)) => {
                 self.snapshot.status = Some(status);
                 self.record_fast_poll_success();
             }
-            Ok(None) => {
+            Ok(Err(_)) => {
                 self.record_fast_poll_failure("GET /status failed");
             }
             Err(_) => {
@@ -395,7 +306,7 @@ impl<'a> ApiRuntime<'a> {
         let interval = self
             .next_poll_interval_secs()
             .max(NORMAL_POLL_INTERVAL_SECS);
-        self.event_queue.enqueue(
+        self.enqueue(
             EventKind::PollStatus,
             Instant::now() + Duration::from_secs(interval),
             EnqueueMode::PreferEarlier,
@@ -406,7 +317,7 @@ impl<'a> ApiRuntime<'a> {
 
     async fn handle_poll_current_cook(&mut self) {
         if self.poll_action_in_flight() {
-            self.event_queue.enqueue(
+            self.enqueue(
                 EventKind::PollCurrentCook,
                 Instant::now() + Duration::from_secs(POST_ACTION_COOK_REFRESH_DELAY_SECS),
                 EnqueueMode::PreferEarlier,
@@ -416,14 +327,21 @@ impl<'a> ApiRuntime<'a> {
 
         match with_timeout(
             Duration::from_secs(API_CALL_TIMEOUT_SECS),
-            fetch_current_cook(self.stack),
+            fetch_current_cook(self.stack, &mut *self.rx_buf, &self.server_url),
         )
         .await
         {
-            Ok(current_cook) => {
-                self.snapshot.current_cook = current_cook;
+            Ok(Ok(Some(cook))) => {
+                self.snapshot.current_cook = Some(cook);
                 self.record_fast_poll_success();
                 self.reconcile_current_cook_recipe_title();
+            }
+            Ok(Ok(None)) => {
+                self.snapshot.current_cook = None;
+                self.record_fast_poll_success();
+            }
+            Ok(Err(_)) => {
+                self.record_fast_poll_failure("GET /current-cook failed");
             }
             Err(_) => {
                 self.record_fast_poll_failure("GET /current-cook timed out");
@@ -431,7 +349,7 @@ impl<'a> ApiRuntime<'a> {
         }
 
         let interval = self.next_poll_interval_secs().max(COOK_POLL_INTERVAL_SECS);
-        self.event_queue.enqueue(
+        self.enqueue(
             EventKind::PollCurrentCook,
             Instant::now() + Duration::from_secs(interval),
             EnqueueMode::PreferEarlier,
@@ -443,12 +361,15 @@ impl<'a> ApiRuntime<'a> {
     async fn handle_poll_recipes(&mut self) {
         match with_timeout(
             Duration::from_secs(API_CALL_TIMEOUT_SECS),
-            fetch_recipes(self.stack),
+            fetch_recipes(self.stack, &mut *self.rx_buf, &self.server_url),
         )
         .await
         {
-            Ok(recipes) => {
+            Ok(Ok(recipes)) => {
                 self.snapshot.recipes = Arc::new(recipes);
+            }
+            Ok(Err(_)) => {
+                warn!("GET /recipes: fetch failed");
             }
             Err(_) => {
                 warn!("GET /recipes: timed out");
@@ -460,7 +381,7 @@ impl<'a> ApiRuntime<'a> {
         let interval = self
             .next_poll_interval_secs()
             .max(RECIPE_POLL_INTERVAL_SECS);
-        self.event_queue.enqueue(
+        self.enqueue(
             EventKind::PollRecipes,
             Instant::now() + Duration::from_secs(interval),
             EnqueueMode::PreferEarlier,
@@ -473,13 +394,19 @@ impl<'a> ApiRuntime<'a> {
 
         match command {
             ApiCommand::Start { recipe_id } => {
+                // If two Start commands for different recipes arrive before the
+                // drain loop services them, this overwrites the first recipe id
+                // and the two ApiStart events coalesce (enqueue dedups by
+                // kind), so recipe A is silently dropped in favour of B. This
+                // is acceptable: two back-to-back starts for different recipes
+                // would be rejected by the upstream Anova oven server (not our
+                // intermediary server) anyway, so only the latter could ever
+                // have taken effect.
                 self.pending_start_recipe_id = Some(recipe_id);
-                self.event_queue
-                    .enqueue(EventKind::ApiStart, now, EnqueueMode::PreferEarlier);
+                self.enqueue(EventKind::ApiStart, now, EnqueueMode::PreferEarlier);
             }
             ApiCommand::Stop => {
-                self.event_queue
-                    .enqueue(EventKind::ApiStop, now, EnqueueMode::PreferEarlier);
+                self.enqueue(EventKind::ApiStop, now, EnqueueMode::PreferEarlier);
                 self.queue_post_action_refresh(now);
             }
         }
@@ -492,17 +419,30 @@ async fn api_client_task(
     commands: &'static CommandChannel,
     state: &'static StateWatch,
 ) -> ! {
-    let mut runtime = ApiRuntime::new(stack, state.sender());
+    static RX_BUF: StaticCell<Aligned<HTTP_RX_BUF_LEN>> = StaticCell::new();
+    let rx_buf = &mut RX_BUF.init(Aligned([0u8; HTTP_RX_BUF_LEN])).0[..];
+    let mut runtime = ApiRuntime::new(stack, state.sender(), rx_buf);
 
     loop {
         crate::persist::bump_api_heartbeat();
         if let Some(next_due) = runtime.event_queue.next_due_at() {
             match select(Timer::at(next_due), commands.receive()).await {
-                Either::First(()) => {
-                    while let Some(event) = runtime.event_queue.pop_due(Instant::now()) {
-                        runtime.handle_event(event).await;
+                Either::First(()) => loop {
+                    // Service pending commands before each event so a user
+                    // Stop/Start isn't stuck behind a multi-second poll drain
+                    // (review §1.2). handle_command enqueues ApiStop/ApiStart
+                    // at `now` with priority 0, so the following pop_due
+                    // tie-breaks it ahead of any other poll due at the same
+                    // instant. Exit once nothing is due and park in the outer
+                    // select.
+                    while let Ok(command) = commands.try_receive() {
+                        runtime.handle_command(command);
                     }
-                }
+                    match runtime.event_queue.pop_due(Instant::now()) {
+                        Some(event) => runtime.handle_event(event).await,
+                        None => break,
+                    }
+                },
                 Either::Second(command) => runtime.handle_command(command),
             }
         } else {

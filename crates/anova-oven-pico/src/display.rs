@@ -1,10 +1,10 @@
-use alloc::string::String;
-
 use embassy_executor::{SpawnError, Spawner};
 use embassy_futures::select::{select, Either};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Timer};
+
+pub use anova_oven_pico_core::fsm::ViewSpec;
 
 use crate::lcd::LcdController;
 
@@ -13,38 +13,6 @@ const ANIM_TICK_MS: u64 = 50;
 pub type DisplayNotifier = Signal<CriticalSectionRawMutex, ViewSpec>;
 
 pub struct Display<'a>(&'a DisplayNotifier);
-
-#[derive(Clone)]
-pub enum ViewSpec {
-    WifiInit,
-    DhcpInit,
-    Connecting,
-    ServerOffline,
-    Status {
-        status: Option<anova_oven_api::OvenStatus>,
-        cook: Option<anova_oven_api::CurrentCook>,
-    },
-    RecipeBrowser {
-        count: usize,
-        index: usize,
-        title: String,
-    },
-    StopConfirmation {
-        status: Option<anova_oven_api::OvenStatus>,
-        cook: Option<anova_oven_api::CurrentCook>,
-    },
-    StartingCook {
-        recipe_title: String,
-    },
-    NextStagePrompt {
-        recipe_title: String,
-    },
-    Recovery {
-        reset_count: u32,
-        panic_count: u32,
-        message: Option<String>,
-    },
-}
 
 impl<'a> Display<'a> {
     pub fn new(

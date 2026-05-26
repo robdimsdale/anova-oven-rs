@@ -77,9 +77,9 @@ impl LcdController {
     /// long text: after completing one full scroll AND the end-pause has elapsed;
     /// short text: after MIN_SLOT_HOLD_MS has elapsed.
     fn row1_animation_done(&self) -> bool {
-        self.row1_scroll_state.as_ref().map_or(false, |state| {
-            state.cycle_complete && Instant::now() >= state.pause_until
-        })
+        self.row1_scroll_state
+            .as_ref()
+            .is_some_and(|state| state.cycle_complete && Instant::now() >= state.pause_until)
     }
 
     pub(crate) async fn render(&mut self, view: &ViewSpec) {

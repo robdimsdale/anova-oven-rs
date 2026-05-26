@@ -1,0 +1,40 @@
+name: Test PR
+
+on:
+  pull_request:
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install stable toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --release -- -D warnings
+
+      - name: cargo test
+        run: cargo test --release --all
+
+      - name: Install nightly toolchain for pico
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: nightly
+          target: thumbv6m-none-eabi
+
+      - name: cargo build pico (thumbv6m-none-eabi)
+        working-directory: crates/anova-oven-pico
+        env:
+          ANOVA_WIFI_SSID: ci-dummy-ssid
+          ANOVA_WIFI_PASSWORD: ci-dummy-password
+          ANOVA_SERVER_URL: http://192.0.2.1:8080
+        run: cargo build --release
