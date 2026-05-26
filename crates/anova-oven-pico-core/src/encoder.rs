@@ -1,6 +1,6 @@
-//! Pure quadrature decoder for the rotary encoder. The embassy GPIO wait
-//! + debounce + channel send stays in the bin; this module owns the
-//! state machine (QEM lookup + accumulator + direction-reversal reset).
+//! Pure quadrature decoder for the rotary encoder.
+//! The embassy GPIO wait + debounce + channel send stays in the binary;
+//! this module owns the state machine (QEM lookup + accumulator + direction-reversal reset).
 
 /// One direction-tick at a detent boundary. Maps to `InputEvent::EncoderCW`
 /// / `EncoderCCW` at the bin's call site.

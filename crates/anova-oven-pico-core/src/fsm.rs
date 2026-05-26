@@ -72,9 +72,10 @@ impl ApiSnapshot {
 
 /// FSM state. Each variant maps to one `execute_*` handler in the bin's
 /// `state.rs` that handles the input/timer events for that screen.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub enum AppState {
     Offline,
+    #[default]
     Idle,
     Cooking {
         optimistic_recipe_title: Option<String>,
@@ -94,12 +95,6 @@ pub enum AppState {
     AwaitNextStage {
         next_description: String,
     },
-}
-
-impl Default for AppState {
-    fn default() -> Self {
-        Self::Idle
-    }
 }
 
 impl AppState {

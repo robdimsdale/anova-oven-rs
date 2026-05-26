@@ -748,7 +748,7 @@ mod tests {
         }
     }
 
-    fn effect_ws<'a>(effects: &'a [SmEffect]) -> Option<&'a WsCommand> {
+    fn effect_ws(effects: &[SmEffect]) -> Option<&WsCommand> {
         effects.iter().find_map(|e| match e {
             SmEffect::Ws(c) => Some(c),
             _ => None,
