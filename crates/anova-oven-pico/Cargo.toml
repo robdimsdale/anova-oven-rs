@@ -58,7 +58,7 @@
     "critical-section-impl",
     "rp2040",
   ] }
-  embassy-net = { version = "0.9.0", default-features = false, features = [
+  embassy-net = { version = "0.9.1", default-features = false, features = [
     "tcp",
     "dhcpv4",
     "dns",
