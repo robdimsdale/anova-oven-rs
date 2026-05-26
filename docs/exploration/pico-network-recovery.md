@@ -5,6 +5,26 @@ upstream HTTP server (`anova-oven-server`) becomes unreachable, then comes
 back. This is a record of what we tried, what worked, what didn't, and the
 hard constraints we discovered along the way.
 
+> **Historical note (2026-05-26):** the source layout referenced below
+> describes the pico crate as it was during this investigation. The
+> backoff logic and `next_poll_interval_secs` helper still exist but have
+> moved during the scheduler refactor:
+>
+> - `app_state.rs` is now [`state.rs`](../../crates/anova-oven-pico/src/state.rs).
+> - Poll scheduling and `server_fail_count` (renamed `fail_count`) now
+>   live in [`api_client.rs`](../../crates/anova-oven-pico/src/api_client.rs),
+>   not `main.rs`. `next_poll_interval_secs` is a method on the API
+>   client's snapshot, fed from an `EventQueue` (in
+>   `anova-oven-pico-core::scheduler`) rather than a `next_poll_at`
+>   `Instant` in the main loop.
+> - The four backoff tiers (1 s / 5 s / 15 s / 30 s) are still in
+>   place, expressed as `POLL_BACKOFF_TIER1/2/3_*` constants.
+> - `cyw43` is still pinned at 0.7.0; the underlying RX-channel
+>   constraint described below is unchanged.
+>
+> The diagnostic conclusions and "what we did / did not do" decisions
+> remain accurate.
+
 ## Original symptom
 
 - Pico W is happily polling the server (`/status` every 1s, `/current-cook`
