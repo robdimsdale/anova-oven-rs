@@ -62,8 +62,7 @@ use cortex_m_rt::{exception, ExceptionFrame};
 //   v3 = 0xA9B0_C1D4 — added last_free_heap/network_up/last_api_fail_count
 //                      live fields; RingEntry grown to 6 u32
 const MAGIC: u32 = 0xA9B0_C1D4;
-const MSG_BUF_SIZE: usize = 512;
-const RING_SIZE: usize = 8;
+pub use anova_oven_pico_core::persist_data::{MSG_BUF_SIZE, RING_SIZE};
 
 /// RP2040 WATCHDOG.REASON register. Bit 0 = TIMER (timed out), bit 1 =
 /// FORCE (TRIGGER bit set in CTRL). Bits clear when the watchdog is
@@ -82,6 +81,13 @@ struct RingEntry {
 }
 
 const RING_ENTRY_WORDS: usize = 6;
+
+// Decoded data types live in pico-core so the `/health` JSON shape is
+// host-testable and Serialize-derived (no parallel response struct to
+// drift). The bin owns only the embedded MMIO read/write logic below.
+pub use anova_oven_pico_core::persist_data::{
+    AppStateLabel, Heartbeats, ResetHistoryEntry, Snapshot,
+};
 
 #[repr(C)]
 struct PersistRegion {
@@ -107,69 +113,7 @@ struct PersistRegion {
 #[link_section = ".uninit.PERSIST"]
 static mut PERSIST: MaybeUninit<PersistRegion> = MaybeUninit::uninit();
 
-/// What caused the boot we're currently in.
-#[derive(Copy, Clone, defmt::Format)]
-#[repr(u32)]
-pub enum ResetReason {
-    /// Reserved for invalid stored values — used when decoding old ring
-    /// entries with values outside the known enum range.
-    Unknown = 0,
-    /// Magic word was invalid — first boot since power-on, or RAM lost.
-    ColdBoot = 1,
-    /// Previous run hit our `#[panic_handler]` (or HardFault) which then
-    /// called `SCB::sys_reset()`.
-    Panic = 2,
-    /// RP2040 watchdog timed out (no `feed()` within the timeout window).
-    WatchdogTimeout = 3,
-    /// `Watchdog::trigger_reset()` was called explicitly. Not used by our
-    /// firmware today; present for completeness.
-    WatchdogForced = 4,
-    /// `SCB::sys_reset()` (or external NRST) without a panic. Shouldn't
-    /// happen in normal operation.
-    OtherSoftReset = 5,
-}
-
-impl ResetReason {
-    fn from_u32(v: u32) -> Self {
-        match v {
-            1 => Self::ColdBoot,
-            2 => Self::Panic,
-            3 => Self::WatchdogTimeout,
-            4 => Self::WatchdogForced,
-            5 => Self::OtherSoftReset,
-            _ => Self::Unknown,
-        }
-    }
-}
-
-#[derive(Copy, Clone, defmt::Format)]
-pub struct ResetHistoryEntry {
-    pub reset_reason: ResetReason,
-    pub uptime_secs: u32,
-    pub api_heartbeat: u32,
-    pub free_heap: u32,
-    pub network_up: bool,
-    pub api_fail_count: u32,
-}
-
-#[derive(Clone)]
-pub struct Snapshot {
-    pub reset_count: u32,
-    pub panic_count: u32,
-    pub message: Option<heapless::String<MSG_BUF_SIZE>>,
-    /// True when `panic_count` advanced past `last_displayed_panic_count`
-    /// — i.e. a panic happened since the last LCD recovery view.
-    pub message_is_new: bool,
-    pub reset_reason: ResetReason,
-    pub last_app_state: u32,
-    pub last_uptime_secs: u32,
-    pub api_heartbeat: u32,
-    pub display_heartbeat: u32,
-    pub watchdog_heartbeat: u32,
-    /// The last RING_SIZE resets, newest first. Includes the reset that
-    /// produced *this* boot at index 0 (unless it was a cold boot).
-    pub reset_history: heapless::Vec<ResetHistoryEntry, RING_SIZE>,
-}
+pub use anova_oven_pico_core::reset::{ResetReason, INIT_STAGE_DHCP, INIT_STAGE_WIFI};
 
 fn region_ptr() -> *mut PersistRegion {
     #[allow(static_mut_refs)]
@@ -296,26 +240,103 @@ fn read_watchdog_reason_raw() -> (bool, bool) {
     (timer, force)
 }
 
-/// Combine WATCHDOG.REASON with our persist state to decide what kind of
-/// reset just happened. Called only by `init_at_boot()`.
-///
-/// A panic is checked *before* the watchdog timer bit on purpose: a
-/// panic is the root cause, and if a slow/hung panic handler lets the
-/// watchdog fire too (WATCHDOG.REASON.TIMER set), we still want the
-/// reset attributed to the panic rather than masked as a plain
-/// watchdog timeout.
-fn classify_reset(magic_was_valid: bool, panic_count_advanced: bool) -> ResetReason {
+/// Thin wrapper around `pico_core::reset::classify_reset` that injects the
+/// MMIO read of WATCHDOG.REASON. The pure classification logic (with its
+/// panic-beats-watchdog precedence and `InitTimeout` inference) lives in
+/// the lib and is unit-tested there.
+fn classify_reset(
+    magic_was_valid: bool,
+    panic_count_advanced: bool,
+    last_app_state: u32,
+) -> ResetReason {
     let (timer, force) = read_watchdog_reason_raw();
-    if !magic_was_valid {
-        ResetReason::ColdBoot
-    } else if panic_count_advanced {
-        ResetReason::Panic
-    } else if timer {
-        ResetReason::WatchdogTimeout
-    } else if force {
-        ResetReason::WatchdogForced
-    } else {
-        ResetReason::OtherSoftReset
+    anova_oven_pico_core::reset::classify_reset(
+        magic_was_valid,
+        panic_count_advanced,
+        last_app_state,
+        timer,
+        force,
+    )
+}
+
+/// Re-read the entire persist region. Safe to call at any time after
+/// `init_at_boot()` has run. The fields are u32-aligned and updated
+/// individually with `write_volatile`, so torn reads (a 32-bit value
+/// captured mid-write) are not possible on Cortex-M0+ where word writes
+/// are atomic; multi-field consistency is best-effort (e.g. the ring's
+/// `ring_head` might advance one entry between reads, which is harmless
+/// — `ring_read` re-derives indices from the head it observes).
+pub fn read_live() -> Snapshot {
+    let ptr = region_ptr();
+    unsafe {
+        let magic_valid = magic_valid();
+        let reset_count = core::ptr::read_volatile(core::ptr::addr_of!((*ptr).reset_count));
+        let panic_count = core::ptr::read_volatile(core::ptr::addr_of!((*ptr).panic_count));
+        let last_displayed_panic_count =
+            core::ptr::read_volatile(core::ptr::addr_of!((*ptr).last_displayed_panic_count));
+        let reset_reason_raw = core::ptr::read_volatile(core::ptr::addr_of!((*ptr).reset_reason));
+        let last_app_state = core::ptr::read_volatile(core::ptr::addr_of!((*ptr).last_app_state));
+        let last_uptime_secs =
+            core::ptr::read_volatile(core::ptr::addr_of!((*ptr).last_uptime_secs));
+        let api_heartbeat = core::ptr::read_volatile(core::ptr::addr_of!((*ptr).api_heartbeat));
+        let display_heartbeat =
+            core::ptr::read_volatile(core::ptr::addr_of!((*ptr).display_heartbeat));
+        let watchdog_heartbeat =
+            core::ptr::read_volatile(core::ptr::addr_of!((*ptr).watchdog_heartbeat));
+        let last_free_heap = core::ptr::read_volatile(core::ptr::addr_of!((*ptr).last_free_heap));
+        let network_up = core::ptr::read_volatile(core::ptr::addr_of!((*ptr).network_up)) != 0;
+        let last_api_fail_count =
+            core::ptr::read_volatile(core::ptr::addr_of!((*ptr).last_api_fail_count));
+        let ring_head = core::ptr::read_volatile(core::ptr::addr_of!((*ptr).ring_head));
+
+        let reset_history = ring_read();
+
+        // Same logic as init_at_boot for the message: copy up to msg_len
+        // bytes and trim to a valid UTF-8 prefix. The buffer survives
+        // until the next panic so /health can keep returning it across
+        // many requests after a crash.
+        let len = core::ptr::read_volatile(core::ptr::addr_of!((*ptr).msg_len)) as usize;
+        let message = if magic_valid && len > 0 && len <= MSG_BUF_SIZE {
+            let mut bytes: heapless::Vec<u8, MSG_BUF_SIZE> = heapless::Vec::new();
+            let bytes_ptr = core::ptr::addr_of!((*ptr).msg_buf) as *const u8;
+            for i in 0..len {
+                let _ = bytes.push(core::ptr::read_volatile(bytes_ptr.add(i)));
+            }
+            let valid_end = match core::str::from_utf8(&bytes) {
+                Ok(_) => bytes.len(),
+                Err(e) => e.valid_up_to(),
+            };
+            let mut s: heapless::String<MSG_BUF_SIZE> = heapless::String::new();
+            if let Ok(prefix) = core::str::from_utf8(&bytes[..valid_end]) {
+                let _ = s.push_str(prefix);
+            }
+            Some(s)
+        } else {
+            None
+        };
+
+        Snapshot {
+            magic_valid,
+            uptime_secs: embassy_time::Instant::now().as_secs(),
+            reset_count,
+            panic_count,
+            last_displayed_panic_count,
+            message_is_new: panic_count > last_displayed_panic_count,
+            reset_reason: ResetReason::from_u32(reset_reason_raw),
+            last_app_state: AppStateLabel::from_discriminant(last_app_state),
+            last_uptime_secs,
+            heartbeats: Heartbeats {
+                api: api_heartbeat,
+                display: display_heartbeat,
+                watchdog: watchdog_heartbeat,
+            },
+            last_free_heap,
+            network_up,
+            last_api_fail_count,
+            ring_head,
+            reset_history,
+            message,
+        }
     }
 }
 
@@ -327,58 +348,38 @@ fn classify_reset(magic_was_valid: bool, panic_count_advanced: bool) -> ResetRea
 /// later point.
 pub fn init_at_boot() -> Snapshot {
     let ptr = region_ptr();
-    let mut reset_count;
-    let panic_count;
-    let last_displayed_panic_count;
+
+    // Side effects: validate / zero, bump reset_count, classify and
+    // persist reset_reason, append the previous run to the ring, then
+    // clear per-run breadcrumbs. Only the values needed for the
+    // classification + ring-append decisions are read inline; everything
+    // else is picked up by the `read_live()` call at the end so the two
+    // entry points share one read implementation.
+    let magic_was_valid;
     let last_app_state;
     let last_uptime_secs;
-    let api_heartbeat;
-    let display_heartbeat;
-    let watchdog_heartbeat;
-    let magic_was_valid;
-    let mut message: Option<heapless::String<MSG_BUF_SIZE>> = None;
-
+    let panic_count_advanced;
     unsafe {
         magic_was_valid = magic_valid();
         if !magic_was_valid {
             zero_region();
         }
 
-        reset_count = core::ptr::read_volatile(core::ptr::addr_of!((*ptr).reset_count));
-        reset_count = reset_count.wrapping_add(1);
-        core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr).reset_count), reset_count);
+        let rc = core::ptr::read_volatile(core::ptr::addr_of!((*ptr).reset_count));
+        core::ptr::write_volatile(
+            core::ptr::addr_of_mut!((*ptr).reset_count),
+            rc.wrapping_add(1),
+        );
 
-        panic_count = core::ptr::read_volatile(core::ptr::addr_of!((*ptr).panic_count));
-        last_displayed_panic_count =
-            core::ptr::read_volatile(core::ptr::addr_of!((*ptr).last_displayed_panic_count));
         last_app_state = core::ptr::read_volatile(core::ptr::addr_of!((*ptr).last_app_state));
         last_uptime_secs = core::ptr::read_volatile(core::ptr::addr_of!((*ptr).last_uptime_secs));
-        api_heartbeat = core::ptr::read_volatile(core::ptr::addr_of!((*ptr).api_heartbeat));
-        display_heartbeat = core::ptr::read_volatile(core::ptr::addr_of!((*ptr).display_heartbeat));
-        watchdog_heartbeat =
-            core::ptr::read_volatile(core::ptr::addr_of!((*ptr).watchdog_heartbeat));
-
-        let len = core::ptr::read_volatile(core::ptr::addr_of!((*ptr).msg_len)) as usize;
-        if len > 0 && len <= MSG_BUF_SIZE {
-            let mut bytes: heapless::Vec<u8, MSG_BUF_SIZE> = heapless::Vec::new();
-            let bytes_ptr = core::ptr::addr_of!((*ptr).msg_buf) as *const u8;
-            for i in 0..len {
-                let _ = bytes.push(core::ptr::read_volatile(bytes_ptr.add(i)));
-            }
-            let mut s: heapless::String<MSG_BUF_SIZE> = heapless::String::new();
-            let valid_end = match core::str::from_utf8(&bytes) {
-                Ok(_) => bytes.len(),
-                Err(e) => e.valid_up_to(),
-            };
-            if let Ok(prefix) = core::str::from_utf8(&bytes[..valid_end]) {
-                let _ = s.push_str(prefix);
-            }
-            message = Some(s);
-        }
+        let panic_count = core::ptr::read_volatile(core::ptr::addr_of!((*ptr).panic_count));
+        let last_displayed_panic_count =
+            core::ptr::read_volatile(core::ptr::addr_of!((*ptr).last_displayed_panic_count));
+        panic_count_advanced = panic_count > last_displayed_panic_count;
     }
 
-    let message_is_new = panic_count > last_displayed_panic_count;
-    let reset_reason = classify_reset(magic_was_valid, message_is_new);
+    let reset_reason = classify_reset(magic_was_valid, panic_count_advanced, last_app_state);
 
     // Persist the classified reason so it's readable via probe-rs at any
     // point in this boot's lifetime. (init_at_boot is the only writer.)
@@ -387,43 +388,33 @@ pub fn init_at_boot() -> Snapshot {
             core::ptr::addr_of_mut!((*ptr).reset_reason),
             reset_reason as u32,
         );
-    }
 
-    // Append this boot's reset to the ring buffer (excluding cold boot —
-    // there's no meaningful "previous run" duration to record). The
-    // uptime we log is the previous run's `last_uptime_secs`, i.e. how
-    // long the run that just ended had been alive at its last watchdog
-    // feed.
-    if !matches!(reset_reason, ResetReason::ColdBoot) {
-        unsafe {
+        // Append this boot's reset to the ring buffer (excluding cold
+        // boot — there's no meaningful "previous run" duration to
+        // record). The uptime we log is the previous run's
+        // `last_uptime_secs`, i.e. how long the run that just ended had
+        // been alive at its last watchdog feed. Must happen *before* we
+        // zero the live breadcrumbs below — ring_append snapshots them
+        // for the entry.
+        if !matches!(reset_reason, ResetReason::ColdBoot) {
             ring_append(reset_reason, last_uptime_secs);
         }
-    }
-    let reset_history = unsafe { ring_read() };
 
-    // Reset per-run breadcrumbs now that the previous run's values have
-    // been snapshotted into the ring. These describe the *current* run
-    // and must start clean so a freeze before the network comes up (or
-    // before the first feed) is distinguishable from one after.
-    unsafe {
+        // Reset per-run breadcrumbs now that the previous run's values
+        // have been captured into the ring. These describe the *current*
+        // run and must start clean so a freeze before the network comes
+        // up (or before the first feed) is distinguishable from one
+        // after.
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr).network_up), 0);
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr).last_api_fail_count), 0);
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr).last_free_heap), 0);
     }
 
-    Snapshot {
-        reset_count,
-        panic_count,
-        message,
-        message_is_new,
-        reset_reason,
-        last_app_state,
-        last_uptime_secs,
-        api_heartbeat,
-        display_heartbeat,
-        watchdog_heartbeat,
-        reset_history,
-    }
+    // The region is now in its steady "this-run" state — every field
+    // reflects either the previous run (heartbeats, ring) or the fresh
+    // start (zeroed breadcrumbs, just-classified reset_reason). A live
+    // read is the snapshot we want.
+    read_live()
 }
 
 /// Advance `last_displayed_panic_count` to the current `panic_count` so
@@ -449,6 +440,20 @@ pub fn record_app_state(discriminant: u32) {
     unsafe {
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr).last_app_state), discriminant);
     }
+}
+
+/// Deliberately reboot because a bring-up stage (WiFi join / DHCP)
+/// didn't complete within its deadline. Caller must have set the
+/// `last_app_state` breadcrumb to the relevant `INIT_STAGE_*` value
+/// (via `record_app_state`) *before* the wait, so that this plain soft
+/// reset is attributed to `ResetReason::InitTimeout` next boot and the
+/// reset ring records which stage stalled. Never returns.
+///
+/// Safe to call from normal async context (unlike the panic path, this
+/// isn't re-entrancy-sensitive — the caller should `warn!` first).
+pub fn reboot_init_timeout() -> ! {
+    cortex_m::asm::dsb();
+    SCB::sys_reset();
 }
 
 /// Update the "uptime at last successful watchdog feed" breadcrumb.

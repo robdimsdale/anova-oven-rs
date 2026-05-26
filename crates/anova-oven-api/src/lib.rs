@@ -389,7 +389,7 @@ impl CurrentCook {
     /// This heuristic is broken for multi-stage cooks where multiple stages
     /// share the same [`Stage::kind`]. Prefer reading
     /// [`OvenStatus::cook_progress`] (`current_stage_index`) when available.
-    #[deprecated(note = "use OvenStatus::cook_progress.current_stage_index instead")]
+    #[deprecated(note = "use OvenStatus:: instead")]
     pub fn current_stage(&self, status: &OvenStatus) -> Option<&Stage> {
         let kind = status.stage_kind();
         self.stages.iter().find(|s| s.kind == kind)

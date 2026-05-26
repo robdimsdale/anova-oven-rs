@@ -1,3 +1,4 @@
+use anova_oven_pico_core::encoder::{EncoderTick, QuadratureDecoder};
 use defmt::{info, warn};
 use embassy_executor::{SpawnError, Spawner};
 use embassy_rp::gpio::Input as GpioInput;
@@ -59,44 +60,34 @@ pub async fn rotary_encoder_task(
     mut pin_b: GpioInput<'static>,
     channel: &'static InputChannel,
 ) -> ! {
-    const QEM: [i8; 16] = [0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0];
-    const TRANSITIONS_PER_DETENT: i8 = 4;
-
-    let mut prev = ((pin_a.is_low() as u8) << 1) | (pin_b.is_low() as u8);
-    let mut accum: i8 = 0;
+    let mut decoder = QuadratureDecoder::new(pin_a.is_low(), pin_b.is_low());
 
     loop {
         embassy_futures::select::select(pin_a.wait_for_any_edge(), pin_b.wait_for_any_edge()).await;
         Timer::after(Duration::from_micros(500)).await;
 
-        let curr = ((pin_a.is_low() as u8) << 1) | (pin_b.is_low() as u8);
-        let dir = QEM[((prev << 2) | curr) as usize];
-        prev = curr;
-
-        if dir == 0 {
+        let Some(tick) = decoder.update(pin_a.is_low(), pin_b.is_low()) else {
             continue;
-        }
+        };
 
-        if (accum > 0 && dir < 0) || (accum < 0 && dir > 0) {
-            accum = 0;
-        }
-
-        accum += dir;
-
-        if accum >= TRANSITIONS_PER_DETENT {
-            #[cfg(feature = "verbose-logs")]
-            info!("Rotary encoder: CW");
-            if channel.try_send(InputEvent::EncoderCW).is_err() {
-                warn!("Input channel full; dropping encoder CW event");
+        let event = match tick {
+            EncoderTick::Cw => InputEvent::EncoderCW,
+            EncoderTick::Ccw => InputEvent::EncoderCCW,
+        };
+        #[cfg(feature = "verbose-logs")]
+        info!(
+            "Rotary encoder: {}",
+            match tick {
+                EncoderTick::Cw => "CW",
+                EncoderTick::Ccw => "CCW",
             }
-            accum = 0;
-        } else if accum <= -TRANSITIONS_PER_DETENT {
-            #[cfg(feature = "verbose-logs")]
-            info!("Rotary encoder: CCW");
-            if channel.try_send(InputEvent::EncoderCCW).is_err() {
-                warn!("Input channel full; dropping encoder CCW event");
-            }
-            accum = 0;
+        );
+        if channel.try_send(event).is_err() {
+            let direction = match tick {
+                EncoderTick::Cw => "CW",
+                EncoderTick::Ccw => "CCW",
+            };
+            warn!("Input channel full; dropping encoder {} event", direction);
         }
     }
 }

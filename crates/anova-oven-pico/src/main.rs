@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![feature(impl_trait_in_assoc_type)]
 
 extern crate alloc;
 
@@ -7,6 +8,7 @@ mod api;
 mod api_client;
 mod backlight;
 mod display;
+mod health;
 mod input;
 mod lcd;
 mod persist;
@@ -30,7 +32,7 @@ use embassy_rp::watchdog::Watchdog;
 use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
 use embassy_sync::watch::Watch;
-use embassy_time::{Delay, Duration, Instant, Timer};
+use embassy_time::{with_timeout, Delay, Duration, Instant, Timer};
 use hd44780_driver::{
     bus::FourBitBusPins, memory_map::MemoryMap1602, non_blocking::HD44780,
     setup::DisplayOptions4Bit,
@@ -42,7 +44,7 @@ use crate::backlight::BacklightController;
 use crate::display::{Display, DisplayNotifier, ViewSpec};
 use crate::input::{Input, InputChannel};
 use crate::lcd::LcdController;
-use crate::state::{AppState, Ctx};
+use crate::state::{execute, AppState, Ctx};
 
 const WIFI_SSID: &str = env!("ANOVA_WIFI_SSID");
 const WIFI_PASSWORD: &str = env!("ANOVA_WIFI_PASSWORD");
@@ -50,6 +52,15 @@ pub(crate) const SERVER_URL: &str = env!("ANOVA_SERVER_URL");
 
 const WATCHDOG_TIMEOUT_SECS: u64 = 8;
 const WATCHDOG_FEED_INTERVAL_SECS: u64 = 2;
+/// Bring-up deadlines. The WiFi join and DHCP waits used to be unbounded
+/// loops; with the watchdog feeder running unconditionally, a stall here
+/// (e.g. associated to the AP but no DHCP lease) hangs the box forever
+/// instead of recovering. On timeout we deliberately reboot and retry
+/// from a clean slate (see `persist::reboot_init_timeout`). Generous
+/// values: a real join can take >10s and slow networks lease slowly;
+/// we only want to catch genuine "never going to happen" stalls.
+const WIFI_JOIN_DEADLINE_SECS: u64 = 45;
+const DHCP_DEADLINE_SECS: u64 = 45;
 const RECOVERY_DISPLAY_SECS: u64 = 30;
 const RECOVERY_RENDER_TICK_MS: u64 = 50;
 
@@ -161,12 +172,13 @@ async fn main(spawner: Spawner) {
         recovery.message.as_deref().map(|s| s.len()).unwrap_or(0),
     );
     info!(
-        "persist: last_app_state={} last_uptime_secs={} api_hb={} display_hb={} watchdog_hb={}",
-        recovery.last_app_state,
+        "persist: last_app_state={}:{} last_uptime_secs={} api_hb={} display_hb={} watchdog_hb={}",
+        recovery.last_app_state.id,
+        recovery.last_app_state.name,
         recovery.last_uptime_secs,
-        recovery.api_heartbeat,
-        recovery.display_heartbeat,
-        recovery.watchdog_heartbeat,
+        recovery.heartbeats.api,
+        recovery.heartbeats.display,
+        recovery.heartbeats.watchdog,
     );
     for (i, entry) in recovery.reset_history.iter().enumerate() {
         info!(
@@ -269,33 +281,65 @@ async fn main(spawner: Spawner) {
     if SERVER_URL.contains("localhost") || SERVER_URL.contains("127.0.0.1") {
         warn!("ANOVA_SERVER_URL points to loopback");
     }
-    loop {
-        match control
-            .join(WIFI_SSID, cyw43::JoinOptions::new(WIFI_PASSWORD.as_bytes()))
-            .await
-        {
-            Ok(_) => {
-                info!("WiFi connected");
-                break;
-            }
-            Err(err) => {
-                warn!("WiFi join failed: {}", defmt::Debug2Format(&err));
-                Timer::after(Duration::from_secs(1)).await;
+    // Bound the WiFi join: retry forever *within* the deadline, then
+    // deliberately reboot. The breadcrumb is set before the wait so a
+    // timeout (or any reset while stuck here) is attributed to
+    // ResetReason::InitTimeout with stage=WiFi on the next boot.
+    persist::record_app_state(persist::INIT_STAGE_WIFI);
+    let joined = with_timeout(Duration::from_secs(WIFI_JOIN_DEADLINE_SECS), async {
+        loop {
+            match control
+                .join(WIFI_SSID, cyw43::JoinOptions::new(WIFI_PASSWORD.as_bytes()))
+                .await
+            {
+                Ok(_) => break,
+                Err(err) => {
+                    warn!("WiFi join failed: {}", defmt::Debug2Format(&err));
+                    Timer::after(Duration::from_secs(1)).await;
+                }
             }
         }
+    })
+    .await;
+    if joined.is_err() {
+        warn!(
+            "WiFi join did not succeed within {}s; rebooting",
+            WIFI_JOIN_DEADLINE_SECS
+        );
+        persist::reboot_init_timeout();
     }
+    info!("WiFi connected");
 
     info!("Waiting for DHCP...");
     display.render(ViewSpec::DhcpInit);
 
-    while !stack.is_config_up() {
-        Timer::after(Duration::from_millis(100)).await;
+    // Same pattern for DHCP — this is the wait that actually stalled in
+    // the field (associated to the AP but never got a lease).
+    persist::record_app_state(persist::INIT_STAGE_DHCP);
+    let configured = with_timeout(Duration::from_secs(DHCP_DEADLINE_SECS), async {
+        while !stack.is_config_up() {
+            Timer::after(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    if configured.is_err() {
+        warn!(
+            "DHCP did not complete within {}s; rebooting",
+            DHCP_DEADLINE_SECS
+        );
+        persist::reboot_init_timeout();
     }
     info!("Network is up");
     persist::record_network_up();
     if let Some(config) = stack.config_v4() {
         info!("IP address: {}", defmt::Display2Format(&config.address));
     }
+
+    // Start the `/health` HTTP server now that DHCP is up. Runs in its
+    // own embassy task so a stalled client can't delay the watchdog
+    // feeder. The endpoint exposes the live persist-region snapshot —
+    // same data as `scripts/dump-persist.sh` over SWD.
+    health::spawn(spawner, stack);
 
     let api = ApiClient::new(stack, &API_COMMANDS, &API_STATE, spawner).unwrap();
     let api_rx = api.receiver().unwrap();
@@ -311,7 +355,7 @@ async fn main(spawner: Spawner) {
     info!("Init complete, entering main loop");
 
     loop {
-        state = state.execute(&mut ctx).await;
+        state = execute(state, &mut ctx).await;
     }
 }
 
