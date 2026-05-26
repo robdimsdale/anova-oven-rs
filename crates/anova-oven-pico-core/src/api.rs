@@ -1,5 +1,6 @@
 //! Pure pre-flight logic for outbound API calls. The actual HTTP transport
-//! lives in `anova-oven-pico::api` and depends on `reqwless`/`embassy-net`.
+//! lives in the firmware bin's `api` module on top of whatever async HTTP
+//! client + network stack the bin chose (today `reqwless` + `embassy-net`).
 
 use alloc::format;
 use alloc::string::String;

@@ -35,8 +35,14 @@
 
   anova-oven-api = { path = "../anova-oven-api", default-features = false }
   # Pure-logic core extracted from this crate so it can be host-tested
-  # (see crates/anova-oven-pico-core, review §5.1).
-  anova-oven-pico-core = { path = "../anova-oven-pico-core", features = ["defmt"] }
+  # (see crates/anova-oven-pico-core, review §5.1). The `serde` feature
+  # opts in to `Serialize` derives on the persist-region data types so
+  # the `/health` handler can serve `read_live()` directly with no
+  # intermediate response struct (and thus no drift surface).
+  anova-oven-pico-core = { path = "../anova-oven-pico-core", features = [
+    "defmt",
+    "serde",
+  ] }
   serde_json = { version = "1.0", default-features = false, features = [
     "alloc",
   ] }
@@ -65,10 +71,23 @@
 
   embedded-alloc = "0.7"
   embedded-io-async = "0.7"
-  heapless = { version = "0.9", default-features = false }
+  # `serde` enables `Serialize` impls on heapless::String/Vec so the
+  # persist snapshot can be served as JSON without copying out to alloc.
+  heapless = { version = "0.9", default-features = false, features = ["serde"] }
 
   # Plain HTTP client (no TLS needed — server is on local network)
   reqwless = { version = "0.14", default-features = false }
+
+  # Inbound HTTP server for the read-only `/health` endpoint. The
+  # `json` feature pulls in `serde-json-core` so the handler can return
+  # `picoserve::response::Json(HealthResponse)` and have picoserve
+  # serialize the typed struct directly to the socket — no alloc on
+  # the response path, so `/health` keeps working under heap pressure
+  # (which is exactly when it's most useful for debugging).
+  picoserve = { version = "0.18", default-features = false, features = [
+    "embassy",
+    "json",
+  ] }
 
   # NOTE: "firmware-logs" is only enabled via the verbose-logs feature,
   # never by default. Its log_read path calls bp_read with a

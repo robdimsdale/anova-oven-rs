@@ -4,11 +4,11 @@ use defmt::warn;
 use embassy_futures::select::{select, select3, Either, Either3};
 use embassy_time::{Duration, Instant, Timer};
 
-pub use anova_oven_pico_core::fsm::{AppState, BacklightPolicy};
 use anova_oven_pico_core::fsm::{
     active_recipe_title, baseline_state_for, cooking_view, idle_view, next_stage_prompt,
     optimistic_idle_view, ViewSpec,
 };
+pub use anova_oven_pico_core::fsm::{AppState, BacklightPolicy};
 
 use crate::api_client::{ApiClient, StateReceiver};
 use crate::backlight::BacklightController;

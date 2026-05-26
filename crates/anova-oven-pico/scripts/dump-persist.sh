@@ -100,6 +100,21 @@ if [[ ! -f "$PERSIST_RS" ]]; then
   exit 1
 fi
 
+# Name-table sources in pico-core. Parsed by the embedded python below
+# (`RESET_REASON` from reset.rs, `APP_STATE` from fsm.rs + reset.rs).
+# These used to be hand-maintained Python dicts in this script — that
+# duplicated the Rust source and silently rotted on new variants. Now
+# the script is the *only* surface that has to know how to parse them;
+# adding a variant in Rust automatically updates this output.
+RESET_RS="$REPO_ROOT/crates/anova-oven-pico-core/src/reset.rs"
+FSM_RS="$REPO_ROOT/crates/anova-oven-pico-core/src/fsm.rs"
+for f in "$RESET_RS" "$FSM_RS"; do
+  if [[ ! -f "$f" ]]; then
+    echo "error: cannot find $f to read enum name tables" >&2
+    exit 1
+  fi
+done
+
 # --- Layout, parsed from persist.rs so it can't silently drift -------------
 
 rs_const() { # name -> integer literal (underscores stripped)
@@ -205,10 +220,11 @@ fi
 # heredoc and the script sees empty stdin. (That latent bug is why the
 # original version of this script reported "got 0" for every read.)
 export MAGIC_RS RING_SIZE_RS MSG_BUF_SIZE_RS RING_ENTRY_WORDS_RS \
-       HEADER_FIELDS RING_FIELDS
+       HEADER_FIELDS RING_FIELDS RESET_RS FSM_RS
 export PERSIST_WORDS="$RAW"
 python3 - "$WORDS" <<'PY'
 import os
+import re
 import sys
 
 expected = int(sys.argv[1])
@@ -224,34 +240,149 @@ RING_ENTRY_WORDS = int(os.environ["RING_ENTRY_WORDS_RS"], 0)
 HEADER = [f for f in os.environ["HEADER_FIELDS"].split() if f]
 RING_FIELDS = [f for f in os.environ["RING_FIELDS"].split() if f]
 
-RESET_REASON = {
-    0: "Unknown",
-    1: "ColdBoot",
-    2: "Panic",
-    3: "WatchdogTimeout",
-    4: "WatchdogForced",
-    5: "OtherSoftReset",
-    6: "InitTimeout",
-}
 
-# `last_app_state` breadcrumb. 0 = never recorded yet (zeroed region,
-# still pre-init); 1..=8 mirror AppState::discriminant() in state.rs;
-# 100/101 are the pre-state-machine INIT_STAGE_* sentinels from
-# persist.rs. Hand-maintained, like RESET_REASON mirrors the Rust enum —
-# keep in sync with state.rs::discriminant() and persist.rs.
-APP_STATE = {
-    0: "(unset / pre-init)",
-    1: "Offline",
-    2: "Idle",
-    3: "Cooking",
-    4: "BrowseRecipes",
-    5: "StartPending",
-    6: "ConfirmStop",
-    7: "StopPending",
-    8: "AwaitNextStage",
-    100: "INIT_STAGE_WIFI",
-    101: "INIT_STAGE_DHCP",
-}
+def read(path):
+    with open(path, "r", encoding="utf-8") as fp:
+        return fp.read()
+
+
+RESET_SRC = read(os.environ["RESET_RS"])
+FSM_SRC = read(os.environ["FSM_RS"])
+
+
+def die(msg):
+    sys.exit(
+        f"error: {msg}\n"
+        "       enum-name parse out of sync with Rust source — refusing to\n"
+        "       decode against possibly-stale labels (would mis-attribute\n"
+        "       resets in the output). Update this script's regexes or fix\n"
+        "       the Rust source to match."
+    )
+
+
+# --- RESET_REASON: `#[repr(u32)] enum ResetReason { Variant = N, ... }`
+#                   + `fn name(&self) -> &'static str { Self::Variant => "Label", ... }`
+#
+# The first pass extracts `Variant -> u32`; the second pass extracts
+# `Variant -> label`; we compose to `u32 -> label`. Going through the
+# variant name (rather than assuming positional order) means an
+# explicit discriminant skip (`= 7`) wouldn't silently misalign.
+
+def parse_reset_reason(src):
+    enum_body = re.search(
+        r"pub enum ResetReason\s*\{(.*?)\}",
+        src,
+        re.DOTALL,
+    )
+    if not enum_body:
+        die("could not locate `pub enum ResetReason { ... }` in reset.rs")
+    variants = dict(
+        re.findall(
+            r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(\d+)\s*,",
+            enum_body.group(1),
+            re.MULTILINE,
+        )
+    )
+    if not variants:
+        die("found ResetReason but no `Variant = N,` arms — enum body shape changed")
+
+    name_fn = re.search(
+        r"pub fn name\(&self\)\s*->\s*&'static str\s*\{\s*match self\s*\{(.*?)\}\s*\}",
+        src,
+        re.DOTALL,
+    )
+    if not name_fn:
+        die("could not locate `ResetReason::name(&self)` match in reset.rs")
+    labels = dict(
+        re.findall(
+            r"Self::([A-Za-z_][A-Za-z0-9_]*)\s*=>\s*\"([^\"]+)\"",
+            name_fn.group(1),
+        )
+    )
+    if not labels:
+        die("found ResetReason::name but no `Self::Variant => \"Label\",` arms")
+
+    missing = set(variants) - set(labels)
+    if missing:
+        die(f"ResetReason variants without a name() arm: {sorted(missing)}")
+
+    return {int(variants[v]): labels[v] for v in variants}
+
+
+# --- APP_STATE: union of `fn app_state_name(d: u32)` arms in fsm.rs
+#                and `fn init_stage_name(d: u32)` arms in reset.rs.
+#
+# Both have the shape `N => Some("Label"),` (app_state_name) or
+# `CONST_NAME => Some("..."),` (init_stage_name). The init_stage_name
+# arms key off the `pub const INIT_STAGE_*: u32 = N;` declarations, so
+# we also have to resolve those — same parse-from-source pattern.
+
+def parse_const_u32_table(src):
+    """`pub const NAME: u32 = N;` -> {NAME: N}."""
+    return dict(
+        re.findall(
+            r"^\s*pub const ([A-Z][A-Z0-9_]*):\s*u32\s*=\s*(\d+)\s*;",
+            src,
+            re.MULTILINE,
+        )
+    )
+
+
+def parse_some_label_table(src, fn_name, const_table):
+    """Extract `key => Some("label"),` arms from a single match-fn body.
+
+    Keys are either numeric literals or const identifiers; const names
+    are resolved against `const_table`.
+    """
+    body = re.search(
+        rf"fn {fn_name}\s*\([^)]*\)\s*->\s*Option<&'static str>\s*\{{\s*"
+        r"match\s+d\s*\{(.*?)\}\s*\}",
+        src,
+        re.DOTALL,
+    )
+    if not body:
+        die(f"could not locate `fn {fn_name}` match-on-`d` in source")
+    table = {}
+    for key, label in re.findall(
+        r'^\s*([A-Za-z0-9_]+)\s*=>\s*Some\("([^"]+)"\)\s*,',
+        body.group(1),
+        re.MULTILINE,
+    ):
+        if key.isdigit():
+            num = int(key)
+        elif key in const_table:
+            num = int(const_table[key])
+        else:
+            # `_ => None,` is the wildcard arm and isn't returned here
+            # because it doesn't match `Some("...")`. Any other unknown
+            # identifier is a real parse failure.
+            die(f"`{fn_name}` arm key `{key}` is not a number nor a known const")
+        table[num] = label
+    if not table:
+        die(f"`{fn_name}` parsed to an empty table — arm shape changed?")
+    return table
+
+
+reset_consts = parse_const_u32_table(RESET_SRC)
+APP_STATE = {}
+APP_STATE.update(parse_some_label_table(FSM_SRC, "app_state_name", {}))
+APP_STATE.update(parse_some_label_table(RESET_SRC, "init_stage_name", reset_consts))
+RESET_REASON = parse_reset_reason(RESET_SRC)
+
+# Sanity: persist.rs stores ResetReason::ColdBoot as 1 in
+# init_at_boot (and 0 = Unknown for unset/raw values). If those are
+# missing the layout/values have drifted in a way we won't notice
+# until a real crash dump.
+for required in (0, 1):
+    if required not in RESET_REASON:
+        die(f"RESET_REASON parsed without entry for {required} — "
+            f"enum discriminants changed?")
+# Same idea for AppState: 1..=8 are persisted across resets and the
+# INIT_STAGE_* sentinels are the bring-up breadcrumbs.
+for required in (1, 2, 3, 4, 5, 6, 7, 8, 100, 101):
+    if required not in APP_STATE:
+        die(f"APP_STATE parsed without entry for {required} — "
+            f"discriminant() or INIT_STAGE_* changed?")
 
 
 def reason(v):

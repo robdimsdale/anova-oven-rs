@@ -1,12 +1,14 @@
-# Pure-logic library extracted from `anova-oven-pico` so it can be unit-tested
-# on the host (review §5.1). The bin crate (`anova-oven-pico`) is a standalone
-# workspace targeting `thumbv6m-none-eabi`; this crate lives in the root
-# workspace and builds for the host by default. Pico depends on it via a path
-# dependency the same way it depends on `anova-oven-api`.
+# Pure-logic library extracted from the firmware bin so it can be unit-tested
+# on the host (review §5.1). The current bin (`anova-oven-pico`) targets
+# `thumbv6m-none-eabi` as a standalone workspace; this crate lives in the
+# root workspace and builds for the host by default. A future port to a
+# different MCU family (STM32/nRF/ESP32) would reuse this crate unchanged.
 #
-# Keep this crate `#![no_std]` and dependency-light — no embassy-rp, no cyw43,
-# no reqwless, no defmt. The bin owns logging and hardware; the lib owns
-# decisions.
+# Keep this crate `#![no_std]` and dependency-light — no chip HAL (no
+# embassy-rp/embassy-stm32/etc.), no radio driver (no cyw43/etc.), no HTTP
+# client (no reqwless), no defmt. A hard dependency on embassy-time is
+# accepted; chip-specific dependencies are not. The bin owns logging and
+# hardware; the lib owns decisions.
 
 [package]
 name = "anova-oven-pico-core"
@@ -20,12 +22,23 @@ default = []
 # global logger only the firmware provides). The bin enables this in its
 # path-dependency declaration.
 defmt = ["dep:defmt"]
+# Derives `serde::Serialize` on the public data types that the bin's
+# `/health` endpoint exposes (Snapshot, ResetHistoryEntry, ResetReason,
+# AppStateLabel, …). Off by default so non-JSON consumers don't pay
+# the serde compile cost. The bin enables it; pico-core itself uses
+# only `Serialize`, not `Deserialize`.
+serde = ["dep:serde", "heapless/serde"]
 
 [dependencies]
 heapless = { version = "0.9", default-features = false }
+serde = { version = "1", default-features = false, features = [
+  "derive",
+], optional = true }
 # `embassy-time` provides `Instant`/`Duration` as plain data types. The bin
-# supplies the time driver on-target via `embassy-rp`. For host tests we
-# enable the `mock-driver` feature via `dev-dependencies` below.
+# supplies the on-target time driver from whichever embassy chip HAL it
+# uses (today `embassy-rp`; on STM32 it'd be `embassy-stm32`, on nRF
+# `embassy-nrf`, etc.). For host tests we enable the `mock-driver` feature
+# via `dev-dependencies` below.
 embassy-time = "0.5"
 defmt = { version = "1.0", optional = true }
 # `ApiSnapshot`/`ViewSpec` hold serde types from the shared API crate, and

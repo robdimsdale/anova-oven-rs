@@ -1,12 +1,14 @@
 //! Reset classification — pure logic that maps the inputs we capture at boot
 //! (was the persist `MAGIC` valid?, did `panic_count` advance?, what was the
-//! last `AppState` breadcrumb?, what does the WATCHDOG.REASON register say?)
-//! into a [`ResetReason`]. The MMIO read of WATCHDOG.REASON and the persist
-//! region access stay in the bin; this module does only the classification.
+//! last `AppState` breadcrumb?, did the watchdog fire and how?) into a
+//! [`ResetReason`]. The MMIO read of the chip's watchdog-reason register and
+//! the persist-region access stay in the bin (chip-specific); this module
+//! does only the classification.
 
 /// What caused the boot we're currently in.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[repr(u32)]
 pub enum ResetReason {
     /// Reserved for invalid stored values — used when decoding old ring
@@ -14,16 +16,18 @@ pub enum ResetReason {
     Unknown = 0,
     /// Magic word was invalid — first boot since power-on, or RAM lost.
     ColdBoot = 1,
-    /// Previous run hit our `#[panic_handler]` (or HardFault) which then
-    /// called `SCB::sys_reset()`.
+    /// Previous run hit our `#[panic_handler]` (or a fault handler)
+    /// which then soft-reset the chip.
     Panic = 2,
-    /// RP2040 watchdog timed out (no `feed()` within the timeout window).
+    /// Hardware watchdog timed out (no `feed()` within its window). The
+    /// bin reads the chip's watchdog-reason register to tell this apart
+    /// from a forced reset; the classification here is chip-agnostic.
     WatchdogTimeout = 3,
-    /// `Watchdog::trigger_reset()` was called explicitly. Not used by our
-    /// firmware today; present for completeness.
+    /// Watchdog was deliberately triggered (a forced reset). Not used by
+    /// our firmware today; present for completeness.
     WatchdogForced = 4,
-    /// `SCB::sys_reset()` (or external NRST) without a panic. Shouldn't
-    /// happen in normal operation.
+    /// Plain soft reset (or external reset pin) without a panic.
+    /// Shouldn't happen in normal operation.
     OtherSoftReset = 5,
     /// A bring-up stage (WiFi join / DHCP) didn't complete within its
     /// deadline and `reboot_init_timeout()` deliberately reset the board.
@@ -44,6 +48,24 @@ impl ResetReason {
             _ => Self::Unknown,
         }
     }
+
+    /// Human-readable variant name. Used by the firmware's `/health`
+    /// endpoint and parsed out of this source file by the bin's
+    /// `dump-persist` debug-port tool so both surfaces share one
+    /// source of truth — keep the `Self::Variant => "Variant"` arm
+    /// style stable (the regex parser assumes one arm per line and
+    /// an exact-name string literal) when editing.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Unknown => "Unknown",
+            Self::ColdBoot => "ColdBoot",
+            Self::Panic => "Panic",
+            Self::WatchdogTimeout => "WatchdogTimeout",
+            Self::WatchdogForced => "WatchdogForced",
+            Self::OtherSoftReset => "OtherSoftReset",
+            Self::InitTimeout => "InitTimeout",
+        }
+    }
 }
 
 /// `last_app_state` breadcrumb values for the pre-`AppState` bring-up
@@ -57,8 +79,27 @@ pub fn is_init_stage(s: u32) -> bool {
     matches!(s, INIT_STAGE_WIFI | INIT_STAGE_DHCP)
 }
 
-/// Combine the persist breadcrumbs with WATCHDOG.REASON to classify what
-/// caused this boot.
+/// Human-readable label for an `INIT_STAGE_*` sentinel value, or
+/// `None` if `d` isn't a known init-stage discriminant. Co-located
+/// with the `INIT_STAGE_*` consts above so adding a new init stage
+/// means editing one screen.
+///
+/// Parsed by the bin's `dump-persist` debug-port tool — keep arms as
+/// `INIT_STAGE_NAME => Some("INIT_STAGE_NAME"),` on one line so the
+/// regex parser keeps working.
+pub fn init_stage_name(d: u32) -> Option<&'static str> {
+    match d {
+        INIT_STAGE_WIFI => Some("INIT_STAGE_WIFI"),
+        INIT_STAGE_DHCP => Some("INIT_STAGE_DHCP"),
+        _ => None,
+    }
+}
+
+/// Combine the persist breadcrumbs with the chip's watchdog status to
+/// classify what caused this boot. `watchdog_timer` and `watchdog_force`
+/// are the two booleans the bin extracts from whatever
+/// watchdog-reason MMIO register the chip exposes — see the bin for
+/// the chip-specific decoding.
 ///
 /// A panic is checked *before* the watchdog timer bit on purpose: a panic
 /// is the root cause, and if a slow/hung panic handler lets the watchdog
@@ -69,8 +110,8 @@ pub fn is_init_stage(s: u32) -> bool {
 /// soft reset, no panic, no watchdog) but with `last_app_state` still in
 /// the `INIT_STAGE_*` range — i.e. the box reset while in WiFi/DHCP
 /// bring-up, which is our deliberate `reboot_init_timeout()`. (A stray
-/// NRST during bring-up lands here too; "reset during init" is a fair
-/// label either way.)
+/// reset-pin assertion during bring-up lands here too; "reset during
+/// init" is a fair label either way.)
 pub fn classify_reset(
     magic_was_valid: bool,
     panic_count_advanced: bool,
@@ -207,6 +248,54 @@ mod tests {
         assert_eq!(ResetReason::from_u32(7), ResetReason::Unknown);
         assert_eq!(ResetReason::from_u32(42), ResetReason::Unknown);
         assert_eq!(ResetReason::from_u32(u32::MAX), ResetReason::Unknown);
+    }
+
+    #[test]
+    fn reset_reason_name_round_trips_every_variant() {
+        // Adding a ResetReason variant without a `name()` arm fails to
+        // compile (the match is exhaustive). This test additionally
+        // guards against a developer adding `Self::New => ""` — every
+        // variant must have a non-empty, non-"Unknown"-collision name
+        // (except `Unknown` itself).
+        let all = [
+            ResetReason::Unknown,
+            ResetReason::ColdBoot,
+            ResetReason::Panic,
+            ResetReason::WatchdogTimeout,
+            ResetReason::WatchdogForced,
+            ResetReason::OtherSoftReset,
+            ResetReason::InitTimeout,
+        ];
+        for r in all {
+            let n = r.name();
+            assert!(!n.is_empty(), "ResetReason::{r:?} has empty name");
+            // Round-trip via from_u32: name must describe the same variant.
+            let round = ResetReason::from_u32(r as u32);
+            assert_eq!(
+                round, r,
+                "ResetReason::from_u32({}) returned {round:?}, expected {r:?}",
+                r as u32
+            );
+        }
+    }
+
+    #[test]
+    fn init_stage_name_covers_known_stages() {
+        assert_eq!(init_stage_name(INIT_STAGE_WIFI), Some("INIT_STAGE_WIFI"));
+        assert_eq!(init_stage_name(INIT_STAGE_DHCP), Some("INIT_STAGE_DHCP"));
+        assert_eq!(init_stage_name(0), None);
+        assert_eq!(init_stage_name(99), None);
+        assert_eq!(init_stage_name(102), None);
+        // Anything `is_init_stage` accepts, `init_stage_name` must also
+        // recognize — guards against the two staying in sync only by
+        // hand.
+        for d in 0u32..=200 {
+            assert_eq!(
+                is_init_stage(d),
+                init_stage_name(d).is_some(),
+                "drift at d={d}"
+            );
+        }
     }
 
     #[test]

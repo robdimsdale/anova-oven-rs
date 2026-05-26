@@ -119,7 +119,38 @@ impl AppState {
             AppState::AwaitNextStage { .. } => 8,
         }
     }
+}
 
+/// Human-readable label for an `AppState::discriminant()` value, or
+/// `None` if `d` isn't a known AppState discriminant (e.g. it's an
+/// `INIT_STAGE_*` sentinel — use [`crate::reset::init_stage_name`]
+/// for those).
+///
+/// Co-located with `discriminant()` so adding a new variant means
+/// editing one screen. Also parsed by the bin's `dump-persist`
+/// debug-port tool so any over-debugger snapshot shows the same labels
+/// as `/health` — keep arms as `N => Some("VariantName"),` one per
+/// line so the regex parser keeps working.
+///
+/// `name_for_discriminant` rather than an impl method because the
+/// caller has only a `u32` (read from the persist region), not an
+/// `AppState`.
+pub fn app_state_name(d: u32) -> Option<&'static str> {
+    match d {
+        0 => Some("(unset / pre-init)"),
+        1 => Some("Offline"),
+        2 => Some("Idle"),
+        3 => Some("Cooking"),
+        4 => Some("BrowseRecipes"),
+        5 => Some("StartPending"),
+        6 => Some("ConfirmStop"),
+        7 => Some("StopPending"),
+        8 => Some("AwaitNextStage"),
+        _ => None,
+    }
+}
+
+impl AppState {
     pub fn backlight_policy(&self) -> BacklightPolicy {
         match self {
             AppState::Idle | AppState::Cooking { .. } => {
@@ -474,6 +505,50 @@ mod tests {
             .discriminant(),
             8
         );
+    }
+
+    #[test]
+    fn every_app_state_variant_has_a_name() {
+        // The dual to `discriminants_are_stable`: every variant's
+        // discriminant must round-trip to a `Some(_)` name. Adding a
+        // new variant + bumping its `discriminant()` arm without also
+        // updating `app_state_name` would otherwise show up as
+        // "Unknown" on `/health` and over `dump-persist.sh` — silently
+        // wrong precisely when debugging.
+        let all: [AppState; 8] = [
+            AppState::Offline,
+            AppState::Idle,
+            AppState::Cooking {
+                optimistic_recipe_title: None,
+            },
+            AppState::BrowseRecipes { index: 0 },
+            AppState::StartPending {
+                recipe_title: String::new(),
+                recipe_id: String::new(),
+                since: Instant::from_ticks(0),
+            },
+            AppState::ConfirmStop,
+            AppState::StopPending {
+                since: Instant::from_ticks(0),
+            },
+            AppState::AwaitNextStage {
+                next_description: String::new(),
+            },
+        ];
+        for s in all {
+            let d = s.discriminant();
+            assert!(
+                app_state_name(d).is_some(),
+                "AppState (discriminant {d}) has no app_state_name mapping",
+            );
+        }
+        // Unknown/out-of-range discriminants return None so callers can
+        // distinguish "we don't know" from a valid label.
+        assert_eq!(app_state_name(9), None);
+        assert_eq!(app_state_name(99), None);
+        // 100/101 are INIT_STAGE_* sentinels, owned by reset.rs.
+        assert_eq!(app_state_name(100), None);
+        assert_eq!(app_state_name(101), None);
     }
 
     // --- AppState::backlight_policy ---

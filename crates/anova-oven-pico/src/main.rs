@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![feature(impl_trait_in_assoc_type)]
 
 extern crate alloc;
 
@@ -7,6 +8,7 @@ mod api;
 mod api_client;
 mod backlight;
 mod display;
+mod health;
 mod input;
 mod lcd;
 mod persist;
@@ -170,12 +172,13 @@ async fn main(spawner: Spawner) {
         recovery.message.as_deref().map(|s| s.len()).unwrap_or(0),
     );
     info!(
-        "persist: last_app_state={} last_uptime_secs={} api_hb={} display_hb={} watchdog_hb={}",
-        recovery.last_app_state,
+        "persist: last_app_state={}:{} last_uptime_secs={} api_hb={} display_hb={} watchdog_hb={}",
+        recovery.last_app_state.id,
+        recovery.last_app_state.name,
         recovery.last_uptime_secs,
-        recovery.api_heartbeat,
-        recovery.display_heartbeat,
-        recovery.watchdog_heartbeat,
+        recovery.heartbeats.api,
+        recovery.heartbeats.display,
+        recovery.heartbeats.watchdog,
     );
     for (i, entry) in recovery.reset_history.iter().enumerate() {
         info!(
@@ -331,6 +334,12 @@ async fn main(spawner: Spawner) {
     if let Some(config) = stack.config_v4() {
         info!("IP address: {}", defmt::Display2Format(&config.address));
     }
+
+    // Start the `/health` HTTP server now that DHCP is up. Runs in its
+    // own embassy task so a stalled client can't delay the watchdog
+    // feeder. The endpoint exposes the live persist-region snapshot —
+    // same data as `scripts/dump-persist.sh` over SWD.
+    health::spawn(spawner, stack);
 
     let api = ApiClient::new(stack, &API_COMMANDS, &API_STATE, spawner).unwrap();
     let api_rx = api.receiver().unwrap();
