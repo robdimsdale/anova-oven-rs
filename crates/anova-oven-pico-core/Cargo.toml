@@ -40,7 +40,7 @@ serde = { version = "1", default-features = false, features = [
 # `embassy-nrf`, etc.). For host tests we enable the `mock-driver` feature
 # via `dev-dependencies` below.
 embassy-time = "0.5"
-defmt = { version = "1.0", optional = true }
+defmt = { version = "1.1", optional = true }
 # `ApiSnapshot`/`ViewSpec` hold serde types from the shared API crate, and
 # `ApiSnapshot::recipes` is an `Arc<Vec<Recipe>>` so renders share a pointer
 # rather than deep-cloning the recipe list.
