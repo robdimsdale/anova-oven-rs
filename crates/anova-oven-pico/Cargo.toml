@@ -106,7 +106,7 @@
   ] }
   cortex-m = "0.7"
   cortex-m-rt = "0.7"
-  defmt = "1.0"
+  defmt = "1.1"
   defmt-rtt = { version = "1.2", features = ["disable-blocking-mode"] }
   static_cell = "2"
 
