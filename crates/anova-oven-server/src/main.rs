@@ -7,6 +7,7 @@
 
 mod cook_progress;
 mod firestore;
+mod liveness;
 mod processors;
 mod protocol;
 mod read_model;
@@ -181,6 +182,7 @@ async fn main() {
     );
     let ws_read_timeout =
         env_duration_secs("ANOVA_WS_READ_TIMEOUT_SECS", DEFAULT_WS_READ_TIMEOUT_SECS);
+    let liveness = std::sync::Arc::new(liveness::Liveness::new(ws_read_timeout.as_secs()));
 
     let (sm_cmd_tx, sm_cmd_rx) = mpsc::channel::<StateMachineCommand>(64);
     let (sm_evt_tx, sm_evt_rx) = mpsc::channel::<StateMachineEvent>(256);
@@ -238,7 +240,13 @@ async fn main() {
     };
     spawn_critical(
         "ws-processor",
-        processors::ws::run(ws_token_source, ws_cmd_rx, ws_evt_tx, ws_read_timeout),
+        processors::ws::run(
+            ws_token_source,
+            ws_cmd_rx,
+            ws_evt_tx,
+            ws_read_timeout,
+            liveness.clone(),
+        ),
     );
 
     let firestore_processor = FirestoreProcessor::new(
@@ -306,6 +314,7 @@ async fn main() {
         sm_cmd_tx,
         cook_progress_rx,
         cook_progress_msg_tx,
+        liveness,
     });
 
     let addr = std::env::var("ANOVA_BIND").unwrap_or_else(|_| "0.0.0.0:8080".into());

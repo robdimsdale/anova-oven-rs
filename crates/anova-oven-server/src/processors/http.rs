@@ -18,6 +18,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, info, trace, warn};
 
 use crate::cook_progress::CookProgressMsg;
+use crate::liveness::Liveness;
 use crate::runtime::types::{SmError, StateMachineCommand};
 
 #[derive(Clone)]
@@ -25,6 +26,7 @@ pub struct HttpState {
     pub sm_cmd_tx: mpsc::Sender<StateMachineCommand>,
     pub cook_progress_rx: watch::Receiver<Option<CookProgress>>,
     pub cook_progress_msg_tx: mpsc::Sender<CookProgressMsg>,
+    pub liveness: Arc<Liveness>,
 }
 
 pub(crate) fn router(state: HttpState) -> Router {
@@ -36,7 +38,16 @@ pub(crate) fn router(state: HttpState) -> Router {
         .route("/stop", routing::post(handle_stop))
         .route("/start", routing::post(handle_start))
         .route("/current-cook", routing::get(handle_current_cook))
+        .route("/health", routing::get(handle_health))
         .with_state(Arc::new(state))
+}
+
+/// Liveness probe: reports upstream connection status and how long since the
+/// last oven-state frame, so an external monitor can alert on silent
+/// staleness. Always returns 200 (it is itself the health check) — callers
+/// inspect the JSON fields.
+async fn handle_health(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
+    json_response(StatusCode::OK, &state.liveness.snapshot())
 }
 
 fn build_response(status: StatusCode, content_type: &'static str, body: Vec<u8>) -> Response {

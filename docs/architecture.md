@@ -301,6 +301,16 @@ equivalent container restart policy) to make this self-healing.
                           `/status` already carries `cook_progress`.
                           Fire-and-forget `204` once queued.
 - `POST /stop`          — sends `CMD_APO_STOP`; fire-and-forget `204`.
+- `GET /health`         — liveness probe. Always `200`; body is
+                          `{ connected, seconds_since_last_state,
+                          read_timeout_secs }`. `connected` is the upstream
+                          WebSocket status; `seconds_since_last_state` climbs
+                          when Anova goes quiet (`null` until the first frame).
+                          Point an external monitor at this to catch silent
+                          staleness the in-process watchdog can't (e.g. a
+                          wedged process). Alert on `!connected` or
+                          `seconds_since_last_state` approaching
+                          `read_timeout_secs`.
 
 **Module layout:**
 - `src/main.rs`              — entry point, channel wiring, tick loops
