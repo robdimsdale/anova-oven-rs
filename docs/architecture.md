@@ -274,6 +274,15 @@ cargo run -p anova-oven-server
   flag, descriptions). `GET /status` stitches the latest `CookProgress`
   onto the `OvenStatus` before serializing.
 
+**Task supervision:** the long-lived processors are spawned via
+`spawn_critical`, which watches each task's `JoinHandle`. If any of them
+exits — a clean return (an upstream channel closed) or a panic — the
+supervisor logs the culprit and calls `std::process::exit(1)` so the OS
+supervisor restarts the whole process from a clean slate, rather than
+leaving a zombie where some processors serve stale data while a
+load-bearing one is gone. Run under `systemd` with `Restart=always` (or an
+equivalent container restart policy) to make this self-healing.
+
 **Endpoints:**
 - `GET /status`         — current `OvenStatus` (with derived
                           `cook_progress` inlined when cooking).

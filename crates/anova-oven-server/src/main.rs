@@ -84,6 +84,33 @@ fn init_tracing() -> WorkerGuard {
     guard
 }
 
+/// Spawn a long-lived task under supervision. Each of these tasks is meant to
+/// run for the whole process lifetime; any exit — a clean return (an upstream
+/// channel closed) or a panic — leaves the server in a half-alive "zombie"
+/// state where some processors keep serving stale data while a load-bearing one
+/// is gone. Rather than paper over that, we log which task died and terminate
+/// the process so the OS supervisor (systemd `Restart=always`, a container
+/// restart policy, etc.) brings everything back from a clean slate.
+fn spawn_critical(name: &'static str, fut: impl std::future::Future<Output = ()> + Send + 'static) {
+    let handle = tokio::spawn(fut);
+    tokio::spawn(async move {
+        let reason = match handle.await {
+            Ok(()) => "returned unexpectedly (an upstream channel likely closed)".to_string(),
+            Err(e) if e.is_panic() => "panicked".to_string(),
+            Err(e) => format!("was cancelled: {e}"),
+        };
+        tracing::error!(
+            task = name,
+            reason = %reason,
+            "critical task stopped; terminating process for supervisor restart"
+        );
+        // Give the non-blocking tracing appender a moment to flush before the
+        // abrupt exit skips its WorkerGuard drop.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        std::process::exit(1);
+    });
+}
+
 fn spawn_tick_loop(evt_tx: mpsc::Sender<StateMachineEvent>, period: Duration, kind: TickKind) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(period);
@@ -171,7 +198,7 @@ async fn main() {
     let (cook_progress_msg_tx, cook_progress_msg_rx) = mpsc::channel(32);
 
     let sm_evt_tx_ws = sm_evt_tx.clone();
-    tokio::spawn(async move {
+    spawn_critical("ws-event-forwarder", async move {
         while let Some(evt) = ws_evt_rx.recv().await {
             if sm_evt_tx_ws.send(StateMachineEvent::Ws(evt)).await.is_err() {
                 return;
@@ -180,7 +207,7 @@ async fn main() {
     });
 
     let sm_evt_tx_fs = sm_evt_tx.clone();
-    tokio::spawn(async move {
+    spawn_critical("firestore-event-forwarder", async move {
         while let Some(evt) = fs_evt_rx.recv().await {
             if sm_evt_tx_fs
                 .send(StateMachineEvent::Firestore(evt))
@@ -209,12 +236,10 @@ async fn main() {
             }
         }
     };
-    tokio::spawn(processors::ws::run(
-        ws_token_source,
-        ws_cmd_rx,
-        ws_evt_tx,
-        ws_read_timeout,
-    ));
+    spawn_critical(
+        "ws-processor",
+        processors::ws::run(ws_token_source, ws_cmd_rx, ws_evt_tx, ws_read_timeout),
+    );
 
     let firestore_processor = FirestoreProcessor::new(
         fs_cmd_rx,
@@ -224,7 +249,7 @@ async fn main() {
         current_cook_timeout,
         current_cook_resolution_timeout,
     );
-    tokio::spawn(firestore_processor.run());
+    spawn_critical("firestore-processor", firestore_processor.run());
 
     let state_machine = StateMachineProcessor::new(
         sm_cmd_rx,
@@ -233,9 +258,9 @@ async fn main() {
         fs_cmd_tx.clone(),
         read_model_tx,
     );
-    tokio::spawn(state_machine.run());
+    spawn_critical("state-machine", state_machine.run());
 
-    tokio::spawn(async move {
+    spawn_critical("read-model-fanout", async move {
         loop {
             if read_model_rx.changed().await.is_err() {
                 return;
@@ -248,7 +273,10 @@ async fn main() {
     });
 
     let cook_progress_task = CookProgressTask::new(cook_progress_tx);
-    tokio::spawn(cook_progress_task.run(status_rx, current_cook_rx, cook_progress_msg_rx));
+    spawn_critical(
+        "cook-progress",
+        cook_progress_task.run(status_rx, current_cook_rx, cook_progress_msg_rx),
+    );
 
     // Startup preloads via typed ticks.
     let _ = sm_evt_tx
