@@ -358,6 +358,23 @@ async fn connect_and_run(
             msg = stream.next() => {
                 last_activity = Instant::now();
                 match msg {
+                    // Control frames (ping/pong/close) carry no JSON.
+                    // tokio-websockets yields them here *in addition* to data
+                    // frames, having already queued the auto-Pong reply. Feeding
+                    // an empty ping payload to the JSON parser is what produced
+                    // the recurring "EOF while parsing a value" warnings. They
+                    // still count as read activity (last_activity advanced
+                    // above) — a ping is proof the link is alive.
+                    Some(Ok(msg)) if msg.is_ping() || msg.is_pong() => {
+                        trace!(kind = if msg.is_ping() { "ping" } else { "pong" }, "[ws] control frame");
+                    }
+                    Some(Ok(msg)) if msg.is_close() => {
+                        let reason = msg
+                            .as_close()
+                            .map(|(code, text)| format!("{code:?}: {text}"))
+                            .unwrap_or_else(|| "no reason".into());
+                        info!(reason = %reason, "[ws] received close frame; will reconnect");
+                    }
                     Some(Ok(msg)) => {
                         let raw_bytes = msg.as_payload();
                         match protocol::parse_message(raw_bytes) {
