@@ -9,6 +9,7 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use http::{HeaderName, HeaderValue, Uri};
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 use tokio_websockets::{ClientBuilder, Message};
 use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
@@ -223,10 +224,11 @@ pub async fn run(
     token: String,
     mut cmd_rx: mpsc::Receiver<WsCommand>,
     evt_tx: mpsc::Sender<WsEvent>,
+    read_timeout: Duration,
 ) {
     loop {
         info!("[ws] connecting to Anova WebSocket");
-        match connect_and_run(&token, &mut cmd_rx, &evt_tx).await {
+        match connect_and_run(&token, &mut cmd_rx, &evt_tx, read_timeout).await {
             Ok(()) => info!("[ws] connection closed cleanly"),
             Err(e) => warn!(error = %e, "[ws] connection error"),
         }
@@ -240,6 +242,7 @@ async fn connect_and_run(
     token: &str,
     cmd_rx: &mut mpsc::Receiver<WsCommand>,
     evt_tx: &mpsc::Sender<WsEvent>,
+    read_timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let uri = Uri::builder()
         .scheme("wss")
@@ -264,10 +267,27 @@ async fn connect_and_run(
 
     let mut cooker_id: Option<String> = None;
     let (mut sink, mut stream) = ws.split();
+    // Anova's cloud has been observed to leave the TCP connection half-open
+    // (no FIN/RST, no further frames) without tokio-websockets or the OS
+    // surfacing an error. Without this deadline, `stream.next()` can hang
+    // forever, silently freezing `state.status` at its last value while
+    // downstream consumers (e.g. the pico's /status poller) keep getting
+    // stale-but-200 responses with no indication anything is wrong. The
+    // deadline only advances on an actual inbound frame, not on command
+    // traffic, so it purely measures upstream read liveness.
+    let mut last_activity = Instant::now();
 
     loop {
         tokio::select! {
+            () = tokio::time::sleep_until(last_activity + read_timeout) => {
+                warn!(
+                    timeout_secs = read_timeout.as_secs(),
+                    "[ws] no message from Anova within read timeout; reconnecting"
+                );
+                return Err("Anova websocket read timeout".into());
+            }
             msg = stream.next() => {
+                last_activity = Instant::now();
                 match msg {
                     Some(Ok(msg)) => {
                         let raw_bytes = msg.as_payload();
