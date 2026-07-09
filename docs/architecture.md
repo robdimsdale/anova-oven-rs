@@ -225,8 +225,10 @@ processors over `tokio::sync::mpsc` channels.
 
 **Optional env vars (defaults shown):**
 - `ANOVA_BIND` — listen address (default `0.0.0.0:8080`)
-- `ANOVA_WS_READ_TIMEOUT_SECS` — reconnect if no upstream frame arrives within
-  this window, catching half-open sockets (default `1200`)
+- `ANOVA_WS_READ_TIMEOUT_SECS` — reconnect if no `EVENT_APO_STATE` frame
+  arrives within this window, catching half-open sockets and quiet-but-stale
+  connections. Anova emits state ~every 10 min idle / ~10s cooking, so the
+  default `1200` is ~2x the idle heartbeat. Keepalive pings do not reset it.
 - `ANOVA_HTTP_TIMEOUT_SECS` — outbound HTTP timeout (default `10`)
 - `ANOVA_HTTP_CONNECT_TIMEOUT_SECS` — outbound connect timeout (default `5`)
 - `ANOVA_CURRENT_COOK_TIMEOUT_SECS` — current-cook query timeout (default `4`)
