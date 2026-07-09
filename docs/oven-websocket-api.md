@@ -34,7 +34,8 @@ User-Agent: okhttp/4.7.2
 
 **Behavior after connecting:**
 - Server sends `EVENT_APO_WIFI_LIST` (contains cooker ID)
-- Server sends `EVENT_APO_STATE` every 30s (idle) or every 2s (cooking)
+- Server sends `EVENT_APO_STATE` roughly every 10 min (idle) or every 10s
+  (cooking) — observed in production; keepalive pings flow more often
 - Server sends `EVENT_USER_STATE` once
 - May send `EVENT_APO_WIFI_FIRMWARE_UPDATE` if an OTA is available
 
@@ -90,7 +91,8 @@ Sent on connection. Contains the cooker ID needed for all commands.
 
 ### EVENT_APO_STATE
 
-Periodic oven state. Every 30s when idle, every 2s during a cook.
+Periodic oven state. Roughly every 10 min when idle, every 10s during a cook
+(observed in production; earlier notes of 30s/2s were inaccurate).
 
 ```json
 {

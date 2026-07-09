@@ -278,7 +278,7 @@ pub async fn run(
     mut token_source: WsTokenSource,
     mut cmd_rx: mpsc::Receiver<WsCommand>,
     evt_tx: mpsc::Sender<WsEvent>,
-    read_timeout: Duration,
+    state_timeout: Duration,
     liveness: Arc<Liveness>,
 ) {
     loop {
@@ -294,7 +294,7 @@ pub async fn run(
             }
         };
         info!("[ws] connecting to Anova WebSocket");
-        match connect_and_run(&token, &mut cmd_rx, &evt_tx, read_timeout, &liveness).await {
+        match connect_and_run(&token, &mut cmd_rx, &evt_tx, state_timeout, &liveness).await {
             Ok(()) => info!("[ws] connection closed cleanly"),
             Err(e) => warn!(error = %e, "[ws] connection error"),
         }
@@ -309,7 +309,7 @@ async fn connect_and_run(
     token: &str,
     cmd_rx: &mut mpsc::Receiver<WsCommand>,
     evt_tx: &mpsc::Sender<WsEvent>,
-    read_timeout: Duration,
+    state_timeout: Duration,
     liveness: &Liveness,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let uri = Uri::builder()
@@ -341,30 +341,36 @@ async fn connect_and_run(
     // surfacing an error. Without this deadline, `stream.next()` can hang
     // forever, silently freezing `state.status` at its last value while
     // downstream consumers (e.g. the pico's /status poller) keep getting
-    // stale-but-200 responses with no indication anything is wrong. The
-    // deadline only advances on an actual inbound frame, not on command
-    // traffic, so it purely measures upstream read liveness.
-    let mut last_activity = Instant::now();
+    // stale-but-200 responses with no indication anything is wrong.
+    //
+    // The deadline is measured against *oven-state frames*, not any frame:
+    // Anova emits EVENT_APO_STATE ~every 10 min idle / ~every 10 s cooking,
+    // while keepalive pings flow more often. The failure we care about is
+    // stale state, not a live-but-quiet socket — and a genuinely dead socket
+    // is covered too (no frames -> no states -> we trip). `state_timeout`
+    // defaults to ~2x the idle heartbeat, so a single dropped idle frame
+    // won't false-trip a reconnect.
+    let mut last_state_frame = Instant::now();
 
     loop {
         tokio::select! {
-            () = tokio::time::sleep_until(last_activity + read_timeout) => {
+            () = tokio::time::sleep_until(last_state_frame + state_timeout) => {
                 warn!(
-                    timeout_secs = read_timeout.as_secs(),
-                    "[ws] no message from Anova within read timeout; reconnecting"
+                    timeout_secs = state_timeout.as_secs(),
+                    "[ws] no oven-state frame from Anova within timeout; reconnecting"
                 );
-                return Err("Anova websocket read timeout".into());
+                return Err("Anova websocket state timeout".into());
             }
             msg = stream.next() => {
-                last_activity = Instant::now();
                 match msg {
                     // Control frames (ping/pong/close) carry no JSON.
                     // tokio-websockets yields them here *in addition* to data
                     // frames, having already queued the auto-Pong reply. Feeding
                     // an empty ping payload to the JSON parser is what produced
-                    // the recurring "EOF while parsing a value" warnings. They
-                    // still count as read activity (last_activity advanced
-                    // above) — a ping is proof the link is alive.
+                    // the recurring "EOF while parsing a value" warnings. Pings
+                    // prove the socket is alive but are deliberately *not* a
+                    // freshness signal — only EVENT_APO_STATE resets the
+                    // deadline below.
                     Some(Ok(msg)) if msg.is_ping() || msg.is_pong() => {
                         trace!(kind = if msg.is_ping() { "ping" } else { "pong" }, "[ws] control frame");
                     }
@@ -379,8 +385,10 @@ async fn connect_and_run(
                         let raw_bytes = msg.as_payload();
                         match protocol::parse_message(raw_bytes) {
                             Ok(protocol::Event::ApoState(payload)) => {
-                                // Freshness signal for `/health`: this is the
-                                // frame whose absence means "stale data".
+                                // The freshness signal for both the reconnect
+                                // watchdog and `/health`: this is the frame whose
+                                // absence means "stale data".
+                                last_state_frame = Instant::now();
                                 liveness.record_state();
                                 let status = protocol::to_oven_status(&payload);
                                 info!(
