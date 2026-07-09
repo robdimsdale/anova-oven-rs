@@ -214,13 +214,19 @@ is a **processor model**: each processor owns one external surface, holds
 its own state, and exchanges typed commands/events with the other
 processors over `tokio::sync::mpsc` channels.
 
-**Credentials (env vars, required — no fallback):**
-- `ANOVA_TOKEN`    — PAT token for the Anova WebSocket API
-- `ANOVA_EMAIL`    — Firebase email
-- `ANOVA_PASSWORD` — Firebase password
+**Credentials (env vars):**
+- `ANOVA_EMAIL`    — Firebase email (required)
+- `ANOVA_PASSWORD` — Firebase password (required)
+- `ANOVA_TOKEN`    — optional static PAT for the Anova WebSocket API. When
+  unset, the WebSocket authenticates with the Firebase ID token from the
+  signed-in session and refreshes it automatically (~hourly), so WS auth is no
+  longer a manual restart job. Set a PAT only if you want to pin a specific
+  token.
 
 **Optional env vars (defaults shown):**
 - `ANOVA_BIND` — listen address (default `0.0.0.0:8080`)
+- `ANOVA_WS_READ_TIMEOUT_SECS` — reconnect if no upstream frame arrives within
+  this window, catching half-open sockets (default `1200`)
 - `ANOVA_HTTP_TIMEOUT_SECS` — outbound HTTP timeout (default `10`)
 - `ANOVA_HTTP_CONNECT_TIMEOUT_SECS` — outbound connect timeout (default `5`)
 - `ANOVA_CURRENT_COOK_TIMEOUT_SECS` — current-cook query timeout (default `4`)
@@ -235,10 +241,10 @@ processors over `tokio::sync::mpsc` channels.
 
 **Running:**
 ```sh
-ANOVA_TOKEN=anova-eyJ... \
 ANOVA_EMAIL=you@example.com \
 ANOVA_PASSWORD=secret \
 cargo run -p anova-oven-server
+# optionally pin a WebSocket PAT with ANOVA_TOKEN=anova-eyJ...
 ```
 
 **Internal architecture:**

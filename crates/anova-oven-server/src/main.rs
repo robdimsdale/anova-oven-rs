@@ -101,7 +101,10 @@ fn spawn_tick_loop(evt_tx: mpsc::Sender<StateMachineEvent>, period: Duration, ki
 async fn main() {
     let _tracing_guard = init_tracing();
 
-    let anova_token = std::env::var("ANOVA_TOKEN").expect("ANOVA_TOKEN env var is required");
+    // Optional: a static PAT for the WebSocket. When absent, the WS falls back
+    // to the auto-refreshing Firebase ID token (see below), which is the more
+    // hands-off choice for a long-running server.
+    let anova_token = std::env::var("ANOVA_TOKEN").ok();
     let anova_email = std::env::var("ANOVA_EMAIL").expect("ANOVA_EMAIL env var is required");
     let anova_password =
         std::env::var("ANOVA_PASSWORD").expect("ANOVA_PASSWORD env var is required");
@@ -189,8 +192,25 @@ async fn main() {
         }
     });
 
+    let ws_token_source = match anova_token {
+        Some(pat) => {
+            info!("[ws] using static PAT for WebSocket auth");
+            processors::ws::WsTokenSource::Pat(pat)
+        }
+        None => {
+            info!("[ws] no ANOVA_TOKEN set; using auto-refreshing Firebase ID token");
+            processors::ws::WsTokenSource::Firebase {
+                http: http.clone(),
+                // The session was just minted by sign_in, so its ID token is
+                // fresh — seed refreshed_at to skip a redundant refresh on the
+                // very first connect.
+                session: session.clone(),
+                refreshed_at: Some(tokio::time::Instant::now()),
+            }
+        }
+    };
     tokio::spawn(processors::ws::run(
-        anova_token,
+        ws_token_source,
         ws_cmd_rx,
         ws_evt_tx,
         ws_read_timeout,
