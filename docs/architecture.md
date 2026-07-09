@@ -221,7 +221,11 @@ processors over `tokio::sync::mpsc` channels.
   unset, the WebSocket authenticates with the Firebase ID token from the
   signed-in session and refreshes it automatically (~hourly), so WS auth is no
   longer a manual restart job. Set a PAT only if you want to pin a specific
-  token.
+  token. (The Firebase ID token authenticating the WS was verified
+  empirically 2026-07-09 — both a PAT and a fresh id_token receive
+  `EVENT_APO_WIFI_LIST`; the WS accepts either for the same account. Note the
+  server enforces the token *after* the HTTP 101 upgrade, closing the socket
+  silently on a bad token rather than failing the handshake.)
 
 **Optional env vars (defaults shown):**
 - `ANOVA_BIND` — listen address (default `0.0.0.0:8080`)
