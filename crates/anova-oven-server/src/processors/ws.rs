@@ -14,8 +14,60 @@ use tokio_websockets::{ClientBuilder, Message};
 use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
 
+use crate::firestore::{self, FirebaseSession};
 use crate::protocol;
 use crate::runtime::types::{WsCommand, WsEvent};
+
+/// Firebase ID tokens are valid for ~60 minutes. Refresh a little early so a
+/// reconnect never presents an about-to-expire token to Anova's gateway.
+const FIREBASE_TOKEN_TTL: Duration = Duration::from_secs(50 * 60);
+
+/// Where the WebSocket `token` query parameter comes from.
+///
+/// Anova accepts either a long-lived Personal Access Token or a short-lived
+/// Firebase ID token. The PAT never changes; the Firebase token must be
+/// refreshed roughly hourly, which is the whole point of this type — a stale
+/// token makes every reconnect attempt fail forever, silently freezing state
+/// exactly like a half-open socket does.
+pub enum WsTokenSource {
+    /// Static PAT (`anova-eyJ…`). Long-lived; nothing to refresh.
+    Pat(String),
+    /// Firebase ID token derived from an auto-refreshing session. Holds its own
+    /// session clone; Firebase refresh tokens are reusable, so refreshing here
+    /// independently of the Firestore processor is safe.
+    Firebase {
+        http: reqwest::Client,
+        session: FirebaseSession,
+        refreshed_at: Option<Instant>,
+    },
+}
+
+impl WsTokenSource {
+    /// Return a currently-valid token, refreshing the Firebase session first if
+    /// the previous ID token is older than [`FIREBASE_TOKEN_TTL`]. The
+    /// staleness check keeps a reconnect storm during an Anova outage from
+    /// hammering the token endpoint every 5s.
+    async fn token(&mut self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        match self {
+            WsTokenSource::Pat(token) => Ok(token.clone()),
+            WsTokenSource::Firebase {
+                http,
+                session,
+                refreshed_at,
+            } => {
+                let stale = refreshed_at
+                    .map(|at| at.elapsed() >= FIREBASE_TOKEN_TTL)
+                    .unwrap_or(true);
+                if stale {
+                    firestore::refresh_session(http, session).await?;
+                    *refreshed_at = Some(Instant::now());
+                    info!("[ws] refreshed Firebase ID token for WebSocket auth");
+                }
+                Ok(session.id_token.clone())
+            }
+        }
+    }
+}
 
 fn celcius_to_fahrenheit(c: f32) -> f32 {
     c * 9.0 / 5.0 + 32.0
@@ -221,12 +273,23 @@ fn update_cook_stages_command_json(
 }
 
 pub async fn run(
-    token: String,
+    mut token_source: WsTokenSource,
     mut cmd_rx: mpsc::Receiver<WsCommand>,
     evt_tx: mpsc::Sender<WsEvent>,
     read_timeout: Duration,
 ) {
     loop {
+        // Obtain (and, for Firebase auth, refresh-if-stale) the token before
+        // every connect so a long-lived process never dials in with an expired
+        // credential after hours of uptime.
+        let token = match token_source.token().await {
+            Ok(token) => token,
+            Err(e) => {
+                warn!(error = %e, "[ws] could not obtain auth token; retrying in 5s");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+        };
         info!("[ws] connecting to Anova WebSocket");
         match connect_and_run(&token, &mut cmd_rx, &evt_tx, read_timeout).await {
             Ok(()) => info!("[ws] connection closed cleanly"),
