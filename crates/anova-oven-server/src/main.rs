@@ -37,6 +37,10 @@ const DEFAULT_CURRENT_COOK_RESOLUTION_TIMEOUT_SECS: u64 = 1;
 const DEFAULT_CURRENT_COOK_REFRESH_INTERVAL_SECS: u64 = 60;
 const DEFAULT_RECIPES_REFRESH_INTERVAL_SECS: u64 = 3600;
 const DEFAULT_HISTORY_REFRESH_INTERVAL_SECS: u64 = 3600;
+// Anova pushes an idle heartbeat state roughly every ~10 minutes when
+// nothing is happening; give ourselves ~2x margin before declaring the
+// upstream connection dead and reconnecting.
+const DEFAULT_WS_READ_TIMEOUT_SECS: u64 = 1200;
 
 fn env_duration_secs(var: &str, default_secs: u64) -> Duration {
     match std::env::var(var) {
@@ -145,6 +149,8 @@ async fn main() {
         "ANOVA_HISTORY_REFRESH_INTERVAL_SECS",
         DEFAULT_HISTORY_REFRESH_INTERVAL_SECS,
     );
+    let ws_read_timeout =
+        env_duration_secs("ANOVA_WS_READ_TIMEOUT_SECS", DEFAULT_WS_READ_TIMEOUT_SECS);
 
     let (sm_cmd_tx, sm_cmd_rx) = mpsc::channel::<StateMachineCommand>(64);
     let (sm_evt_tx, sm_evt_rx) = mpsc::channel::<StateMachineEvent>(256);
@@ -183,7 +189,12 @@ async fn main() {
         }
     });
 
-    tokio::spawn(processors::ws::run(anova_token, ws_cmd_rx, ws_evt_tx));
+    tokio::spawn(processors::ws::run(
+        anova_token,
+        ws_cmd_rx,
+        ws_evt_tx,
+        ws_read_timeout,
+    ));
 
     let firestore_processor = FirestoreProcessor::new(
         fs_cmd_rx,
