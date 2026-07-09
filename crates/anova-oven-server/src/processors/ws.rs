@@ -4,6 +4,7 @@
 //! It emits typed websocket events to the state machine and does not perform
 //! cross-domain orchestration directly.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -15,6 +16,7 @@ use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
 
 use crate::firestore::{self, FirebaseSession};
+use crate::liveness::Liveness;
 use crate::protocol;
 use crate::runtime::types::{WsCommand, WsEvent};
 
@@ -277,6 +279,7 @@ pub async fn run(
     mut cmd_rx: mpsc::Receiver<WsCommand>,
     evt_tx: mpsc::Sender<WsEvent>,
     read_timeout: Duration,
+    liveness: Arc<Liveness>,
 ) {
     loop {
         // Obtain (and, for Firebase auth, refresh-if-stale) the token before
@@ -291,10 +294,11 @@ pub async fn run(
             }
         };
         info!("[ws] connecting to Anova WebSocket");
-        match connect_and_run(&token, &mut cmd_rx, &evt_tx, read_timeout).await {
+        match connect_and_run(&token, &mut cmd_rx, &evt_tx, read_timeout, &liveness).await {
             Ok(()) => info!("[ws] connection closed cleanly"),
             Err(e) => warn!(error = %e, "[ws] connection error"),
         }
+        liveness.set_connected(false);
         let _ = evt_tx.send(WsEvent::Disconnected).await;
         info!("[ws] reconnecting in 5s");
         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -306,6 +310,7 @@ async fn connect_and_run(
     cmd_rx: &mut mpsc::Receiver<WsCommand>,
     evt_tx: &mpsc::Sender<WsEvent>,
     read_timeout: Duration,
+    liveness: &Liveness,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let uri = Uri::builder()
         .scheme("wss")
@@ -324,6 +329,7 @@ async fn connect_and_run(
         .await?;
 
     info!("[ws] connected");
+    liveness.set_connected(true);
     if evt_tx.send(WsEvent::Connected).await.is_err() {
         return Ok(());
     }
@@ -356,6 +362,9 @@ async fn connect_and_run(
                         let raw_bytes = msg.as_payload();
                         match protocol::parse_message(raw_bytes) {
                             Ok(protocol::Event::ApoState(payload)) => {
+                                // Freshness signal for `/health`: this is the
+                                // frame whose absence means "stale data".
+                                liveness.record_state();
                                 let status = protocol::to_oven_status(&payload);
                                 info!(
                                     mode = %status.mode,
