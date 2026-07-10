@@ -100,6 +100,15 @@ impl LcdController {
                 self.write_row(0, "Server Offline").await;
                 self.write_row(1, "Check backend").await;
             }
+            ViewSpec::UpstreamStale { disconnected_secs } => {
+                use core::fmt::Write as _;
+                self.write_row(0, "Anova Link Down").await;
+                // By the time we're here disconnected_secs >= the grace window
+                // (60s), so minutes >= 1. write_row scrolls if it overflows 16.
+                let mut row1: heapless::String<32> = heapless::String::new();
+                let _ = write!(row1, "Stale {}m - check", disconnected_secs / 60);
+                self.write_row(1, row1.as_str()).await;
+            }
             ViewSpec::Status { status, cook } => {
                 self.render_status_display(status.as_ref(), cook.as_ref())
                     .await;

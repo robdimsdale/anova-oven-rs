@@ -44,6 +44,7 @@ pub async fn execute(state: AppState, ctx: &mut Ctx<'_>) -> AppState {
 
     match state {
         AppState::Offline => execute_offline(ctx).await,
+        AppState::UpstreamStale => execute_upstream_stale(ctx).await,
         AppState::Idle => execute_idle(ctx).await,
         AppState::Cooking {
             optimistic_recipe_title,
@@ -81,6 +82,33 @@ async fn execute_offline(ctx: &mut Ctx<'_>) -> AppState {
     }
 }
 
+/// Server is reachable but its link to Anova is stale — the readout can't be
+/// trusted, so take over the screen with a warning until the link recovers.
+/// A dropped server (our own poll failing) is more severe and wins: fall
+/// through to `Offline` if that happens.
+async fn execute_upstream_stale(ctx: &mut Ctx<'_>) -> AppState {
+    loop {
+        let snap = ctx.api.snapshot();
+        if snap.is_offline() {
+            return AppState::Offline;
+        }
+        let disconnected_secs = match snap.upstream_stale_secs() {
+            Some(secs) => secs,
+            // Link recovered (or server too old to report) — return to whatever
+            // the oven is actually doing.
+            None => return baseline_state_for(&snap),
+        };
+
+        ctx.display
+            .render(ViewSpec::UpstreamStale { disconnected_secs });
+
+        match select(ctx.input.recv(), ctx.api_changed()).await {
+            Either::First(_) => {}
+            Either::Second(()) => {}
+        }
+    }
+}
+
 async fn execute_idle(ctx: &mut Ctx<'_>) -> AppState {
     let idle_dim_delay = AppState::Idle.idle_dim_delay();
     let mut dim_at = Instant::now() + idle_dim_delay;
@@ -91,6 +119,9 @@ async fn execute_idle(ctx: &mut Ctx<'_>) -> AppState {
 
         if snap.is_offline() {
             return AppState::Offline;
+        }
+        if snap.upstream_stale_secs().is_some() {
+            return AppState::UpstreamStale;
         }
         if snap.is_cooking() {
             return AppState::Cooking {
@@ -143,6 +174,9 @@ async fn execute_cooking(
         if snap.is_offline() {
             return AppState::Offline;
         }
+        if snap.upstream_stale_secs().is_some() {
+            return AppState::UpstreamStale;
+        }
         if !snap.is_cooking() {
             return AppState::Idle;
         }
@@ -173,6 +207,9 @@ async fn execute_await_next_stage(_next_description: String, ctx: &mut Ctx<'_>) 
 
         if snap.is_offline() {
             return AppState::Offline;
+        }
+        if snap.upstream_stale_secs().is_some() {
+            return AppState::UpstreamStale;
         }
         if !snap.is_cooking() {
             return AppState::Idle;

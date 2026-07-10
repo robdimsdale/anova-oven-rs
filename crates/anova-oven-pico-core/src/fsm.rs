@@ -23,6 +23,14 @@ pub const IDLE: &str = "idle";
 /// offline. Lives here so `ApiSnapshot::is_offline` is self-contained.
 pub const OFFLINE_THRESHOLD: u64 = 3;
 
+/// How long the server's upstream (server→Anova) link must be continuously
+/// disconnected before we surface it on the display. Sized to sit above the
+/// routine ~5s max-connection-age reconnects so those stay silent, while a real
+/// Anova outage lights up within a minute. Distinct from [`OFFLINE_THRESHOLD`],
+/// which is about *our* link to the server; this is about the server's link to
+/// Anova (the server is still reachable and answering — just with stale data).
+pub const UPSTREAM_STALE_GRACE_SECS: u64 = 60;
+
 /// Latest data we've fetched from the server, plus poll health. Cloned on
 /// every render — `recipes` is `Arc` so that clone is cheap; `status` /
 /// `current_cook` are still deep-cloned today (review §2.1 #3 suggests
@@ -68,6 +76,22 @@ impl ApiSnapshot {
                 .as_ref()
                 .is_some_and(|status| status.mode.as_str() != IDLE)
     }
+
+    /// Seconds the server's upstream link to Anova has been down, but only once
+    /// past [`UPSTREAM_STALE_GRACE_SECS`] — i.e. the data we're showing is
+    /// stale and worth flagging. `None` when the link is healthy, within the
+    /// grace window, or when the server is too old to report link health.
+    ///
+    /// Only meaningful while the server itself is reachable ([`is_offline`]
+    /// takes precedence); a stale reading requires a status to have been served.
+    pub fn upstream_stale_secs(&self) -> Option<u64> {
+        let upstream = self.status.as_ref()?.upstream.as_ref()?;
+        if !upstream.connected && upstream.disconnected_secs >= UPSTREAM_STALE_GRACE_SECS {
+            Some(upstream.disconnected_secs)
+        } else {
+            None
+        }
+    }
 }
 
 /// FSM state. Each variant maps to one `execute_*` handler in the bin's
@@ -75,6 +99,11 @@ impl ApiSnapshot {
 #[derive(Clone, Default)]
 pub enum AppState {
     Offline,
+    /// Server is reachable but its own link to Anova has been down long enough
+    /// that the data it's serving is stale. Full-screen takeover, like
+    /// [`AppState::Offline`], but a distinct failure (our link to the server is
+    /// fine; the server's link to Anova is not).
+    UpstreamStale,
     #[default]
     Idle,
     Cooking {
@@ -112,6 +141,7 @@ impl AppState {
             AppState::ConfirmStop => 6,
             AppState::StopPending { .. } => 7,
             AppState::AwaitNextStage { .. } => 8,
+            AppState::UpstreamStale => 9,
         }
     }
 }
@@ -141,6 +171,7 @@ pub fn app_state_name(d: u32) -> Option<&'static str> {
         6 => Some("ConfirmStop"),
         7 => Some("StopPending"),
         8 => Some("AwaitNextStage"),
+        9 => Some("UpstreamStale"),
         _ => None,
     }
 }
@@ -152,6 +183,7 @@ impl AppState {
                 BacklightPolicy::FullThenDimAfter(Duration::from_secs(5))
             }
             AppState::Offline
+            | AppState::UpstreamStale
             | AppState::BrowseRecipes { .. }
             | AppState::StartPending { .. }
             | AppState::ConfirmStop
@@ -184,6 +216,11 @@ pub enum ViewSpec {
     DhcpInit,
     Connecting,
     ServerOffline,
+    /// Server reachable, but its link to Anova has been down `disconnected_secs`
+    /// long enough that the readout is stale. Full-screen warning.
+    UpstreamStale {
+        disconnected_secs: u64,
+    },
     Status {
         status: Option<anova_oven_api::OvenStatus>,
         cook: Option<anova_oven_api::CurrentCook>,
@@ -325,6 +362,47 @@ mod tests {
 
     fn snapshot() -> ApiSnapshot {
         ApiSnapshot::default()
+    }
+
+    #[test]
+    fn upstream_stale_secs_gates_on_connected_and_grace() {
+        use anova_oven_api::UpstreamHealth;
+
+        let mut snap = snapshot();
+        // No status at all -> nothing to judge.
+        assert_eq!(snap.upstream_stale_secs(), None);
+
+        let mut status = idle_status();
+
+        // Status present but no upstream field (server predates it) -> None.
+        status.upstream = None;
+        snap.status = Some(status.clone());
+        assert_eq!(snap.upstream_stale_secs(), None);
+
+        // Connected -> never stale, whatever the counter says.
+        status.upstream = Some(UpstreamHealth {
+            connected: true,
+            disconnected_secs: 9999,
+        });
+        snap.status = Some(status.clone());
+        assert_eq!(snap.upstream_stale_secs(), None);
+
+        // Disconnected but within the grace window -> not yet flagged (ignores
+        // the routine ~5s reconnects).
+        status.upstream = Some(UpstreamHealth {
+            connected: false,
+            disconnected_secs: UPSTREAM_STALE_GRACE_SECS - 1,
+        });
+        snap.status = Some(status.clone());
+        assert_eq!(snap.upstream_stale_secs(), None);
+
+        // Disconnected past the grace window -> flagged, reporting the duration.
+        status.upstream = Some(UpstreamHealth {
+            connected: false,
+            disconnected_secs: UPSTREAM_STALE_GRACE_SECS,
+        });
+        snap.status = Some(status);
+        assert_eq!(snap.upstream_stale_secs(), Some(UPSTREAM_STALE_GRACE_SECS));
     }
 
     /// Base OvenStatus JSON with every required field present. Tests
@@ -510,8 +588,9 @@ mod tests {
         // updating `app_state_name` would otherwise show up as
         // "Unknown" on `/health` and over `dump-persist.sh` — silently
         // wrong precisely when debugging.
-        let all: [AppState; 8] = [
+        let all: [AppState; 9] = [
             AppState::Offline,
+            AppState::UpstreamStale,
             AppState::Idle,
             AppState::Cooking {
                 optimistic_recipe_title: None,
@@ -539,7 +618,7 @@ mod tests {
         }
         // Unknown/out-of-range discriminants return None so callers can
         // distinguish "we don't know" from a valid label.
-        assert_eq!(app_state_name(9), None);
+        assert_eq!(app_state_name(10), None);
         assert_eq!(app_state_name(99), None);
         // 100/101 are INIT_STAGE_* sentinels, owned by reset.rs.
         assert_eq!(app_state_name(100), None);
