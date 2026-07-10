@@ -526,6 +526,7 @@ mod tests {
             active_stage_index: None,
             active_stage_id: None,
             cook_progress: None,
+            upstream: None,
         }
     }
 

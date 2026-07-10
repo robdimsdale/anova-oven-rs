@@ -121,6 +121,13 @@ async fn handle_status(State(state): State<Arc<HttpState>>) -> impl IntoResponse
     match reply_rx.await {
         Ok(Ok(mut status)) => {
             status.cook_progress = state.cook_progress_rx.borrow().clone();
+            // Attach upstream link health so a display client can tell this is
+            // a cached reading served while the Anova link is down (the poll
+            // still 200s either way). Same source as `GET /health`.
+            status.upstream = Some(anova_oven_api::UpstreamHealth {
+                connected: state.liveness.connected(),
+                disconnected_secs: state.liveness.disconnected_secs(),
+            });
             json_response(StatusCode::OK, &status)
         }
         Ok(Err(err)) => map_sm_error(err),

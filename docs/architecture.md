@@ -293,7 +293,12 @@ equivalent container restart policy) to make this self-healing.
 - `GET /status`         — current `OvenStatus` (with derived
                           `cook_progress` inlined when cooking).
                           Returns 503 while the WebSocket is still
-                          establishing.
+                          establishing. Also carries an `upstream`
+                          object `{ connected, disconnected_secs }` so a
+                          display client can tell a fresh reading from a
+                          cached one served while the Anova link is down
+                          (the poll is `200` either way). Same source as
+                          `/health`; see "Upstream staleness on the pico".
 - `GET /recipes`        — cached recipe list (own + bookmarked,
                           deduplicated by ID, own takes precedence).
 - `POST /update-recipes`— force-refresh recipes from Firestore and
@@ -317,6 +322,21 @@ equivalent container restart policy) to make this self-healing.
                           wedged process). Alert on `!connected` or
                           `seconds_since_last_state` approaching
                           `read_timeout_secs`.
+
+**Upstream staleness on the pico:** the pico is the only always-on watcher
+of the server, but it can't detect a stale Anova link on its own — a cached
+`/status` is still a `200`, so its poll succeeds and it stays "happy." So the
+server tells it: `GET /status` carries `upstream { connected, disconnected_secs }`,
+populated from the same `Liveness` tracker `/health` uses. The pico piggybacks
+on its existing 1 Hz `/status` poll (no second endpoint) and, when the link has
+been down past a 60 s grace (`UPSTREAM_STALE_GRACE_SECS` — long enough to ignore
+the routine ~5 s max-connection-age reconnects), takes over the LCD with an
+"Anova Link Down / Stale Nm" warning (`AppState::UpstreamStale`). This is
+distinct from the pico's existing `Offline` screen, which is about the pico's
+own link to the *server* failing; upstream-stale means the server is reachable
+but its link to Anova is down. The trigger is connection state, not data age —
+idle state only arrives ~every 10 min, so "age" is naturally high and useless as
+a staleness signal.
 
 **Module layout:**
 - `src/main.rs`              — entry point, channel wiring, tick loops
