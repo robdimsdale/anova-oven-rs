@@ -98,6 +98,27 @@ pub struct OvenStatus {
     /// Server-derived cook progression (present only while cooking).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cook_progress: Option<CookProgress>,
+
+    /// Health of the server's own upstream WebSocket link to Anova at the time
+    /// this status was served. `None` from servers predating this field. Lets a
+    /// display client (the pico) distinguish a fresh reading from a cached one
+    /// the server keeps serving 200s for while its Anova link is down — which
+    /// it otherwise cannot, since a stale `/status` is still a 200.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<UpstreamHealth>,
+}
+
+/// Health of the server→Anova WebSocket link, surfaced on `GET /status` so a
+/// display client can flag stale data without a second request. The server's
+/// `/health` endpoint exposes the same connection state plus more detail.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UpstreamHealth {
+    /// Is the server's WebSocket to Anova currently connected?
+    pub connected: bool,
+    /// Seconds the link has been continuously disconnected (`0` when
+    /// connected). A client warns once this exceeds its grace period, so the
+    /// routine ~5s max-connection-age reconnects stay silent.
+    pub disconnected_secs: u64,
 }
 
 /// Server-derived cook progression, included in `GET /status` while a cook is
@@ -438,6 +459,7 @@ mod tests {
             active_stage_index: None,
             active_stage_id: None,
             cook_progress: None,
+            upstream: None,
         };
         let json = serde_json::to_string(&status).unwrap();
         let parsed: OvenStatus = serde_json::from_str(&json).unwrap();

@@ -282,5 +282,8 @@ pub fn to_oven_status(payload: &ApoStatePayload) -> anova_oven_api::OvenStatus {
         active_stage_index,
         active_stage_id,
         cook_progress: None,
+        // Populated by the HTTP layer from the live Liveness tracker when this
+        // status is served; the protocol layer has no view of link health.
+        upstream: None,
     }
 }

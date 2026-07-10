@@ -23,6 +23,12 @@ pub struct Liveness {
     last_state_ms: AtomicU64,
     /// Whether the upstream WebSocket is currently connected.
     connected: AtomicBool,
+    /// Unix-epoch milliseconds at which the socket last transitioned from
+    /// connected to disconnected. `0` means "not currently tracking a
+    /// disconnect" (either connected, or never connected since startup). Used
+    /// to report *how long* the link has been down so a display client can
+    /// ignore the routine ~5s max-connection-age reconnects.
+    disconnected_since_ms: AtomicU64,
     /// The configured read-timeout window, echoed into `/health` so a monitor
     /// knows the bound past which the in-process watchdog would have already
     /// forced a reconnect.
@@ -34,6 +40,7 @@ impl Liveness {
         Self {
             last_state_ms: AtomicU64::new(0),
             connected: AtomicBool::new(false),
+            disconnected_since_ms: AtomicU64::new(0),
             read_timeout_secs,
         }
     }
@@ -43,9 +50,38 @@ impl Liveness {
         self.last_state_ms.store(now_ms(), Ordering::Relaxed);
     }
 
-    /// Record the current connection status of the upstream socket.
+    /// Record the current connection status of the upstream socket. Only ever
+    /// called from the single WS task, so the read-modify-write below needs no
+    /// external synchronization.
     pub fn set_connected(&self, connected: bool) {
-        self.connected.store(connected, Ordering::Relaxed);
+        let was = self.connected.swap(connected, Ordering::Relaxed);
+        if connected {
+            // Back up: clear any in-flight disconnect timer.
+            self.disconnected_since_ms.store(0, Ordering::Relaxed);
+        } else if was {
+            // Just transitioned connected -> disconnected: start the timer.
+            // Repeated set_connected(false) during a reconnect storm keeps the
+            // original timestamp (the `else if was` guard), so the duration
+            // reflects the whole outage, not the last 5s retry.
+            self.disconnected_since_ms
+                .store(now_ms(), Ordering::Relaxed);
+        }
+    }
+
+    /// Seconds the link has been continuously disconnected, or `0` when
+    /// connected (or before the first connect).
+    pub fn disconnected_secs(&self) -> u64 {
+        let since = self.disconnected_since_ms.load(Ordering::Relaxed);
+        if since == 0 {
+            0
+        } else {
+            now_ms().saturating_sub(since) / 1000
+        }
+    }
+
+    /// Whether the upstream WebSocket is currently connected.
+    pub fn connected(&self) -> bool {
+        self.connected.load(Ordering::Relaxed)
     }
 
     /// Point-in-time view for serialization.
@@ -59,6 +95,7 @@ impl Liveness {
         LivenessSnapshot {
             connected: self.connected.load(Ordering::Relaxed),
             seconds_since_last_state,
+            disconnected_secs: self.disconnected_secs(),
             read_timeout_secs: self.read_timeout_secs,
         }
     }
@@ -72,6 +109,9 @@ pub struct LivenessSnapshot {
     /// Seconds since the last oven-state frame, or `null` if none yet. A value
     /// climbing toward `read_timeout_secs` means upstream has gone quiet.
     pub seconds_since_last_state: Option<u64>,
+    /// Seconds the WebSocket has been continuously disconnected (`0` when
+    /// connected). Mirrors what `/status` surfaces to display clients.
+    pub disconnected_secs: u64,
     /// The in-process read-timeout bound, for context.
     pub read_timeout_secs: u64,
 }
@@ -106,6 +146,34 @@ mod tests {
         // Just recorded, so elapsed whole seconds should be 0.
         assert_eq!(snap.seconds_since_last_state, Some(0));
         assert_eq!(snap.read_timeout_secs, 600);
+    }
+
+    #[test]
+    fn disconnected_secs_is_zero_while_connected() {
+        let l = Liveness::new(60);
+        assert_eq!(l.disconnected_secs(), 0); // never connected yet
+        l.set_connected(true);
+        assert_eq!(l.disconnected_secs(), 0);
+    }
+
+    #[test]
+    fn disconnect_starts_timer_and_reconnect_clears_it() {
+        let l = Liveness::new(60);
+        l.set_connected(true);
+        l.set_connected(false);
+        assert!(!l.connected());
+        // Just disconnected, same second -> 0, but the timer is now armed.
+        assert_eq!(l.disconnected_secs(), 0);
+        // A reconnect storm (repeated set_connected(false)) must not re-arm the
+        // timer; it stays measuring from the original drop. We can't advance the
+        // wall clock here, so assert it doesn't blow up or flip to connected.
+        l.set_connected(false);
+        l.set_connected(false);
+        assert!(!l.connected());
+        // Reconnecting clears the duration.
+        l.set_connected(true);
+        assert!(l.connected());
+        assert_eq!(l.disconnected_secs(), 0);
     }
 
     #[test]
