@@ -17,11 +17,13 @@
 //! Pixel data bit `1` = reflective white, `0` = black. We map
 //! `BinaryColor::On` (the text foreground) to black on a white background.
 //!
-//! The SPI transfer is blocking (`embedded_hal::spi::SpiBus`). A full frame is
-//! ~12 KB and at 2 MHz takes ~50 ms; `SharpScreen::render` dirty-checks so a
-//! full flush only happens on an actual view change (~1/s), which is well
-//! within the 8 s watchdog and doesn't disturb cyw43's autonomous PIO/DMA
-//! radio path. (Async/DMA would need a second DMA channel's `DMA_IRQ_0`
+//! The SPI transfer is blocking (`embedded_hal::spi::SpiBus`). [`flush`](Sharp::flush)
+//! sends only the lines that changed since the last successful flush — the panel
+//! retains any line we don't re-address in its own memory — so a full ~12 KB /
+//! ~50 ms frame is the worst case, not the norm: a few changed text lines
+//! transfer (and bit-reverse) in well under a millisecond. Even a full flush
+//! stays well within the 8 s watchdog and doesn't disturb cyw43's autonomous
+//! PIO/DMA radio path. (Async/DMA would need a second DMA channel's `DMA_IRQ_0`
 //! binding, which cyw43 already owns exclusively — see main.rs.)
 
 use embedded_graphics::{
@@ -52,37 +54,38 @@ pub struct Sharp<SPI, CS> {
     spi: SPI,
     cs: CS,
     frame: [u8; FRAME_LEN],
+    /// The framebuffer contents last successfully pushed to the panel. [`flush`]
+    /// diffs `frame` against this per line and sends only the lines that differ;
+    /// it is updated (for the sent lines) only after a successful write, so a
+    /// failed transfer is retried in full on the next flush.
+    last_sent: [u8; FRAME_LEN],
     vcom: bool,
+    /// Forces the next [`flush`] to send every line regardless of the diff. Set
+    /// at construction (the panel's power-on contents are undefined) and by
+    /// [`clear_white`](Self::clear_white).
+    force_full: bool,
 }
 
 impl<SPI: SpiBus, CS: OutputPin> Sharp<SPI, CS> {
     /// Wraps an SPI bus (mode 0, <= 2 MHz) and the active-high CS pin. Starts
-    /// deselected with an all-white framebuffer.
+    /// deselected with an all-white framebuffer and a forced full first flush.
     pub fn new(spi: SPI, mut cs: CS) -> Self {
         let _ = cs.set_low(); // deselected (active-high CS)
         Self {
             spi,
             cs,
             frame: [0xFF; FRAME_LEN],
+            last_sent: [0xFF; FRAME_LEN],
             vcom: false,
+            force_full: true,
         }
     }
 
-    /// Reset the framebuffer to all-white. Does not touch the panel until the
-    /// next [`flush`](Self::flush).
+    /// Reset the framebuffer to all-white and force the next [`flush`] to repaint
+    /// the whole panel. Does not touch the panel until that flush.
     pub fn clear_white(&mut self) {
         self.frame = [0xFF; FRAME_LEN];
-    }
-
-    /// FNV-1a hash of the framebuffer, used by the backend to skip a flush when
-    /// nothing drawn actually changed.
-    pub fn checksum(&self) -> u32 {
-        let mut h: u32 = 0x811c_9dc5;
-        for &b in self.frame.iter() {
-            h ^= b as u32;
-            h = h.wrapping_mul(0x0100_0193);
-        }
-        h
+        self.force_full = true;
     }
 
     fn set_pixel(&mut self, x: usize, y: usize, black: bool) {
@@ -98,33 +101,69 @@ impl<SPI: SpiBus, CS: OutputPin> Sharp<SPI, CS> {
         }
     }
 
-    /// Push the whole framebuffer to the panel and toggle VCOM.
-    pub fn flush(&mut self) -> Result<(), SPI::Error> {
-        // Build one contiguous, already-bit-reversed transfer.
+    /// Push the lines that changed since the last successful flush and toggle
+    /// VCOM. Returns `Ok(true)` if any line was sent (VCOM toggled as part of
+    /// the write), or `Ok(false)` if nothing changed — in which case the caller
+    /// should issue [`toggle_vcom`](Self::toggle_vcom) to keep VCOM alternating.
+    ///
+    /// Because the panel retains any line we don't re-address, sending only the
+    /// dirty lines is exact, and cheaper in both SPI time and bit-reversal in
+    /// proportion to how little changed. Whole rows are still the atomic unit:
+    /// a line with even one changed pixel costs its full `BYTES_PER_LINE`.
+    pub fn flush(&mut self) -> Result<bool, SPI::Error> {
+        // Worst case (every line dirty) is exactly the original full-frame size.
         let mut tx = [0u8; TX_LEN];
-        let mode = CMD_WRITE | if self.vcom { CMD_VCOM } else { 0 };
-        self.vcom = !self.vcom;
+        // Remember which lines we packed, so the shadow is updated only for
+        // those, and only after the write succeeds.
+        let mut dirty = [false; HEIGHT];
 
-        let mut p = 0;
-        tx[p] = mode.reverse_bits();
-        p += 1;
-        for line in 0..HEIGHT {
+        // tx[0] holds the mode byte; fill it in once we know we're sending.
+        let mut p = 1;
+        let mut any = false;
+        for (line, is_dirty) in dirty.iter_mut().enumerate() {
+            let start = line * BYTES_PER_LINE;
+            let end = start + BYTES_PER_LINE;
+            if !self.force_full && self.frame[start..end] == self.last_sent[start..end] {
+                continue;
+            }
+            *is_dirty = true;
+            any = true;
             tx[p] = ((line + 1) as u8).reverse_bits(); // 1-indexed line address
             p += 1;
-            let start = line * BYTES_PER_LINE;
-            for i in 0..BYTES_PER_LINE {
-                tx[p] = self.frame[start + i].reverse_bits();
+            for i in start..end {
+                tx[p] = self.frame[i].reverse_bits();
                 p += 1;
             }
             tx[p] = 0x00; // end of line
             p += 1;
         }
+
+        if !any {
+            return Ok(false);
+        }
+
+        let mode = CMD_WRITE | if self.vcom { CMD_VCOM } else { 0 };
+        tx[0] = mode.reverse_bits();
         tx[p] = 0x00; // end of frame
+        p += 1;
 
         let _ = self.cs.set_high();
-        let r = self.spi.write(&tx);
+        let r = self.spi.write(&tx[..p]);
         let _ = self.cs.set_low();
-        r
+        r?;
+
+        // Commit only after a successful write: advance VCOM, spend the forced
+        // full repaint, and mark the sent lines as now matching the panel.
+        self.vcom = !self.vcom;
+        self.force_full = false;
+        for (line, &is_dirty) in dirty.iter().enumerate() {
+            if is_dirty {
+                let start = line * BYTES_PER_LINE;
+                let end = start + BYTES_PER_LINE;
+                self.last_sent[start..end].copy_from_slice(&self.frame[start..end]);
+            }
+        }
+        Ok(true)
     }
 
     /// Cheap VCOM maintenance: sends only the 2-byte no-op command (no line
