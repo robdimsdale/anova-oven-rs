@@ -3,11 +3,13 @@
 //! `ActiveScreen` in `screen.rs` when `ui-sharp-basic` is enabled.
 //!
 //! Cadence: `display_task` calls [`SharpScreen::render`] every `ANIM_TICK_MS`
-//! (50 ms). A full frame flush is ~48 ms, so we do NOT repaint every tick —
-//! `render` draws into the framebuffer, and only pushes it to the panel when
-//! the drawn pixels actually changed (checksum compare). On unchanged ticks it
-//! issues the cheap 2-byte VCOM toggle instead, which keeps VCOM alternating
-//! well above the panel's >= 1 Hz requirement.
+//! (50 ms). `render` draws into the framebuffer and asks the driver to flush;
+//! the driver ([`Sharp::flush`](crate::sharp::Sharp::flush)) sends only the
+//! lines that changed since the last flush, so a typical UI update (a few text
+//! lines) is a sub-millisecond transfer rather than a ~48 ms full-frame push.
+//! When nothing changed the driver reports it and we issue the cheap 2-byte
+//! VCOM toggle instead, keeping VCOM alternating well above the panel's >= 1 Hz
+//! requirement.
 //!
 //! Unlike the 16x2 HD44780 (`lcd.rs`), the panel has room to show the whole
 //! status at once, so there's no scrolling/slot animation here.
@@ -41,14 +43,12 @@ const PAPER: BinaryColor = BinaryColor::Off;
 
 pub struct SharpScreen {
     panel: Panel,
-    last_crc: u32,
 }
 
 impl SharpScreen {
     pub fn new(spi: Spi<'static, SPI0, Blocking>, cs: Output<'static>) -> Self {
         Self {
             panel: Sharp::new(spi, cs),
-            last_crc: 0,
         }
     }
 
@@ -56,22 +56,23 @@ impl SharpScreen {
     pub async fn configure(&mut self) {
         self.panel.clear_white();
         let _ = self.panel.flush();
-        self.last_crc = self.panel.checksum();
     }
 
-    /// Draw `view`, then flush only if the rendered frame changed; otherwise
-    /// toggle VCOM cheaply. Mirrors `LcdController::render`'s signature so
-    /// `display_task` is backend-agnostic. Kept `async` for that contract even
-    /// though the SPI writes are blocking (see `sharp.rs`).
+    /// Draw `view`, then flush the lines that changed; on a tick where nothing
+    /// changed, toggle VCOM cheaply instead. Mirrors `LcdController::render`'s
+    /// signature so `display_task` is backend-agnostic. Kept `async` for that
+    /// contract even though the SPI writes are blocking (see `sharp.rs`).
     pub async fn render(&mut self, view: &ViewSpec) {
         draw(&mut self.panel, view);
-        let crc = self.panel.checksum();
-        if crc != self.last_crc {
-            if self.panel.flush().is_ok() {
-                self.last_crc = crc;
+        match self.panel.flush() {
+            // Changed lines were sent; the write toggled VCOM.
+            Ok(true) => {}
+            // Nothing changed — keep VCOM alternating with the 2-byte no-op.
+            Ok(false) => {
+                let _ = self.panel.toggle_vcom();
             }
-        } else {
-            let _ = self.panel.toggle_vcom();
+            // Transfer failed; the shadow is untouched, so the next tick retries.
+            Err(_) => {}
         }
     }
 }
