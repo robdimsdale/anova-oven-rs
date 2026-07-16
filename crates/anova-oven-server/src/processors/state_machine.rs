@@ -383,6 +383,17 @@ fn apply_apo_state(state: &mut SmState, status: OvenStatus) -> Vec<SmEffect> {
         state.set_lifecycle(Lifecycle::Idle, TransitionOrigin::TimeoutRecovery);
     }
 
+    // Stale-cook reconcile: a settled-idle oven must not carry a current cook.
+    // The cooking->idle edge above clears it, but that edge is only observed
+    // if the server saw the prior cooking frame. Anova's Firestore currentCook
+    // lingers after a cook ends, so if we never saw the edge (e.g. restart or
+    // WS reconnect while already idle, or a silently-failed start rolled back
+    // to Idle) a fetched-but-stale record would otherwise persist here and
+    // drive phantom cook-progress.
+    if !is_cooking && matches!(state.lifecycle, Lifecycle::Idle) {
+        state.current_cook = None;
+    }
+
     state.status = Some(status);
     effects.push(SmEffect::PublishReadModel);
     effects
@@ -805,6 +816,22 @@ mod tests {
                 reason: HistoryReason::WsCookToIdle
             }
         )));
+        assert_eq!(state.lifecycle, Lifecycle::Idle);
+        assert!(state.current_cook.is_none());
+    }
+
+    // Stale current_cook is cleared on an idle ApoState even when the
+    // cooking->idle edge was never observed (e.g. server restart / WS
+    // reconnect while already idle) — the stale-cook reconcile.
+    #[test]
+    fn idle_apo_state_clears_stale_current_cook_without_edge() {
+        let mut state = SmState::new();
+        // Populated out-of-band, with no prior cooking status observed, so the
+        // cooking->idle edge below will not fire — only the reconcile can.
+        state.current_cook = Some(cook(vec![stage(Some("s1"), "cook", false, Some(1200))]));
+
+        let _ = apply_apo_state(&mut state, oven_status("idle", 0));
+
         assert_eq!(state.lifecycle, Lifecycle::Idle);
         assert!(state.current_cook.is_none());
     }

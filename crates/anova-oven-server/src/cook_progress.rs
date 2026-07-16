@@ -166,6 +166,21 @@ impl CookProgressTask {
             return;
         };
 
+        // Live oven state is authoritative for whether a cook is running (the
+        // phone app agrees). Anova's Firestore `currentCook` lingers after a
+        // cook ends, so a present `cook` does not imply an active cook. If the
+        // oven confirms idle, don't (re)build a tracker from a stale record —
+        // mirrors `on_status`. A `None` status (mid-startup, not yet observed)
+        // still builds, preserving the startup-race behavior below.
+        if status.is_some_and(|s| !s.is_cooking()) {
+            if self.tracker.is_some() {
+                debug!("[cook-progress] ignoring current-cook while oven idle");
+                self.tracker = None;
+                self.publish();
+            }
+            return;
+        }
+
         let same_cook = self
             .tracker
             .as_ref()
@@ -464,8 +479,35 @@ fn infer_stage_index(stages: &[Stage], status: &OvenStatus) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::evaluate_stage_completion;
-    use anova_oven_api::{OvenStatus, Stage};
+    use super::{evaluate_stage_completion, CookProgressTask};
+    use anova_oven_api::{CookProgress, CurrentCook, OvenStatus, Stage};
+    use tokio::sync::watch;
+
+    fn task_with_rx() -> (CookProgressTask, watch::Receiver<Option<CookProgress>>) {
+        let (tx, rx) = watch::channel(None);
+        (CookProgressTask::new(tx), rx)
+    }
+
+    fn idle_status() -> OvenStatus {
+        OvenStatus {
+            mode: "idle".into(),
+            ..base_status()
+        }
+    }
+
+    fn stale_cook() -> CurrentCook {
+        // Anova's Firestore currentCook still holds this record after the cook
+        // ended and the oven went idle — the scenario that drove the phantom
+        // "tracker rebuilt" log spam.
+        CurrentCook {
+            recipe_id: None,
+            recipe_title: "Steam Oven Toast".into(),
+            started_at: "2026-07-15T13:28:27.750Z".into(),
+            cook_stage_count: 3,
+            total_stage_count: 3,
+            stages: vec![base_stage(), base_stage(), base_stage()],
+        }
+    }
 
     fn base_stage() -> Stage {
         Stage {
@@ -581,5 +623,45 @@ mod tests {
         );
 
         assert!(!complete);
+    }
+
+    // A stale Firestore currentCook must not build a tracker while the oven is
+    // confirmed idle — this is the phantom "tracker rebuilt" loop.
+    #[test]
+    fn stale_cook_builds_no_tracker_when_oven_idle() {
+        let (mut task, rx) = task_with_rx();
+
+        task.on_current_cook(Some(stale_cook()), Some(&idle_status()));
+
+        assert!(task.tracker.is_none());
+        assert!(rx.borrow().is_none());
+    }
+
+    // A live idle status clears a tracker that was built while cooking, and a
+    // subsequent stale-cook refresh does not resurrect it.
+    #[test]
+    fn idle_status_clears_tracker_and_stale_refresh_does_not_rebuild() {
+        let (mut task, rx) = task_with_rx();
+
+        // Cooking: tracker is built.
+        task.on_current_cook(Some(stale_cook()), Some(&base_status()));
+        assert!(task.tracker.is_some());
+        assert!(rx.borrow().is_some());
+
+        // Oven goes idle: the same-cook current-cook update must clear it.
+        task.on_current_cook(Some(stale_cook()), Some(&idle_status()));
+        assert!(task.tracker.is_none());
+        assert!(rx.borrow().is_none());
+    }
+
+    // Status unknown (mid-startup, oven not yet observed) still builds, so a
+    // genuine cook in progress at startup is tracked.
+    #[test]
+    fn current_cook_builds_tracker_when_status_unknown() {
+        let (mut task, _rx) = task_with_rx();
+
+        task.on_current_cook(Some(stale_cook()), None);
+
+        assert!(task.tracker.is_some());
     }
 }
