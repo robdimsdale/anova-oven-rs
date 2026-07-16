@@ -10,8 +10,14 @@ mod backlight;
 mod display;
 mod health;
 mod input;
+#[cfg(feature = "ui-lcd")]
 mod lcd;
 mod persist;
+mod screen;
+#[cfg(feature = "ui-sharp-basic")]
+mod sharp;
+#[cfg(feature = "ui-sharp-basic")]
+mod sharp_ui;
 mod state;
 
 use embedded_alloc::LlffHeap as Heap;
@@ -32,7 +38,10 @@ use embassy_rp::watchdog::Watchdog;
 use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
 use embassy_sync::watch::Watch;
-use embassy_time::{with_timeout, Delay, Duration, Instant, Timer};
+use embassy_time::{with_timeout, Duration, Instant, Timer};
+#[cfg(feature = "ui-lcd")]
+use embassy_time::Delay;
+#[cfg(feature = "ui-lcd")]
 use hd44780_driver::{
     bus::FourBitBusPins, memory_map::MemoryMap1602, non_blocking::HD44780,
     setup::DisplayOptions4Bit,
@@ -43,7 +52,7 @@ use crate::api_client::{ApiClient, CommandChannel, StateWatch};
 use crate::backlight::BacklightController;
 use crate::display::{Display, DisplayNotifier, ViewSpec};
 use crate::input::{Input, InputChannel};
-use crate::lcd::LcdController;
+use crate::screen::ActiveScreen;
 use crate::state::{execute, AppState, Ctx};
 
 const WIFI_SSID: &str = env!("ANOVA_WIFI_SSID");
@@ -139,26 +148,48 @@ async fn main(spawner: Spawner) {
 
     let p = embassy_rp::init(Default::default());
 
-    let mut lcd_delay = Delay;
-    let lcd = match HD44780::new(
-        DisplayOptions4Bit::new(MemoryMap1602::new()).with_pins(FourBitBusPins {
-            rs: Output::new(p.PIN_17, Level::Low),
-            en: Output::new(p.PIN_16, Level::Low),
-            d4: Output::new(p.PIN_21, Level::Low),
-            d5: Output::new(p.PIN_20, Level::Low),
-            d6: Output::new(p.PIN_19, Level::Low),
-            d7: Output::new(p.PIN_18, Level::Low),
-        }),
-        &mut lcd_delay,
-    )
-    .await
-    {
-        Ok(lcd) => lcd,
-        Err(_) => panic!("LCD init failed"),
+    // Display backend — selected by the `ui-*` feature (see screen.rs). Exactly
+    // one arm compiles; both produce an `ActiveScreen` with `configure()` /
+    // `render(&ViewSpec)`. Note the HD44780 (GP16-21) and the Sharp SPI0 pins
+    // (GP17/18/19) overlap, which is why this is a compile-time swap.
+    #[cfg(feature = "ui-lcd")]
+    let mut screen: ActiveScreen = {
+        let mut lcd_delay = Delay;
+        let lcd = match HD44780::new(
+            DisplayOptions4Bit::new(MemoryMap1602::new()).with_pins(FourBitBusPins {
+                rs: Output::new(p.PIN_17, Level::Low),
+                en: Output::new(p.PIN_16, Level::Low),
+                d4: Output::new(p.PIN_21, Level::Low),
+                d5: Output::new(p.PIN_20, Level::Low),
+                d6: Output::new(p.PIN_19, Level::Low),
+                d7: Output::new(p.PIN_18, Level::Low),
+            }),
+            &mut lcd_delay,
+        )
+        .await
+        {
+            Ok(lcd) => lcd,
+            Err(_) => panic!("LCD init failed"),
+        };
+        crate::lcd::LcdController::new(lcd, lcd_delay)
     };
 
-    let mut lcd_controller = LcdController::new(lcd, lcd_delay);
-    lcd_controller.configure().await;
+    #[cfg(feature = "ui-sharp-basic")]
+    let mut screen: ActiveScreen = {
+        // Sharp Memory Display on SPI0: SCK=GP18, MOSI=GP19, active-high CS=GP17.
+        // Mode 0, 2 MHz (panel max). Blocking (no DMA): async DMA would need a
+        // second channel's DMA_IRQ_0 binding, which cyw43 already owns, and the
+        // dirty-checked ~50 ms flush (~1/s) is fine under the 8 s watchdog.
+        let mut spi_cfg = embassy_rp::spi::Config::default();
+        spi_cfg.frequency = 2_000_000;
+        spi_cfg.phase = embassy_rp::spi::Phase::CaptureOnFirstTransition;
+        spi_cfg.polarity = embassy_rp::spi::Polarity::IdleLow;
+        let spi = embassy_rp::spi::Spi::new_blocking_txonly(p.SPI0, p.PIN_18, p.PIN_19, spi_cfg);
+        let cs = Output::new(p.PIN_17, Level::Low);
+        sharp_ui::SharpScreen::new(spi, cs)
+    };
+
+    screen.configure().await;
 
     // Log the persisted counters, breadcrumbs, and message every boot so
     // an attached probe sees them immediately, regardless of whether
@@ -205,7 +236,7 @@ async fn main(spawner: Spawner) {
             "New panic since last display: panic_count={} reset_count={}",
             recovery.panic_count, recovery.reset_count,
         );
-        show_recovery_view(&mut lcd_controller, &recovery).await;
+        show_recovery_view(&mut screen, &recovery).await;
         persist::mark_displayed();
     }
 
@@ -220,7 +251,7 @@ async fn main(spawner: Spawner) {
     watchdog.start(Duration::from_secs(WATCHDOG_TIMEOUT_SECS));
     spawner.spawn(watchdog_feeder_task(watchdog).unwrap());
 
-    let display = Display::new(lcd_controller, &DISPLAY_NOTIFIER, spawner).unwrap();
+    let display = Display::new(screen, &DISPLAY_NOTIFIER, spawner).unwrap();
 
     #[cfg(feature = "verbose-logs")]
     spawner.spawn(heap_monitor_task().unwrap());
@@ -359,7 +390,7 @@ async fn main(spawner: Spawner) {
     }
 }
 
-async fn show_recovery_view(lcd: &mut LcdController, recovery: &persist::Snapshot) {
+async fn show_recovery_view(screen: &mut ActiveScreen, recovery: &persist::Snapshot) {
     let view = ViewSpec::Recovery {
         reset_count: recovery.reset_count,
         panic_count: recovery.panic_count,
@@ -367,7 +398,7 @@ async fn show_recovery_view(lcd: &mut LcdController, recovery: &persist::Snapsho
     };
     let deadline = Instant::now() + Duration::from_secs(RECOVERY_DISPLAY_SECS);
     while Instant::now() < deadline {
-        lcd.render(&view).await;
+        screen.render(&view).await;
         Timer::after(Duration::from_millis(RECOVERY_RENDER_TICK_MS)).await;
     }
 }

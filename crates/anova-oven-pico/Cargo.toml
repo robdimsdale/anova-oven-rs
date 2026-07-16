@@ -14,7 +14,23 @@
   edition = "2021"
 
 [features]
-  default = []
+  default = ["ui-lcd"]
+
+  # --- Display backend selection (exactly one) --------------------------
+  # The Sharp Memory Display and the HD44780 character LCD can't coexist:
+  # the LCD uses GP16-GP21, which overlaps the Sharp's SPI0 pins
+  # (CS=GP17, SCK=GP18, MOSI=GP19). Choosing a UI therefore swaps both the
+  # peripheral init in main.rs and the render code behind the display task,
+  # so it has to be a cfg feature (a src/bin variant can't touch the shared
+  # main.rs). `screen.rs` picks `ActiveScreen` from whichever is enabled and
+  # const-asserts that exactly one is. Build a Sharp UI with, e.g.:
+  #   cargo run --release --no-default-features --features ui-sharp-basic
+  ui-lcd = []
+  # First graphical layout for the Adafruit 2.7" Sharp Memory Display
+  # (LS027B7DH01, 400x240). Add future layouts as sibling `ui-sharp-*`
+  # features (see screen.rs / sharp_ui.rs).
+  ui-sharp-basic = ["dep:embedded-graphics"]
+
   # Enables defmt on chatty third-party deps and per-event INFO logs in our
   # own code. Off by default so the RTT buffer stays drainable when no probe
   # is attached. Warnings and errors are always emitted unconditionally.
@@ -32,6 +48,11 @@
     "async",
   ] }
   embedded-hal = "1"
+  # Sharp Memory Display backend only (pulled in by `ui-sharp-*` features).
+  # embedded-graphics is a pure no_std graphics lib. The panel uses the
+  # blocking `embedded-hal` SpiBus (already a dep) — see sharp.rs for why not
+  # async/DMA.
+  embedded-graphics = { version = "0.8", optional = true }
 
   anova-oven-api = { path = "../anova-oven-api", default-features = false }
   # Pure-logic core extracted from this crate so it can be host-tested
