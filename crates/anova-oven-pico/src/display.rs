@@ -6,7 +6,7 @@ use embassy_time::{Duration, Timer};
 
 pub use anova_oven_pico_core::fsm::ViewSpec;
 
-use crate::lcd::LcdController;
+use crate::screen::ActiveScreen;
 
 const ANIM_TICK_MS: u64 = 50;
 
@@ -16,11 +16,11 @@ pub struct Display<'a>(&'a DisplayNotifier);
 
 impl<'a> Display<'a> {
     pub fn new(
-        lcd: LcdController,
+        screen: ActiveScreen,
         notifier: &'static DisplayNotifier,
         spawner: Spawner,
     ) -> Result<Self, SpawnError> {
-        spawner.spawn(display_task(lcd, notifier)?);
+        spawner.spawn(display_task(screen, notifier)?);
         Ok(Self(notifier))
     }
 
@@ -30,7 +30,7 @@ impl<'a> Display<'a> {
 }
 
 #[embassy_executor::task]
-async fn display_task(mut lcd: LcdController, notifier: &'static DisplayNotifier) -> ! {
+async fn display_task(mut screen: ActiveScreen, notifier: &'static DisplayNotifier) -> ! {
     let mut current = ViewSpec::Connecting;
 
     loop {
@@ -45,6 +45,6 @@ async fn display_task(mut lcd: LcdController, notifier: &'static DisplayNotifier
         }
 
         crate::persist::bump_display_heartbeat();
-        lcd.render(&current).await;
+        screen.render(&current).await;
     }
 }
