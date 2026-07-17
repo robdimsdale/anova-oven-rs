@@ -168,6 +168,7 @@ impl<'a> ApiRuntime<'a> {
         self.snapshot.fail_count = 0;
         self.snapshot.last_success_at = Some(Instant::now());
         crate::persist::record_api_fail_count(0);
+        crate::ota::notify_api_success();
     }
 
     fn record_fast_poll_failure(&mut self, message: &'static str) {

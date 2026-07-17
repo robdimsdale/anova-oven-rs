@@ -58,6 +58,22 @@
     "critical-section-impl",
     "rp2040",
   ] }
+  # OTA firmware-update helpers. The bootloader crate uses the same
+  # versions in its own (separate) workspace. We depend on
+  # `embassy-boot` directly (not just via embassy-boot-rp's transitive
+  # pull) because `FirmwareUpdaterError` is exported there and not
+  # re-exported from embassy-boot-rp. `embassy-embedded-hal` is named
+  # directly so we can construct `BlockingPartition` ourselves and
+  # avoid embassy-boot's `from_linkerfile_blocking` convenience
+  # constructor — that one is hard-coded to `NoopRawMutex`, which is
+  # `!Sync` and can't live in a static.
+  embassy-boot = { version = "0.7.0", default-features = false, features = [
+    "defmt",
+  ] }
+  embassy-boot-rp = { version = "0.10.0", default-features = false, features = [
+    "defmt",
+  ] }
+  embassy-embedded-hal = { version = "0.6.0", default-features = false }
   embassy-net = { version = "0.9.1", default-features = false, features = [
     "tcp",
     "dhcpv4",

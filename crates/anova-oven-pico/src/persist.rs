@@ -25,6 +25,7 @@
 //!   offset  56:  ring                        ([RingEntry; 8] = 192 bytes)
 //!   offset 248:  msg_len                     (u32)
 //!   offset 252:  msg_buf                     ([u8; 512])
+//!   offset 764:  version_buf                 ([u8; 48])  // NUL-padded `<pkg>-<sha>[-dirty]`
 //!
 //! Each `RingEntry` (6x u32 = 24 bytes) describes one reset that
 //! happened *before* the boot that wrote the entry: the reset reason,
@@ -61,8 +62,9 @@ use cortex_m_rt::{exception, ExceptionFrame};
 //   v2 = 0xA9B0_C1D3 — added ring_head + ring (8 entries, 2 u32 each)
 //   v3 = 0xA9B0_C1D4 — added last_free_heap/network_up/last_api_fail_count
 //                      live fields; RingEntry grown to 6 u32
-const MAGIC: u32 = 0xA9B0_C1D4;
-pub use anova_oven_pico_core::persist_data::{MSG_BUF_SIZE, RING_SIZE};
+//   v4 = 0xA9B0_C1D5 — added version_buf ([u8; 48]) at the tail
+const MAGIC: u32 = 0xA9B0_C1D5;
+pub use anova_oven_pico_core::persist_data::{MSG_BUF_SIZE, RING_SIZE, VERSION_BUF_SIZE};
 
 /// RP2040 WATCHDOG.REASON register. Bit 0 = TIMER (timed out), bit 1 =
 /// FORCE (TRIGGER bit set in CTRL). Bits clear when the watchdog is
@@ -108,6 +110,7 @@ struct PersistRegion {
     ring: [RingEntry; RING_SIZE],
     msg_len: u32,
     msg_buf: [u8; MSG_BUF_SIZE],
+    version_buf: [u8; VERSION_BUF_SIZE],
 }
 
 #[link_section = ".uninit.PERSIST"]
@@ -150,6 +153,32 @@ unsafe fn zero_region() {
             core::ptr::write_volatile(ring_ptr.add(i), 0);
         }
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr).msg_len), 0);
+        let version_ptr = core::ptr::addr_of_mut!((*ptr).version_buf) as *mut u8;
+        for i in 0..VERSION_BUF_SIZE {
+            core::ptr::write_volatile(version_ptr.add(i), 0);
+        }
+    }
+}
+
+/// Copy the build version string into the persist MMIO version slot,
+/// NUL-padding the remainder. Truncates silently if `s` is longer than
+/// `VERSION_BUF_SIZE - 1` (we always reserve a NUL terminator so the
+/// decode in `read_live` and the dump-persist script can stop cleanly).
+/// Called once per boot from `init_at_boot`, regardless of whether the
+/// magic was valid — so an OTA install's first boot immediately reflects
+/// the new version on `/health` and over SWD.
+fn record_build_version(s: &str) {
+    let ptr = region_ptr();
+    let bytes = s.as_bytes();
+    let n = bytes.len().min(VERSION_BUF_SIZE - 1);
+    unsafe {
+        let buf_ptr = core::ptr::addr_of_mut!((*ptr).version_buf) as *mut u8;
+        for i in 0..n {
+            core::ptr::write_volatile(buf_ptr.add(i), bytes[i]);
+        }
+        for i in n..VERSION_BUF_SIZE {
+            core::ptr::write_volatile(buf_ptr.add(i), 0);
+        }
     }
 }
 
@@ -315,6 +344,29 @@ pub fn read_live() -> Snapshot {
             None
         };
 
+        // Decode version_buf: read up to the first NUL, then trim to a
+        // valid UTF-8 prefix. `record_build_version` always NUL-pads, so
+        // a v4-or-later region returns the current image's version; an
+        // older region (impossible past the magic check, but defensive)
+        // would just produce an empty string.
+        let version_ptr = core::ptr::addr_of!((*ptr).version_buf) as *const u8;
+        let mut vbytes: heapless::Vec<u8, VERSION_BUF_SIZE> = heapless::Vec::new();
+        for i in 0..VERSION_BUF_SIZE {
+            let b = core::ptr::read_volatile(version_ptr.add(i));
+            if b == 0 {
+                break;
+            }
+            let _ = vbytes.push(b);
+        }
+        let valid_end = match core::str::from_utf8(&vbytes) {
+            Ok(_) => vbytes.len(),
+            Err(e) => e.valid_up_to(),
+        };
+        let mut version: heapless::String<VERSION_BUF_SIZE> = heapless::String::new();
+        if let Ok(prefix) = core::str::from_utf8(&vbytes[..valid_end]) {
+            let _ = version.push_str(prefix);
+        }
+
         Snapshot {
             magic_valid,
             uptime_secs: embassy_time::Instant::now().as_secs(),
@@ -336,6 +388,7 @@ pub fn read_live() -> Snapshot {
             ring_head,
             reset_history,
             message,
+            version,
         }
     }
 }
@@ -346,7 +399,12 @@ pub fn read_live() -> Snapshot {
 /// *before* `Watchdog::start()` (so WATCHDOG.REASON is still legible).
 /// The message buffer is left intact so probe-rs can read it at any
 /// later point.
-pub fn init_at_boot() -> Snapshot {
+///
+/// `build_version` is recorded into the persist version slot on every
+/// boot (after any cold-boot zeroing) so the returned snapshot and any
+/// later `read_live()` reflect the *currently running* image — not the
+/// previous one. Callers pass `env!("BUILD_VERSION")` from the bin.
+pub fn init_at_boot(build_version: &str) -> Snapshot {
     let ptr = region_ptr();
 
     // Side effects: validate / zero, bump reset_count, classify and
@@ -364,6 +422,11 @@ pub fn init_at_boot() -> Snapshot {
         if !magic_was_valid {
             zero_region();
         }
+        // Overwrite the version slot with the currently running image's
+        // identifier on every boot — after any cold-boot zeroing, so an
+        // OTA install's first boot immediately surfaces the new version
+        // on /health and over SWD even if magic was just re-initialized.
+        record_build_version(build_version);
 
         let rc = core::ptr::read_volatile(core::ptr::addr_of!((*ptr).reset_count));
         core::ptr::write_volatile(

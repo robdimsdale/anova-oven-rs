@@ -1,0 +1,50 @@
+# Standalone workspace — this crate targets thumbv6m-none-eabi (Cortex-M0+)
+# and is the bootloader half of the OTA story (see crates/anova-oven-pico
+# for the app). Build from this directory:
+#   cargo build --release
+#
+# Enable the `defmt` feature when bringing up with a probe attached:
+#   cargo build --release --features defmt
+[workspace]
+
+[package]
+  name = "anova-oven-pico-bootloader"
+  version = "0.1.0"
+  edition = "2021"
+
+[features]
+  default = []
+  defmt = [
+    "dep:defmt",
+    "dep:defmt-rtt",
+    "embassy-boot-rp/defmt",
+    "embassy-rp/defmt",
+  ]
+
+[dependencies]
+  embassy-boot-rp = { version = "0.10.0", default-features = false }
+  # `time-driver` provides the embassy-time driver used by the watchdog
+  # timeout. No `critical-section-impl` here — `cortex-m`'s
+  # `critical-section-single-core` below is the only critical-section
+  # implementation in this binary (enabling both causes a feature-set
+  # collision in `critical-section`).
+  embassy-rp = { version = "0.10.0", default-features = false, features = [
+    "rp2040",
+    "time-driver",
+  ] }
+  embassy-sync = { version = "0.8.0", default-features = false }
+  embassy-time = { version = "0.5.1", default-features = false }
+
+  cortex-m = { version = "0.7", features = [
+    "inline-asm",
+    "critical-section-single-core",
+  ] }
+  cortex-m-rt = "0.7"
+
+  defmt = { version = "1.1", optional = true }
+  defmt-rtt = { version = "1.2", optional = true }
+
+[profile.release]
+  opt-level = "s"
+  debug = true
+  lto = true

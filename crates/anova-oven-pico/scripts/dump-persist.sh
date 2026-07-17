@@ -95,10 +95,13 @@ if [[ -z "$ADDR" ]]; then
 fi
 
 PERSIST_RS="$CRATE_DIR/src/persist.rs"
-if [[ ! -f "$PERSIST_RS" ]]; then
-  echo "error: cannot find $PERSIST_RS to read layout constants" >&2
-  exit 1
-fi
+PERSIST_DATA_RS="$REPO_ROOT/crates/anova-oven-pico-core/src/persist_data.rs"
+for f in "$PERSIST_RS" "$PERSIST_DATA_RS"; do
+  if [[ ! -f "$f" ]]; then
+    echo "error: cannot find $f to read layout constants" >&2
+    exit 1
+  fi
+done
 
 # Name-table sources in pico-core. Parsed by the embedded python below
 # (`RESET_REASON` from reset.rs, `APP_STATE` from fsm.rs + reset.rs).
@@ -118,8 +121,20 @@ done
 # --- Layout, parsed from persist.rs so it can't silently drift -------------
 
 rs_const() { # name -> integer literal (underscores stripped)
-    sed -nE "s/^[[:space:]]*const $1:[^=]*=[[:space:]]*([0-9A-Fa-fx_]+)[[:space:]]*;.*/\1/p" \
-    "$PERSIST_RS" | head -n1 | tr -d '_'
+    # `const NAME` (persist.rs locals like MAGIC, RING_ENTRY_WORDS) or
+    # `pub const NAME` (canonical sizing constants in pico-core,
+    # re-exported via `pub use`). Try persist.rs first so a local
+    # override wins; fall back to persist_data.rs for the re-exports.
+    local name="$1"
+    local found
+    for src in "$PERSIST_RS" "$PERSIST_DATA_RS"; do
+        found="$(sed -nE "s/^[[:space:]]*(pub )?const $name:[^=]*=[[:space:]]*([0-9A-Fa-fx_]+)[[:space:]]*;.*/\2/p" \
+                 "$src" | head -n1 | tr -d '_')"
+        if [[ -n "$found" ]]; then
+            echo "$found"
+            return
+        fi
+    done
 }
 
 # Extract the ordered `name: u32,` field names from the body of
@@ -142,11 +157,13 @@ MAGIC_RS="$(rs_const MAGIC)"
 RING_SIZE_RS="$(rs_const RING_SIZE)"
 MSG_BUF_SIZE_RS="$(rs_const MSG_BUF_SIZE)"
 RING_ENTRY_WORDS_RS="$(rs_const RING_ENTRY_WORDS)"
+VERSION_BUF_SIZE_RS="$(rs_const VERSION_BUF_SIZE)"
 
 if [[ -z "$MAGIC_RS" || -z "$RING_SIZE_RS" || -z "$MSG_BUF_SIZE_RS" \
-      || -z "$RING_ENTRY_WORDS_RS" ]]; then
-  echo "error: failed to parse MAGIC/RING_SIZE/MSG_BUF_SIZE/RING_ENTRY_WORDS" \
-       "from $PERSIST_RS" >&2
+      || -z "$RING_ENTRY_WORDS_RS" || -z "$VERSION_BUF_SIZE_RS" ]]; then
+  echo "error: failed to parse" \
+       "MAGIC/RING_SIZE/MSG_BUF_SIZE/RING_ENTRY_WORDS/VERSION_BUF_SIZE" \
+       "from persist.rs / persist_data.rs" >&2
   exit 1
 fi
 
@@ -179,15 +196,17 @@ esac
 # + RING_SIZE * RING_ENTRY_WORDS       (the ring)
 # + 1                                  (msg_len)
 # + MSG_BUF_SIZE / 4                   (msg_buf bytes)
+# + VERSION_BUF_SIZE / 4               (version_buf bytes)
 WORDS=$(( HEADER_WORDS + RING_SIZE_RS * RING_ENTRY_WORDS_RS \
-          + 1 + MSG_BUF_SIZE_RS / 4 ))
+          + 1 + MSG_BUF_SIZE_RS / 4 + VERSION_BUF_SIZE_RS / 4 ))
 
 echo "ELF:     $ELF"
 echo "symbol:  0x$ADDR (.uninit.PERSIST)"
 echo "chip:    $CHIP   protocol: $PROTOCOL"
 echo "layout:  MAGIC=$MAGIC_RS RING_SIZE=$RING_SIZE_RS" \
      "RING_ENTRY_WORDS=$RING_ENTRY_WORDS_RS" \
-     "MSG_BUF_SIZE=$MSG_BUF_SIZE_RS"
+     "MSG_BUF_SIZE=$MSG_BUF_SIZE_RS" \
+     "VERSION_BUF_SIZE=$VERSION_BUF_SIZE_RS"
 echo "         header=$HEADER_WORDS words -> $WORDS words total" \
      "(from persist.rs)"
 echo
@@ -220,7 +239,7 @@ fi
 # heredoc and the script sees empty stdin. (That latent bug is why the
 # original version of this script reported "got 0" for every read.)
 export MAGIC_RS RING_SIZE_RS MSG_BUF_SIZE_RS RING_ENTRY_WORDS_RS \
-       HEADER_FIELDS RING_FIELDS RESET_RS FSM_RS
+       VERSION_BUF_SIZE_RS HEADER_FIELDS RING_FIELDS RESET_RS FSM_RS
 export PERSIST_WORDS="$RAW"
 python3 - "$WORDS" <<'PY'
 import os
@@ -237,6 +256,7 @@ MAGIC = int(os.environ["MAGIC_RS"], 0)
 RING_SIZE = int(os.environ["RING_SIZE_RS"], 0)
 MSG_BUF_SIZE = int(os.environ["MSG_BUF_SIZE_RS"], 0)
 RING_ENTRY_WORDS = int(os.environ["RING_ENTRY_WORDS_RS"], 0)
+VERSION_BUF_SIZE = int(os.environ["VERSION_BUF_SIZE_RS"], 0)
 HEADER = [f for f in os.environ["HEADER_FIELDS"].split() if f]
 RING_FIELDS = [f for f in os.environ["RING_FIELDS"].split() if f]
 
@@ -410,6 +430,28 @@ def kib(b):
 def updown(v):
     return f"{v} ({'up' if v else 'down'})"
 
+
+# Build version: lives in version_buf at the very end of the region
+# (immediately after msg_buf). Print it first so an operator who's
+# debugging an unknown device sees "which image is this?" before
+# anything else. The slot is NUL-padded; truncate at the first NUL and
+# best-effort UTF-8 decode (same convention as msg_buf below).
+version_start = (
+    len(HEADER) + RING_SIZE * RING_ENTRY_WORDS + 1 + MSG_BUF_SIZE // 4
+)
+version_words = words[version_start:version_start + VERSION_BUF_SIZE // 4]
+version_bytes = bytearray()
+for w in version_words:
+    version_bytes += w.to_bytes(4, "little")
+nul = version_bytes.find(0)
+if nul >= 0:
+    version_bytes = version_bytes[:nul]
+try:
+    version_str = version_bytes.decode("utf-8")
+except UnicodeDecodeError as e:
+    version_str = version_bytes[: e.start].decode("utf-8", "replace")
+print(f"build version: {version_str or '(empty)'}")
+print()
 
 # Header: one u32 per parsed field name, in struct order.
 hdr = dict(zip(HEADER, words))

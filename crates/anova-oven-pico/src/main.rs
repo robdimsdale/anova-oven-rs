@@ -8,11 +8,12 @@ mod api;
 mod api_client;
 mod backlight;
 mod display;
-mod health;
 mod input;
 mod lcd;
+mod ota;
 mod persist;
 mod state;
+mod web;
 
 use embedded_alloc::LlffHeap as Heap;
 
@@ -129,15 +130,27 @@ async fn main(spawner: Spawner) {
         HEAP.init(HEAP_MEM.as_ptr() as usize, HEAP_SIZE);
     }
 
+    // Boot banner — first thing on every defmt session so a probe
+    // attaching mid-boot still sees which image is running. The same
+    // string is recorded into the persist version slot by init_at_boot
+    // (next line) so /health and dump-persist over SWD report it too.
+    info!("anova-oven-pico booting, version: {}", env!("BUILD_VERSION"));
+
     // Read persisted reset/panic counters and any stored panic message.
     // This bumps reset_count so subsequent boots can tell if the previous
     // run ended cleanly or not. Must run after the allocator is up because
     // the snapshot owns a heapless::String backed by stack memory only, but
     // before peripheral init so we record the boot regardless of what comes
     // next.
-    let recovery = persist::init_at_boot();
+    let recovery = persist::init_at_boot(env!("BUILD_VERSION"));
 
     let p = embassy_rp::init(Default::default());
+
+    // Hand the FLASH peripheral to the OTA layer. Must happen before
+    // any task that may call into `ota` spawns. p.FLASH isn't used by
+    // anything else in this firmware, so taking it here is safe.
+    let ota_flash = embassy_rp::flash::Flash::<_, _, { ota::FLASH_SIZE }>::new_blocking(p.FLASH);
+    ota::install_flash(ota_flash);
 
     let mut lcd_delay = Delay;
     let lcd = match HD44780::new(
@@ -335,11 +348,18 @@ async fn main(spawner: Spawner) {
         info!("IP address: {}", defmt::Display2Format(&config.address));
     }
 
-    // Start the `/health` HTTP server now that DHCP is up. Runs in its
-    // own embassy task so a stalled client can't delay the watchdog
-    // feeder. The endpoint exposes the live persist-region snapshot —
-    // same data as `scripts/dump-persist.sh` over SWD.
-    health::spawn(spawner, stack);
+    // Start the HTTP server now that DHCP is up. Runs in its own
+    // embassy task so a stalled client can't delay the watchdog
+    // feeder. Serves `/health` (live persist snapshot) and
+    // `/update_firmware` (streamed OTA upload).
+    web::spawn(spawner, stack);
+
+    // The OTA handler signals reboot via this task so the success
+    // response has time to flush before reset wipes the TCP buffers.
+    ota::spawn_reboot_task(spawner);
+    // Awaits the first successful API exchange, then marks the running
+    // image good so the bootloader keeps it across resets.
+    ota::spawn_health_gate_task(spawner);
 
     let api = ApiClient::new(stack, &API_COMMANDS, &API_STATE, spawner).unwrap();
     let api_rx = api.receiver().unwrap();

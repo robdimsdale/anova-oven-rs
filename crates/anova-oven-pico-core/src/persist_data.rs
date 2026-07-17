@@ -30,10 +30,13 @@ use crate::fsm::app_state_name;
 use crate::reset::{init_stage_name, ResetReason};
 
 /// Canonical sizing constants for the persist region. Bin's
-/// `PersistRegion` layout must match — bump `MAGIC` in the bin if
-/// either of these changes.
+/// `PersistRegion` layout must match — bump `MAGIC` in the bin if any
+/// of these changes.
 pub const MSG_BUF_SIZE: usize = 512;
 pub const RING_SIZE: usize = 8;
+/// Bytes reserved for the NUL-padded build-version string. 48 holds
+/// `"<pkg>-<8-hex-sha>-dirty\0"` (≈22 B) with headroom.
+pub const VERSION_BUF_SIZE: usize = 48;
 
 /// One entry in the boot-history ring. Mirrors the on-MMIO layout
 /// (6× u32 in the bin's `RingEntry`) but exposes booleans / typed
@@ -135,6 +138,12 @@ pub struct Snapshot {
     /// stored bytes don't form valid UTF-8 past some prefix.
     #[cfg_attr(feature = "serde", serde(rename = "panic_message"))]
     pub message: Option<String<MSG_BUF_SIZE>>,
+    /// Build version of the *currently running* image:
+    /// `"<CARGO_PKG_VERSION>-<short-git-sha>[-dirty]"`. Recorded into
+    /// the persist MMIO version slot at every boot, so the value
+    /// reported here also survives across resets and is readable via
+    /// dump-persist over SWD even if `/health` is unreachable.
+    pub version: String<VERSION_BUF_SIZE>,
 }
 
 #[cfg(test)]
@@ -158,6 +167,8 @@ mod tests {
         });
         let mut msg: String<MSG_BUF_SIZE> = String::new();
         let _ = msg.push_str("hello panic");
+        let mut version: String<VERSION_BUF_SIZE> = String::new();
+        let _ = version.push_str("0.1.0-deadbeef-dirty");
         Snapshot {
             magic_valid: true,
             uptime_secs: 12345,
@@ -182,6 +193,7 @@ mod tests {
             ring_head: 9,
             reset_history: history,
             message: Some(msg),
+            version,
         }
     }
 
@@ -217,6 +229,7 @@ mod tests {
             ("last_api_fail_count", 1.into()),
             ("ring_head", 9.into()),
             ("panic_message", "hello panic".into()),
+            ("version", "0.1.0-deadbeef-dirty".into()),
         ];
         for (key, expected) in expectations {
             let got = obj.get(*key).unwrap_or_else(|| {
@@ -284,10 +297,10 @@ mod tests {
         // `EXTRA_NESTED_KEYS`. Forces an active acknowledgment when
         // the schema grows.
         //
-        // 13 flat + last_app_state + heartbeats + reset_history = 16.
+        // 14 flat + last_app_state + heartbeats + reset_history = 17.
         assert_eq!(
             obj.len(),
-            16,
+            17,
             "Snapshot grew a new field — add it to the expectation \
              list above and bump this count. Current keys: {:?}",
             obj.keys().collect::<alloc::vec::Vec<_>>()
