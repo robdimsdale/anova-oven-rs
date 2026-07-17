@@ -84,7 +84,7 @@
   # serialize the typed struct directly to the socket — no alloc on
   # the response path, so `/health` keeps working under heap pressure
   # (which is exactly when it's most useful for debugging).
-  picoserve = { version = "0.18", default-features = false, features = [
+  picoserve = { version = "0.19", default-features = false, features = [
     "embassy",
     "json",
   ] }
