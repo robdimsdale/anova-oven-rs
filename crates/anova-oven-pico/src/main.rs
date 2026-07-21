@@ -14,6 +14,9 @@ mod input;
 mod lcd;
 mod persist;
 mod screen;
+// Shared graphical layout (Layer C), reused by any DrawTarget-based backend.
+#[cfg(feature = "ui-sharp-basic")]
+mod graphics_view;
 #[cfg(feature = "ui-sharp-basic")]
 mod sharp;
 #[cfg(feature = "ui-sharp-basic")]
@@ -50,7 +53,7 @@ use static_cell::StaticCell;
 
 use crate::api_client::{ApiClient, CommandChannel, StateWatch};
 use crate::backlight::BacklightController;
-use crate::display::{Display, DisplayNotifier, ViewSpec};
+use crate::display::{Display, DisplayBackend, DisplayNotifier, ViewSpec};
 use crate::input::{Input, InputChannel};
 use crate::screen::ActiveScreen;
 use crate::state::{execute, AppState, Ctx};
@@ -148,10 +151,11 @@ async fn main(spawner: Spawner) {
 
     let p = embassy_rp::init(Default::default());
 
-    // Display backend — selected by the `ui-*` feature (see screen.rs). Exactly
-    // one arm compiles; both produce an `ActiveScreen` with `configure()` /
-    // `render(&ViewSpec)`. Note the HD44780 (GP16-21) and the Sharp SPI0 pins
-    // (GP17/18/19) overlap, which is why this is a compile-time swap.
+    // Display backend — selected by the `ui-*` feature (see screen.rs). At most
+    // one arm compiles; each produces an `ActiveScreen: DisplayBackend`
+    // (`configure()` / `render(&ViewSpec)`), and with no feature the headless
+    // arm builds a no-op `NullScreen`. Note the HD44780 (GP16-21) and the Sharp
+    // SPI0 pins (GP17/18/19) overlap, which is why this is a compile-time swap.
     #[cfg(feature = "ui-lcd")]
     let mut screen: ActiveScreen = {
         let mut lcd_delay = Delay;
@@ -188,6 +192,10 @@ async fn main(spawner: Spawner) {
         let cs = Output::new(p.PIN_17, Level::Low);
         sharp_ui::SharpScreen::new(spi, cs)
     };
+
+    // Headless: no panel wired, display task drives a no-op backend.
+    #[cfg(not(any(feature = "ui-lcd", feature = "ui-sharp-basic")))]
+    let mut screen: ActiveScreen = crate::display::NullScreen::new();
 
     screen.configure().await;
 

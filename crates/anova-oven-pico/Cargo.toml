@@ -14,17 +14,21 @@
   edition = "2021"
 
 [features]
-  default = ["ui-lcd"]
+  # No display by default: the firmware runs headless (defmt logging only)
+  # via screen::NullScreen. Opt into a panel with one of the ui-* features.
+  default = []
 
-  # --- Display backend selection (exactly one) --------------------------
+  # --- Display backend selection (at most one; none = headless) ---------
   # The Sharp Memory Display and the HD44780 character LCD can't coexist:
   # the LCD uses GP16-GP21, which overlaps the Sharp's SPI0 pins
   # (CS=GP17, SCK=GP18, MOSI=GP19). Choosing a UI therefore swaps both the
   # peripheral init in main.rs and the render code behind the display task,
   # so it has to be a cfg feature (a src/bin variant can't touch the shared
-  # main.rs). `screen.rs` picks `ActiveScreen` from whichever is enabled and
-  # const-asserts that exactly one is. Build a Sharp UI with, e.g.:
-  #   cargo run --release --no-default-features --features ui-sharp-basic
+  # main.rs). `screen.rs` picks `ActiveScreen` from whichever is enabled (or
+  # NullScreen when none is) and const-asserts that at most one is. Build:
+  #   cargo run --release                              # headless
+  #   cargo run --release --features ui-lcd            # character LCD
+  #   cargo run --release --features ui-sharp-basic    # Sharp Memory Display
   ui-lcd = []
   # First graphical layout for the Adafruit 2.7" Sharp Memory Display
   # (LS027B7DH01, 400x240). Add future layouts as sibling `ui-sharp-*`
