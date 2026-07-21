@@ -33,7 +33,7 @@
   # First graphical layout for the Adafruit 2.7" Sharp Memory Display
   # (LS027B7DH01, 400x240). Add future layouts as sibling `ui-sharp-*`
   # features (see screen.rs / sharp_ui.rs).
-  ui-sharp-basic = ["dep:embedded-graphics"]
+  ui-sharp-basic = ["dep:embedded-graphics", "dep:u8g2-fonts"]
 
   # Enables defmt on chatty third-party deps and per-event INFO logs in our
   # own code. Off by default so the RTT buffer stays drainable when no probe
@@ -57,6 +57,10 @@
   # blocking `embedded-hal` SpiBus (already a dep) — see sharp.rs for why not
   # async/DMA.
   embedded-graphics = { version = "0.8", optional = true }
+  # Large bitmap fonts (u8g2 collection) for distance-readable text on the
+  # Sharp panel. Renders straight to an embedded-graphics DrawTarget via its
+  # FontRenderer; pulled in only by the `ui-sharp-*` features.
+  u8g2-fonts = { version = "0.8", optional = true, default-features = false }
 
   anova-oven-api = { path = "../anova-oven-api", default-features = false }
   # Pure-logic core extracted from this crate so it can be host-tested
