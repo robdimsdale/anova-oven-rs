@@ -5,7 +5,8 @@ use alloc::vec::Vec;
 use embassy_rp::gpio::Output;
 use embassy_time::{Delay, Duration, Instant};
 
-use crate::display::ViewSpec;
+use crate::api::celcius_to_fahrenheit;
+use crate::display::{DisplayBackend, ViewSpec};
 
 const LCD_WIDTH: usize = 16;
 const SCROLL_STEP_MS: u64 = 350;
@@ -57,7 +58,7 @@ impl LcdController {
         }
     }
 
-    pub(crate) async fn configure(&mut self) {
+    async fn configure_lcd(&mut self) {
         self.lcd
             .set_display_mode(
                 DisplayMode {
@@ -82,7 +83,7 @@ impl LcdController {
             .is_some_and(|state| state.cycle_complete && Instant::now() >= state.pause_until)
     }
 
-    pub(crate) async fn render(&mut self, view: &ViewSpec) {
+    async fn render_lcd(&mut self, view: &ViewSpec) {
         match view {
             ViewSpec::WifiInit => {
                 self.write_row(0, "Anova Oven").await;
@@ -445,6 +446,12 @@ impl LcdController {
     }
 }
 
-pub fn celcius_to_fahrenheit(c: f32) -> f32 {
-    c * 1.8 + 32.0
+impl DisplayBackend for LcdController {
+    async fn configure(&mut self) {
+        self.configure_lcd().await;
+    }
+
+    async fn render(&mut self, view: &ViewSpec) {
+        self.render_lcd(view).await;
+    }
 }
