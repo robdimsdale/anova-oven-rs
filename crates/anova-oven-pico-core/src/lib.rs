@@ -22,3 +22,4 @@ pub mod fsm;
 pub mod persist_data;
 pub mod reset;
 pub mod scheduler;
+pub mod view_plan;

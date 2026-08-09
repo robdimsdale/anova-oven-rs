@@ -18,6 +18,13 @@ pub fn normalize_server_url(url: &str) -> String {
     }
 }
 
+/// Convert Celsius to Fahrenheit. The oven reports temperatures in Celsius; the
+/// display renders Fahrenheit. Single-sourced here so the bin's display code and
+/// the view planner agree.
+pub fn celcius_to_fahrenheit(c: f32) -> f32 {
+    c * 1.8 + 32.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
