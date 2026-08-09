@@ -321,6 +321,6 @@ pub async fn fetch_recipes(
     .await
 }
 
-pub fn celcius_to_fahrenheit(c: f32) -> f32 {
-    c * 1.8 + 32.0
-}
+// Single-sourced in pico-core so the display code and the host-tested view
+// planner share one formula. Re-exported here for the LCD backend.
+pub use anova_oven_pico_core::api::celcius_to_fahrenheit;
