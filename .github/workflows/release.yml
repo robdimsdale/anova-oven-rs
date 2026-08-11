@@ -18,25 +18,15 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
 
-      - name: cargo fmt
-        run: cargo fmt --all --check
-
-      - name: cargo clippy
-        run: cargo clippy --release -- -D warnings
-
-      - name: cargo test
-        run: cargo test --release --all
-
       - name: Install nightly toolchain for pico
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: nightly
           target: thumbv6m-none-eabi
+          components: rustfmt, clippy
+          # Leave the repo root on stable: the pico crate selects nightly via
+          # its own rust-toolchain.toml.
+          override: false
 
-      - name: cargo build pico (thumbv6m-none-eabi)
-        working-directory: crates/anova-oven-pico
-        env:
-          ANOVA_WIFI_SSID: ci-dummy-ssid
-          ANOVA_WIFI_PASSWORD: ci-dummy-password
-          ANOVA_SERVER_URL: http://192.0.2.1:8080
-        run: cargo build --release
+      - name: Build and test
+        run: ./scripts/build-and-test.sh
