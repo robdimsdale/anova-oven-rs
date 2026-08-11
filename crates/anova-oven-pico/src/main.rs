@@ -38,9 +38,9 @@ use embassy_rp::watchdog::Watchdog;
 use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
 use embassy_sync::watch::Watch;
-use embassy_time::{with_timeout, Duration, Instant, Timer};
 #[cfg(feature = "ui-lcd")]
 use embassy_time::Delay;
+use embassy_time::{with_timeout, Duration, Instant, Timer};
 #[cfg(feature = "ui-lcd")]
 use hd44780_driver::{
     bus::FourBitBusPins, memory_map::MemoryMap1602, non_blocking::HD44780,
