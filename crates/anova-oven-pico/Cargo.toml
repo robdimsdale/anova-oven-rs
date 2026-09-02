@@ -30,6 +30,7 @@
   #   cargo run --release --features ui-lcd            # character LCD
   #   cargo run --release --features ui-sharp-basic    # Sharp Memory Display
   #   cargo run --release --features ui-oled-basic     # 2.42" 128x64 OLED
+  #   cargo run --release --features ui-tft-basic      # 2.0" 320x240 colour TFT
   # See docs/pico-displays.md for wiring and per-panel notes.
   ui-lcd = []
   # First graphical layout for the Adafruit 2.7" Sharp Memory Display
@@ -46,6 +47,12 @@
   # the choice is a build flag: add this feature for a board bought since
   # then. Only meaningful alongside `ui-oled-basic`.
   oled-ssd1309 = []
+  # First graphical layout for the Adafruit 2.0" 320x240 colour IPS TFT
+  # (product 4311, ST7789). Shares the same layout code as the other graphical
+  # panels: the driver keeps a 1-bit framebuffer and applies colour when it
+  # flushes, because a full RGB565 framebuffer would not fit in RP2040 SRAM
+  # (see screen.rs / tft_ui.rs / tft.rs).
+  ui-tft-basic = ["_graphics"]
 
   # Internal (not for direct use): the shared 1-bit graphical stack — the
   # embedded-graphics/u8g2 deps and the `graphics_view` layer that every

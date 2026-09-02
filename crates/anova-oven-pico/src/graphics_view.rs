@@ -47,19 +47,26 @@ impl Theme {
     }
 }
 
-/// Pick a font tier from the panel size. The large tier targets the ~400x240
-/// Sharp panel (bold FreeUniversal for distance reading); the compact tier is
-/// sized for the 128x64 OLED. Bump the large-tier fonts (e.g. `fub42`) here to
-/// trade characters-per-line for size. `_tf` variants carry the full glyph set
-/// (so '…' renders); `ignore_unknown_chars` keeps a rare missing glyph from
+/// Pick a font tier from the panel size. `_tf` variants carry the full glyph
+/// set (so '…' renders); `ignore_unknown_chars` keeps a rare missing glyph from
 /// aborting a draw.
 ///
-/// The compact tier is chosen by width: the widest hero string the planner can
-/// emit is `"888F -> 888F"`, which at 9x18B is 108px and so just fits the
-/// 128px panel's 120px content width. A wider hero font would be clipped, so
-/// the extra legibility is bought in *height* (9x18B over 9x15B) instead. The
-/// title and body are correspondingly short (12px and 9px lines) to leave room
-/// for the detail rows — see [`fit_lines`] for what happens when they overflow.
+/// **Every tier is bounded by width, not height**, because the hero line is the
+/// one thing the planner never wraps: the widest string it can emit is
+/// `"888F -> 888F"`, and a hero font that renders it wider than the content box
+/// gets the temperature clipped. That measurement sets each tier:
+///
+/// | Tier | Panel | Hero | Worst-case hero vs. content |
+/// | --- | --- | --- | --- |
+/// | compact | 128x64 OLED | 9x18B | 108px vs. 120px |
+/// | middle | 320x240 TFT | fub30 | 264px vs. 300px |
+/// | large | 400x240 Sharp | fub35 | 320px vs. 380px |
+///
+/// So `fub35` is *not* usable on the 320-wide TFT even though it has the same
+/// height as the Sharp — it needs 320px for a hero the panel has 300px for.
+/// Where a bigger hero won't fit, the compact tier buys legibility in height
+/// instead (9x18B over 9x15B, same width). Vertical room is the softer
+/// constraint: [`fit_line_count`] drops detail rows that don't fit.
 fn theme_for(size: Size) -> Theme {
     if size.width < 200 || size.height < 120 {
         Theme {
@@ -67,6 +74,13 @@ fn theme_for(size: Size) -> Theme {
             title: FontRenderer::new::<fonts::u8g2_font_t0_11b_tf>()
                 .with_ignore_unknown_chars(true),
             body: FontRenderer::new::<fonts::u8g2_font_5x8_tf>().with_ignore_unknown_chars(true),
+        }
+    } else if size.width < 360 {
+        Theme {
+            hero: FontRenderer::new::<fonts::u8g2_font_fub30_tf>().with_ignore_unknown_chars(true),
+            title: FontRenderer::new::<fonts::u8g2_font_fub20_tf>().with_ignore_unknown_chars(true),
+            body: FontRenderer::new::<fonts::u8g2_font_helvB14_tf>()
+                .with_ignore_unknown_chars(true),
         }
     } else {
         Theme {

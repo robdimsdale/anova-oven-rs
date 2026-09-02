@@ -27,6 +27,16 @@ pub type ActiveScreen = crate::sharp_ui::SharpScreen;
 ))]
 pub type ActiveScreen = crate::oled_ui::OledScreen;
 
+#[cfg(all(
+    feature = "ui-tft-basic",
+    not(any(
+        feature = "ui-lcd",
+        feature = "ui-sharp-basic",
+        feature = "ui-oled-basic"
+    ))
+))]
+pub type ActiveScreen = crate::tft_ui::TftScreen;
+
 // Headless: no panel wired, `display_task` drives a no-op backend.
 #[cfg(not(any(feature = "ui-lcd", feature = "_graphics")))]
 pub type ActiveScreen = crate::display::NullScreen;
@@ -36,10 +46,11 @@ pub type ActiveScreen = crate::display::NullScreen;
 const _: () = {
     let selected = cfg!(feature = "ui-lcd") as usize
         + cfg!(feature = "ui-sharp-basic") as usize
-        + cfg!(feature = "ui-oled-basic") as usize;
+        + cfg!(feature = "ui-oled-basic") as usize
+        + cfg!(feature = "ui-tft-basic") as usize;
     assert!(
         selected <= 1,
-        "enable at most one ui-* display feature (e.g. ui-lcd, ui-sharp-basic or ui-oled-basic); none = headless"
+        "enable at most one ui-* display feature (ui-lcd, ui-sharp-basic, ui-oled-basic or ui-tft-basic); none = headless"
     );
 };
 
