@@ -26,6 +26,10 @@ mod sharp;
 #[cfg(feature = "ui-sharp-basic")]
 mod sharp_ui;
 mod state;
+#[cfg(feature = "ui-tft-basic")]
+mod tft;
+#[cfg(feature = "ui-tft-basic")]
+mod tft_ui;
 
 use embedded_alloc::LlffHeap as Heap;
 
@@ -212,6 +216,27 @@ async fn main(spawner: Spawner) {
         spi_cfg.polarity = embassy_rp::spi::Polarity::IdleLow;
         let spi = embassy_rp::spi::Spi::new_blocking_txonly(p.SPI0, p.PIN_18, p.PIN_19, spi_cfg);
         oled_ui::OledScreen::new(
+            spi,
+            Output::new(p.PIN_16, Level::Low),  // D/C
+            Output::new(p.PIN_17, Level::High), // CS, idle deselected
+            Output::new(p.PIN_20, Level::High), // RESET, idle released
+        )
+    };
+
+    #[cfg(feature = "ui-tft-basic")]
+    let mut screen: ActiveScreen = {
+        // 2.0" 320x240 colour IPS TFT on SPI0: SCK=GP18, MOSI=GP19,
+        // active-low CS=GP17, D/C=GP16, RESET=GP20 — the same five pins the
+        // OLED uses. Mode 0 at 32 MHz: the ST7789 will take ~62 MHz, but 32
+        // keeps margin on jumper wires and still puts a worst-case full
+        // repaint (~150 KB) at ~38 ms. Blocking for the same reason as the
+        // other panels: cyw43 owns the DMA_IRQ_0 binding an async SPI needs.
+        let mut spi_cfg = embassy_rp::spi::Config::default();
+        spi_cfg.frequency = 32_000_000;
+        spi_cfg.phase = embassy_rp::spi::Phase::CaptureOnFirstTransition;
+        spi_cfg.polarity = embassy_rp::spi::Polarity::IdleLow;
+        let spi = embassy_rp::spi::Spi::new_blocking_txonly(p.SPI0, p.PIN_18, p.PIN_19, spi_cfg);
+        tft_ui::TftScreen::new(
             spi,
             Output::new(p.PIN_16, Level::Low),  // D/C
             Output::new(p.PIN_17, Level::High), // CS, idle deselected

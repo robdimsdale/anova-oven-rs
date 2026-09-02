@@ -30,7 +30,8 @@ echo "Checking anova-oven-pico (thumbv6m-none-eabi)"
   # One build per display backend, plus the OLED's SSD1309 controller variant
   # (same backend, different init table — see crates/anova-oven-pico/src/oled.rs).
   for feat in "" "--features ui-lcd" "--features ui-sharp-basic" \
-              "--features ui-oled-basic" "--features ui-oled-basic,oled-ssd1309"; do
+              "--features ui-oled-basic" "--features ui-oled-basic,oled-ssd1309" \
+              "--features ui-tft-basic"; do
     cargo clippy --release --no-default-features $feat -- -D warnings
     cargo build --release --no-default-features $feat
   done

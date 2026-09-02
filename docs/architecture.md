@@ -400,14 +400,17 @@ plain HTTP. Logs via defmt-rtt.
 The firmware is a full appliance UI, not the "poll once and log" prototype
 the early Phase-2 plan described:
 
-- One of three display backends, selected at build time by a `ui-*`
+- One of four display backends, selected at build time by a `ui-*`
   Cargo feature (or none, for a headless build): a 16×2 HD44780
-  character LCD, a 2.7" 400×240 Sharp Memory Display, or a 2.42"
-  128×64 SSD1305/SSD1309 OLED — all showing status / cook progress /
-  next-stage prompts / recovery messages. The two graphical panels
-  share their layout code; the decisions behind it live in
-  `anova-oven-pico-core::view_plan` and are host-tested. Wiring and
-  per-panel notes: [`docs/pico-displays.md`](pico-displays.md).
+  character LCD, a 2.7" 400×240 Sharp Memory Display, a 2.42" 128×64
+  SSD1305/SSD1309 OLED, or a 2.0" 320×240 ST7789 colour IPS TFT — all
+  showing status / cook progress / next-stage prompts / recovery
+  messages. The three graphical panels share their layout code, all
+  three driving a 1-bit `DrawTarget` (the TFT expands to RGB565 at
+  flush time, since a full colour framebuffer would not fit in SRAM);
+  the layout decisions live in `anova-oven-pico-core::view_plan` and
+  are host-tested. Wiring and per-panel notes:
+  [`docs/pico-displays.md`](pico-displays.md).
 - Rotary encoder + push button (input via `embassy-rp` GPIO).
 - LED backlight on PWM with policies for full / dimmed states.
 - FSM (in `state.rs`) selecting which view to display and when to issue
