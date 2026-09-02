@@ -27,18 +27,18 @@ pub trait DisplayBackend {
 /// calls valid with no physical panel wired. Only compiled in the headless
 /// config (see `screen::ActiveScreen`), so the panel builds don't see it as
 /// dead code.
-#[cfg(not(any(feature = "ui-lcd", feature = "ui-sharp-basic")))]
+#[cfg(not(any(feature = "ui-lcd", feature = "_graphics")))]
 #[derive(Default)]
 pub struct NullScreen;
 
-#[cfg(not(any(feature = "ui-lcd", feature = "ui-sharp-basic")))]
+#[cfg(not(any(feature = "ui-lcd", feature = "_graphics")))]
 impl NullScreen {
     pub fn new() -> Self {
         Self
     }
 }
 
-#[cfg(not(any(feature = "ui-lcd", feature = "ui-sharp-basic")))]
+#[cfg(not(any(feature = "ui-lcd", feature = "_graphics")))]
 impl DisplayBackend for NullScreen {
     async fn configure(&mut self) {}
     async fn render(&mut self, _view: &ViewSpec) {}
