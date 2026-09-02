@@ -52,7 +52,8 @@ Target capabilities:
   │  plain HTTP     │         │                     │
   │  (embassy-net,  │         │                     │
   │  no TLS).       │         │                     │
-  │  LCD + encoder  │         │                     │
+  │  Display +      │         │                     │
+  │  encoder        │         │                     │
   │  + button +     │         │                     │
   │  /health        │         │                     │
   │  (picoserve).   │         │                     │
@@ -399,8 +400,14 @@ plain HTTP. Logs via defmt-rtt.
 The firmware is a full appliance UI, not the "poll once and log" prototype
 the early Phase-2 plan described:
 
-- 16×2 HD44780 LCD (4-bit bus, async driver) showing status / cook
-  progress / next-stage prompts / recovery messages.
+- One of three display backends, selected at build time by a `ui-*`
+  Cargo feature (or none, for a headless build): a 16×2 HD44780
+  character LCD, a 2.7" 400×240 Sharp Memory Display, or a 2.42"
+  128×64 SSD1305/SSD1309 OLED — all showing status / cook progress /
+  next-stage prompts / recovery messages. The two graphical panels
+  share their layout code; the decisions behind it live in
+  `anova-oven-pico-core::view_plan` and are host-tested. Wiring and
+  per-panel notes: [`docs/pico-displays.md`](pico-displays.md).
 - Rotary encoder + push button (input via `embassy-rp` GPIO).
 - LED backlight on PWM with policies for full / dimmed states.
 - FSM (in `state.rs`) selecting which view to display and when to issue
@@ -581,6 +588,7 @@ error-handling policy).
 
 - WebSocket protocol: [`docs/oven-websocket-api.md`](oven-websocket-api.md)
 - Cloud API (Firestore): [`docs/oven-cloud-api.md`](oven-cloud-api.md)
+- Pico display backends + wiring: [`docs/pico-displays.md`](pico-displays.md)
 - Pico crate drift map: [`docs/pico-crate-drift.md`](pico-crate-drift.md)
 - Pico OTA brief: [`docs/pico-ota.md`](pico-ota.md)
 - Pico transport security brief: [`docs/pico-transport-security.md`](pico-transport-security.md)

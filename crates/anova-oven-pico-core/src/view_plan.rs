@@ -5,8 +5,9 @@
 //! The firmware's `graphics_view` maps [`FontRole`]s to concrete fonts, supplies
 //! a text-measurement closure (so wrapping uses real glyph widths), and draws
 //! the plan. Keeping the *decisions* here (what text to show, when to show a
-//! target temperature, how to wrap a long recipe title) means they can be unit
-//! tested on the host, unlike the firmware bin which only builds for the MCU.
+//! target temperature, how to wrap a long recipe title, what to drop when the
+//! panel is too short — see [`fit_line_count`]) means they can be unit tested on
+//! the host, unlike the firmware bin which only builds for the MCU.
 
 use alloc::{format, string::String, vec::Vec};
 
@@ -48,6 +49,55 @@ pub struct PlanLine {
 pub struct ScreenPlan {
     pub placement: Placement,
     pub lines: Vec<PlanLine>,
+}
+
+/// Vertical metrics of one font, supplied by the renderer to
+/// [`fit_line_count`] the way `measure` supplies horizontal ones to
+/// [`plan_view`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LineMetrics {
+    /// Baseline-to-baseline advance: how far the pen drops between lines.
+    pub line_height: i32,
+    /// Tallest ink a line can actually put on the panel, ascender to
+    /// descender. At most `line_height`, which also counts the empty leading
+    /// below the descender.
+    pub ink_height: i32,
+}
+
+/// How many leading lines of `lines` fit in `avail` vertical pixels.
+///
+/// A [`ScreenPlan`] is sized for its *content*, not for any particular panel,
+/// so a plan that fits a 400x240 Sharp Memory Display can overflow a 128x64
+/// OLED: a cooking status carrying timer, probe, steam and phase rows needs one
+/// more row than the OLED has. Rendering it anyway would clip the last row
+/// through the middle of its glyphs.
+///
+/// Trimming from the end degrades gracefully because [`plan_view`] orders a
+/// [`Placement::TopStacked`] plan by importance — title, hero temperature, then
+/// detail rows in descending relevance — so what drops off is what mattered
+/// least.
+///
+/// Only the *last* kept line is measured by `ink_height`; the ones above it
+/// have to leave room for the next line's baseline and so are measured by
+/// `line_height`. The trailing line's leading is empty and may hang off the
+/// bottom edge without losing a pixel of text. At least one line is always
+/// kept, so a plan taller than the panel still renders its headline rather than
+/// nothing at all.
+pub fn fit_line_count<M>(lines: &[PlanLine], avail: i32, metrics: M) -> usize
+where
+    M: Fn(FontRole) -> LineMetrics,
+{
+    let mut used = 0;
+    let mut kept = 0;
+    for line in lines {
+        let m = metrics(line.role);
+        if kept > 0 && used + m.ink_height > avail {
+            break;
+        }
+        used += m.line_height;
+        kept += 1;
+    }
+    kept
 }
 
 fn planline(role: FontRole, text: String) -> PlanLine {
@@ -493,6 +543,71 @@ mod tests {
         // chars); capped at 2, the last line is ellipsised to fit.
         let lines = wrap_lines(FontRole::Title, "aa bb cc dd ee", 50, 2, &measure);
         assert_eq!(lines, ["aa bb", "cc d…"]);
+    }
+
+    /// Fake metrics: Hero 20/16, Title 12/10, Body 10/8 (line/ink), so a
+    /// trailing line's 2px of leading is allowed to overhang.
+    fn metrics(role: FontRole) -> LineMetrics {
+        match role {
+            FontRole::Hero => LineMetrics {
+                line_height: 20,
+                ink_height: 16,
+            },
+            FontRole::Title => LineMetrics {
+                line_height: 12,
+                ink_height: 10,
+            },
+            FontRole::Body => LineMetrics {
+                line_height: 10,
+                ink_height: 8,
+            },
+        }
+    }
+
+    #[test]
+    fn fit_keeps_everything_that_fits() {
+        let lines = [
+            pl(FontRole::Title, "Manual cook"),
+            pl(FontRole::Hero, "212F"),
+            pl(FontRole::Body, "Timer  05:00"),
+        ];
+        // 12 + 20 + 8(ink) = 40.
+        assert_eq!(fit_line_count(&lines, 40, metrics), 3);
+    }
+
+    #[test]
+    fn fit_drops_trailing_lines_that_overflow() {
+        let lines = [
+            pl(FontRole::Title, "Manual cook"),
+            pl(FontRole::Hero, "212F"),
+            pl(FontRole::Body, "Timer  05:00"),
+            pl(FontRole::Body, "Probe  130F"),
+        ];
+        // A fourth row would need 12 + 20 + 10 + 8 = 50.
+        assert_eq!(fit_line_count(&lines, 49, metrics), 3);
+        assert_eq!(fit_line_count(&lines, 50, metrics), 4);
+    }
+
+    #[test]
+    fn fit_measures_the_last_line_by_ink_not_line_height() {
+        let lines = [pl(FontRole::Title, "Recovery"), pl(FontRole::Body, "x")];
+        // Two full line boxes are 22px, but the body line's ink is only 8, so
+        // it still fits in 20 with its leading hanging off the bottom.
+        assert_eq!(fit_line_count(&lines, 20, metrics), 2);
+        assert_eq!(fit_line_count(&lines, 19, metrics), 1);
+    }
+
+    #[test]
+    fn fit_always_keeps_the_headline() {
+        let lines = [pl(FontRole::Hero, "212F"), pl(FontRole::Body, "Steam  60%")];
+        // Nothing fits in a zero-height panel; the first line is kept anyway so
+        // the render isn't blank.
+        assert_eq!(fit_line_count(&lines, 0, metrics), 1);
+    }
+
+    #[test]
+    fn fit_of_nothing_is_nothing() {
+        assert_eq!(fit_line_count(&[], 100, metrics), 0);
     }
 
     #[test]

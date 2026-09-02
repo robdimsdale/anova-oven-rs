@@ -27,7 +27,10 @@ echo "Checking anova-oven-pico (thumbv6m-none-eabi)"
   export ANOVA_WIFI_SSID=ci-dummy-ssid \
          ANOVA_WIFI_PASSWORD=ci-dummy-password \
          ANOVA_SERVER_URL=http://192.0.2.1:8080
-  for feat in "" "--features ui-lcd" "--features ui-sharp-basic"; do
+  # One build per display backend, plus the OLED's SSD1309 controller variant
+  # (same backend, different init table — see crates/anova-oven-pico/src/oled.rs).
+  for feat in "" "--features ui-lcd" "--features ui-sharp-basic" \
+              "--features ui-oled-basic" "--features ui-oled-basic,oled-ssd1309"; do
     cargo clippy --release --no-default-features $feat -- -D warnings
     cargo build --release --no-default-features $feat
   done

@@ -14,9 +14,13 @@ mod input;
 mod lcd;
 mod persist;
 mod screen;
-// Shared graphical layout (Layer C), reused by any DrawTarget-based backend.
-#[cfg(feature = "ui-sharp-basic")]
+// Shared graphical layout (Layer C), reused by every DrawTarget-based backend.
+#[cfg(feature = "_graphics")]
 mod graphics_view;
+#[cfg(feature = "ui-oled-basic")]
+mod oled;
+#[cfg(feature = "ui-oled-basic")]
+mod oled_ui;
 #[cfg(feature = "ui-sharp-basic")]
 mod sharp;
 #[cfg(feature = "ui-sharp-basic")]
@@ -154,8 +158,10 @@ async fn main(spawner: Spawner) {
     // Display backend — selected by the `ui-*` feature (see screen.rs). At most
     // one arm compiles; each produces an `ActiveScreen: DisplayBackend`
     // (`configure()` / `render(&ViewSpec)`), and with no feature the headless
-    // arm builds a no-op `NullScreen`. Note the HD44780 (GP16-21) and the Sharp
-    // SPI0 pins (GP17/18/19) overlap, which is why this is a compile-time swap.
+    // arm builds a no-op `NullScreen`. All three panels claim pins from the
+    // GP16-GP21 block — the HD44780 uses all six, and the Sharp and the OLED
+    // share SPI0 (SCK=GP18, MOSI=GP19) — which is why this is a compile-time
+    // swap. Wiring for each is in docs/pico-displays.md.
     #[cfg(feature = "ui-lcd")]
     let mut screen: ActiveScreen = {
         let mut lcd_delay = Delay;
@@ -193,8 +199,28 @@ async fn main(spawner: Spawner) {
         sharp_ui::SharpScreen::new(spi, cs)
     };
 
+    #[cfg(feature = "ui-oled-basic")]
+    let mut screen: ActiveScreen = {
+        // 2.42" 128x64 OLED on SPI0: SCK=GP18, MOSI=GP19, active-low CS=GP17,
+        // D/C=GP16, RESET=GP20. Mode 0 at 4 MHz — the SSD1305's serial
+        // interface tops out around there, and a full 1 KB frame still costs
+        // only ~2 ms. Blocking for the same reason as the Sharp: cyw43 owns the
+        // DMA_IRQ_0 binding an async SPI would need.
+        let mut spi_cfg = embassy_rp::spi::Config::default();
+        spi_cfg.frequency = 4_000_000;
+        spi_cfg.phase = embassy_rp::spi::Phase::CaptureOnFirstTransition;
+        spi_cfg.polarity = embassy_rp::spi::Polarity::IdleLow;
+        let spi = embassy_rp::spi::Spi::new_blocking_txonly(p.SPI0, p.PIN_18, p.PIN_19, spi_cfg);
+        oled_ui::OledScreen::new(
+            spi,
+            Output::new(p.PIN_16, Level::Low),  // D/C
+            Output::new(p.PIN_17, Level::High), // CS, idle deselected
+            Output::new(p.PIN_20, Level::High), // RESET, idle released
+        )
+    };
+
     // Headless: no panel wired, display task drives a no-op backend.
-    #[cfg(not(any(feature = "ui-lcd", feature = "ui-sharp-basic")))]
+    #[cfg(not(any(feature = "ui-lcd", feature = "_graphics")))]
     let mut screen: ActiveScreen = crate::display::NullScreen::new();
 
     screen.configure().await;

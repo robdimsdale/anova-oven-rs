@@ -19,21 +19,40 @@
   default = []
 
   # --- Display backend selection (at most one; none = headless) ---------
-  # The Sharp Memory Display and the HD44780 character LCD can't coexist:
-  # the LCD uses GP16-GP21, which overlaps the Sharp's SPI0 pins
-  # (CS=GP17, SCK=GP18, MOSI=GP19). Choosing a UI therefore swaps both the
-  # peripheral init in main.rs and the render code behind the display task,
-  # so it has to be a cfg feature (a src/bin variant can't touch the shared
-  # main.rs). `screen.rs` picks `ActiveScreen` from whichever is enabled (or
-  # NullScreen when none is) and const-asserts that at most one is. Build:
+  # The panels can't coexist: they all live in the GP16-GP21 block (the
+  # HD44780 uses all six; the Sharp and the OLED share SPI0 on
+  # SCK=GP18/MOSI=GP19). Choosing a UI therefore swaps both the peripheral
+  # init in main.rs and the render code behind the display task, so it has to
+  # be a cfg feature (a src/bin variant can't touch the shared main.rs).
+  # `screen.rs` picks `ActiveScreen` from whichever is enabled (or NullScreen
+  # when none is) and const-asserts that at most one is. Build:
   #   cargo run --release                              # headless
   #   cargo run --release --features ui-lcd            # character LCD
   #   cargo run --release --features ui-sharp-basic    # Sharp Memory Display
+  #   cargo run --release --features ui-oled-basic     # 2.42" 128x64 OLED
+  # See docs/pico-displays.md for wiring and per-panel notes.
   ui-lcd = []
   # First graphical layout for the Adafruit 2.7" Sharp Memory Display
   # (LS027B7DH01, 400x240). Add future layouts as sibling `ui-sharp-*`
   # features (see screen.rs / sharp_ui.rs).
-  ui-sharp-basic = ["dep:embedded-graphics", "dep:u8g2-fonts"]
+  ui-sharp-basic = ["_graphics"]
+  # First graphical layout for the Adafruit 2.42" 128x64 OLED module
+  # (product 2719, SSD1305/SSD1309). Shares all of the Sharp's layout code —
+  # only the driver differs (see screen.rs / oled_ui.rs / oled.rs).
+  ui-oled-basic = ["_graphics"]
+  # Adafruit revised product 2719 from an SSD1305 to an SSD1309 in September
+  # 2023, keeping the pinout and protocol but changing what the controller
+  # accepts at init. The board can't be identified over a write-only bus, so
+  # the choice is a build flag: add this feature for a board bought since
+  # then. Only meaningful alongside `ui-oled-basic`.
+  oled-ssd1309 = []
+
+  # Internal (not for direct use): the shared 1-bit graphical stack — the
+  # embedded-graphics/u8g2 deps and the `graphics_view` layer that every
+  # pixel-addressed panel renders through. Enabled by each `ui-*` feature that
+  # needs it, so `cfg(feature = "_graphics")` means "some graphical panel is
+  # selected" without enumerating them.
+  _graphics = ["dep:embedded-graphics", "dep:u8g2-fonts"]
 
   # Enables defmt on chatty third-party deps and per-event INFO logs in our
   # own code. Off by default so the RTT buffer stays drainable when no probe
@@ -52,14 +71,13 @@
     "async",
   ] }
   embedded-hal = "1"
-  # Sharp Memory Display backend only (pulled in by `ui-sharp-*` features).
-  # embedded-graphics is a pure no_std graphics lib. The panel uses the
-  # blocking `embedded-hal` SpiBus (already a dep) — see sharp.rs for why not
-  # async/DMA.
+  # Graphical backends only (pulled in by `_graphics`). embedded-graphics is a
+  # pure no_std graphics lib. Both panels use the blocking `embedded-hal`
+  # SpiBus (already a dep) — see sharp.rs for why not async/DMA.
   embedded-graphics = { version = "0.8", optional = true }
-  # Large bitmap fonts (u8g2 collection) for distance-readable text on the
-  # Sharp panel. Renders straight to an embedded-graphics DrawTarget via its
-  # FontRenderer; pulled in only by the `ui-sharp-*` features.
+  # Bitmap fonts (u8g2 collection) for distance-readable text. Renders straight
+  # to an embedded-graphics DrawTarget via its FontRenderer; pulled in only by
+  # the `_graphics` feature.
   u8g2-fonts = { version = "0.8", optional = true, default-features = false }
 
   anova-oven-api = { path = "../anova-oven-api", default-features = false }
