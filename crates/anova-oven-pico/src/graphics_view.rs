@@ -1,13 +1,14 @@
 //! Layer C renderer: draws a [`ScreenPlan`] onto any 1-bit [`DrawTarget`] using
 //! the large u8g2 bitmap fonts, so the readout is legible from across the room.
 //!
-//! Shared by every *graphical* backend (the Sharp Memory Display today, a
-//! same-color-model OLED tomorrow). This module owns only *rendering*: choosing
+//! Shared by every *graphical* backend: the 400x240 Sharp Memory Display and
+//! the 128x64 SSD1305/SSD1309 OLED. This module owns only *rendering*: choosing
 //! fonts by a panel-size tier, measuring text (fed back to the planner so wrap
-//! decisions use real glyph widths), and placing the plan's lines. The layout
-//! *decisions* — which text to show, how to wrap a recipe title, the idle
-//! current-only readout, centred vs. top-stacked — live in
-//! [`anova_oven_pico_core::view_plan`] so they can be unit-tested on the host.
+//! decisions use real glyph widths), dropping lines that don't fit the panel,
+//! and placing the rest. The layout *decisions* — which text to show, how to
+//! wrap a recipe title, the idle current-only readout, centred vs. top-stacked
+//! — live in [`anova_oven_pico_core::view_plan`] so they can be unit-tested on
+//! the host.
 
 use embedded_graphics::{pixelcolor::BinaryColor, prelude::*};
 
@@ -18,10 +19,13 @@ use u8g2_fonts::{
 };
 
 use anova_oven_pico_core::fsm::ViewSpec;
-use anova_oven_pico_core::view_plan::{plan_view, FontRole, Placement, PlanLine};
+use anova_oven_pico_core::view_plan::{
+    fit_line_count, plan_view, FontRole, LineMetrics, Placement, PlanLine,
+};
 
-/// White background (`BinaryColor::Off`), black ink (`BinaryColor::On`) — see
-/// the color mapping in `sharp.rs`.
+/// Background is `BinaryColor::Off`, ink is `BinaryColor::On`. Each driver maps
+/// that pair onto its panel's own polarity: black-on-white for the reflective
+/// Sharp (`sharp.rs`), lit-on-dark for the emissive OLED (`oled.rs`).
 const INK: BinaryColor = BinaryColor::On;
 const PAPER: BinaryColor = BinaryColor::Off;
 
@@ -44,17 +48,25 @@ impl Theme {
 }
 
 /// Pick a font tier from the panel size. The large tier targets the ~400x240
-/// Sharp panel (bold FreeUniversal for distance reading); the compact tier
-/// keeps a small panel legible. Bump the large-tier fonts (e.g. `fub42`) here to
+/// Sharp panel (bold FreeUniversal for distance reading); the compact tier is
+/// sized for the 128x64 OLED. Bump the large-tier fonts (e.g. `fub42`) here to
 /// trade characters-per-line for size. `_tf` variants carry the full glyph set
 /// (so '…' renders); `ignore_unknown_chars` keeps a rare missing glyph from
 /// aborting a draw.
+///
+/// The compact tier is chosen by width: the widest hero string the planner can
+/// emit is `"888F -> 888F"`, which at 9x18B is 108px and so just fits the
+/// 128px panel's 120px content width. A wider hero font would be clipped, so
+/// the extra legibility is bought in *height* (9x18B over 9x15B) instead. The
+/// title and body are correspondingly short (12px and 9px lines) to leave room
+/// for the detail rows — see [`fit_lines`] for what happens when they overflow.
 fn theme_for(size: Size) -> Theme {
     if size.width < 200 || size.height < 120 {
         Theme {
-            hero: FontRenderer::new::<fonts::u8g2_font_9x15B_tf>().with_ignore_unknown_chars(true),
-            title: FontRenderer::new::<fonts::u8g2_font_7x13B_tf>().with_ignore_unknown_chars(true),
-            body: FontRenderer::new::<fonts::u8g2_font_6x10_tf>().with_ignore_unknown_chars(true),
+            hero: FontRenderer::new::<fonts::u8g2_font_9x18B_tf>().with_ignore_unknown_chars(true),
+            title: FontRenderer::new::<fonts::u8g2_font_t0_11b_tf>()
+                .with_ignore_unknown_chars(true),
+            body: FontRenderer::new::<fonts::u8g2_font_5x8_tf>().with_ignore_unknown_chars(true),
         }
     } else {
         Theme {
@@ -71,11 +83,23 @@ fn margin_x(size: Size) -> i32 {
 }
 
 fn margin_top(size: Size) -> i32 {
-    core::cmp::max(4, (size.height / 24) as i32)
+    core::cmp::max(2, (size.height / 24) as i32)
 }
 
+/// Baseline-to-baseline advance: how far the pen drops between lines.
 fn line_height(font: &FontRenderer) -> i32 {
     font.get_default_line_height() as i32
+}
+
+/// The vertical counterpart of [`text_width`]: real font metrics handed to the
+/// planner so it can decide what fits (see [`fit_line_count`]).
+fn line_metrics(font: &FontRenderer) -> LineMetrics {
+    LineMetrics {
+        line_height: line_height(font),
+        // Ascender to descender: the tallest ink a line can put down, which is
+        // less than the line box because that also counts the empty leading.
+        ink_height: (font.get_ascent() as i32 - font.get_descent() as i32).max(0),
+    }
 }
 
 /// Pen-advance width of `s` in `font`; supplied to the planner for word-wrap.
@@ -98,9 +122,20 @@ where
 
     let plan = plan_view(view, content_w, |role, s| text_width(theme.font(role), s));
 
+    // A plan is sized for its content, not for this panel, so drop the trailing
+    // lines that don't fit rather than clipping the last one through the middle
+    // of its glyphs. `Centered` measures against the whole panel; `TopStacked`
+    // starts at the top margin and so has that much less to work with.
+    let avail = match plan.placement {
+        Placement::Centered => size.height as i32,
+        Placement::TopStacked => size.height as i32 - margin_top(size),
+    };
+    let kept = fit_line_count(&plan.lines, avail, |role| line_metrics(theme.font(role)));
+    let lines = &plan.lines[..kept];
+
     match plan.placement {
-        Placement::Centered => draw_centered(t, size, &theme, &plan.lines),
-        Placement::TopStacked => draw_top(t, size, mx, &theme, &plan.lines),
+        Placement::Centered => draw_centered(t, size, &theme, lines),
+        Placement::TopStacked => draw_top(t, size, mx, &theme, lines),
     }
 }
 
