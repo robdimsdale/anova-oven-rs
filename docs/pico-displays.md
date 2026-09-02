@@ -1,6 +1,6 @@
 # Pico display backends
 
-The firmware supports three panels plus a headless build. Exactly one is
+The firmware supports four panels plus a headless build. Exactly one is
 compiled in, chosen by a Cargo feature, because they all claim pins from the
 same GP16–GP21 block and each needs different peripheral init in `main.rs`.
 
@@ -10,13 +10,14 @@ same GP16–GP21 block and each needs different peripheral init in `main.rs`.
 | `--features ui-lcd` | 16×2 HD44780 character LCD | 4-bit parallel |
 | `--features ui-sharp-basic` | Adafruit 2.7" Sharp Memory Display (LS027B7DH01, 400×240) | SPI0 |
 | `--features ui-oled-basic` | Adafruit 2.42" OLED (product 2719, 128×64) | SPI0 |
+| `--features ui-tft-basic` | Adafruit 2.0" colour IPS TFT (product 4311, 320×240) | SPI0 |
 
 `screen.rs` resolves the feature to `ActiveScreen` and const-asserts that at
 most one is enabled; enabling two fails the build with that message.
 
 ## Code layers
 
-The two graphical panels share everything above the wire:
+The three graphical panels share everything above the wire:
 
 ```
 ViewSpec                        (fsm.rs — what the FSM wants shown)
@@ -25,14 +26,35 @@ ViewSpec                        (fsm.rs — what the FSM wants shown)
       └── graphics_view         (fonts per panel-size tier, wrap measurement,
           │                      drop lines that don't fit, draw)
           ├── sharp.rs   → Sharp   (DrawTarget, dirty-line flush, VCOM upkeep)
-          └── oled.rs    → Oled    (DrawTarget, dirty-page flush)
+          ├── oled.rs    → Oled    (DrawTarget, dirty-page flush)
+          └── tft.rs     → Tft     (DrawTarget, dirty-row flush, 1-bit → RGB565)
 ```
 
-Adding a fourth panel means a driver implementing `DrawTarget<Color =
+Adding another panel means a driver implementing `DrawTarget<Color =
 BinaryColor>`, a thin `*_ui.rs` backend implementing `DisplayBackend`, a
 `ui-*` feature that pulls in `_graphics`, and one arm in `screen.rs`. The
-layout code should not need to change: `graphics_view` picks its font tier
-from the panel's reported size, and trims trailing lines that don't fit.
+layout code should not need to change beyond possibly a font tier:
+`graphics_view` picks its tier from the panel's reported size, and trims
+trailing lines that don't fit.
+
+Every graphical driver here is a **1-bit** `DrawTarget`, including the colour
+TFT. That is not an oversight — see the TFT section below for why, and for what
+colour the panel does get.
+
+### Font tiers
+
+Tiers are bounded by **width**, because the hero temperature is the one line
+the planner never wraps, and a hero font too wide for the content box gets the
+temperature clipped:
+
+| Tier | Panel | Hero font | Worst-case hero (`888F -> 888F`) vs. content width |
+| --- | --- | --- | --- |
+| compact | 128×64 OLED | 9x18B | 108 px vs. 120 px |
+| middle | 320×240 TFT | fub30 | 264 px vs. 300 px |
+| large | 400×240 Sharp | fub35 | 320 px vs. 380 px |
+
+Note that the TFT and the Sharp are the same height but not the same tier:
+`fub35` needs 320 px for a hero the 320-wide panel has only 300 px for.
 
 ## 2.42" OLED (Adafruit 2719)
 
@@ -105,7 +127,7 @@ Notes:
 120 px content width), a 12 px title, and 9 px detail rows. That budget fits a
 title, the hero temperature and three detail rows. A cooking status with
 timer, probe, steam *and* phase rows needs one more, so the phase row is
-dropped — `fit_lines` trims from the end, and the planner orders a top-stacked
+dropped — `fit_line_count` trims from the end, and the planner orders a top-stacked
 plan by importance, so what goes is what mattered least.
 
 ### Known gap: burn-in
@@ -119,6 +141,73 @@ the controller's contrast command (`0x81`) or by parking the panel with
 display-off (`0xAE`), which stops the ageing entirely and preserves GDDRAM.
 That needs a second signal alongside `DisplayNotifier`, which is why it is not
 in the initial backend.
+
+## 2.0" colour IPS TFT (Adafruit 4311)
+
+ST7789 controller, 320×240, 4-wire SPI at 32 MHz. The breakout has an onboard
+regulator and 3/5V level shifter, so the Pico drives it directly at 3.3V.
+
+### Why a 1-bit framebuffer on a colour panel
+
+A full RGB565 framebuffer is 320 × 240 × 2 = **150 KB**, and the dirty-diffing
+every other backend uses needs a shadow copy too — 300 KB against the RP2040's
+264 KB of total SRAM. It does not fit, and nothing clever makes it fit.
+
+So `tft.rs` keeps the same 1-bit framebuffer the other panels use (9,600 bytes
+plus a 9,600-byte shadow — *less* than `sharp.rs` spends) and expands it to
+RGB565 one scanline at a time as it flushes. The whole shared layout stack,
+the `DrawTarget<Color = BinaryColor>` contract and the dirty-region diffing
+carry over untouched. Measured `.bss` bears this out: the TFT build uses
+179 KB against the Sharp build's 194 KB.
+
+The trade is one ink colour and one background colour per *frame* rather than
+per pixel. Because the palette is applied at flush time, `tft_ui.rs` still uses
+it for the thing colour is actually good at on a status readout — saying
+"something needs attention" before you have read a word:
+
+| Views | Ink |
+| --- | --- |
+| Status, recipe browser, bring-up screens | white |
+| Next-stage prompt, stop confirmation, server offline, oven disconnected | amber |
+| Recovery (post-crash) | red |
+
+A palette change forces a full repaint, because the framebuffer diff tracks
+bits, not the colours they currently stand for.
+
+### Wiring
+
+| Breakout pin | Pico W | Notes |
+| --- | --- | --- |
+| Vin (3–5V) | 3V3 (pin 36) | onboard regulator + level shifter |
+| GND | GND | |
+| SCK | GP18 (SPI0 SCK) | |
+| MOSI | GP19 (SPI0 TX) | |
+| CS | GP17 | active low |
+| D/C | GP16 | |
+| RST | GP20 | |
+| BL | — | pulled high on the board; leave unconnected |
+| MISO, SDCS | — | microSD only, unused |
+
+Same five signal pins as the OLED, so swapping between those two panels is a
+rebuild and nothing else.
+
+### If the picture comes out wrong
+
+Two knobs, both in `MADCTL_LANDSCAPE` in `src/tft.rs`:
+
+- **Upside down** — use `0x60` (MX instead of MY) to rotate 180°.
+- **Red and blue swapped** — OR in `0x08` to select BGR order.
+
+A photographic negative would mean the `INVON` in the init sequence is wrong
+for your panel; these IPS units normally need it.
+
+### Known gap: the backlight is not dimmed
+
+`BL` is a PWM input and the FSM already computes a `BacklightPolicy`, so this
+panel could honour the dim timeout properly — better than the OLED, which
+would have to fake it with contrast. It needs the same plumbing described
+under the OLED below: a route from the FSM's policy to the display backend.
+Until then, leave `BL` unconnected and the backlight runs at full brightness.
 
 ## 2.7" Sharp Memory Display
 
