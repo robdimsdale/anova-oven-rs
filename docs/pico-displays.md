@@ -185,11 +185,11 @@ bits, not the colours they currently stand for.
 | CS | GP17 | active low |
 | D/C | GP16 | |
 | RST | GP20 | |
-| BL | — | pulled high on the board; leave unconnected |
+| BL | GP21 | PWM slice 2 channel B — physically next to RST (GP20/pin 26 and GP21/pin 27 are adjacent on the header) |
 | MISO, SDCS | — | microSD only, unused |
 
-Same five signal pins as the OLED, so swapping between those two panels is a
-rebuild and nothing else.
+Six signal pins now, one more than the OLED's five (it has no `BL`), so
+swapping between those two panels means rewiring `BL` as well as a rebuild.
 
 ### If the picture comes out wrong
 
@@ -201,13 +201,14 @@ Two knobs, both in `MADCTL_LANDSCAPE` in `src/tft.rs`:
 A photographic negative would mean the `INVON` in the init sequence is wrong
 for your panel; these IPS units normally need it.
 
-### Known gap: the backlight is not dimmed
+### Backlight
 
-`BL` is a PWM input and the FSM already computes a `BacklightPolicy`, so this
-panel could honour the dim timeout properly — better than the OLED, which
-would have to fake it with contrast. It needs the same plumbing described
-under the OLED below: a route from the FSM's policy to the display backend.
-Until then, leave `BL` unconnected and the backlight runs at full brightness.
+`BL` is driven by `backlight::PwmBacklightController` (GP21, PWM slice 2
+channel B) and follows the same `BacklightPolicy` the FSM already computes
+for the character LCD's RGB backlight — full while awake, dimmed to the same
+`DEFAULT_DIM_LEVEL` after the idle timeout. The breakout pulls `BL` high
+on-board, so the PWM duty cycle is un-inverted: 0 sinks the line low through
+that pull-up, 255 drives it fully high.
 
 ## 2.7" Sharp Memory Display
 
@@ -220,4 +221,7 @@ alternate at ≥ 1 Hz or the image degrades.
 
 4-bit parallel bus on GP16–GP21 (RS=GP17, EN=GP16, D4–D7=GP21/GP20/GP19/GP18),
 with the RGB backlight on the PWM pins GP6/GP7/GP8. This is the only backend
-that uses the backlight controller.
+with a 3-channel RGB backlight — the TFT's single-channel `BL` is driven
+separately (see above); the Sharp and OLED panels have no backlight hardware
+at all, so their build gets a no-op `NullBacklightController`. All three are
+selected by `backlight::ActiveBacklight`, mirroring `screen::ActiveScreen`.

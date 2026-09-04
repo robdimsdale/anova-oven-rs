@@ -60,7 +60,12 @@ use hd44780_driver::{
 use static_cell::StaticCell;
 
 use crate::api_client::{ApiClient, CommandChannel, StateWatch};
+#[cfg(feature = "ui-lcd")]
 use crate::backlight::BacklightController;
+#[cfg(not(any(feature = "ui-lcd", feature = "ui-tft-basic")))]
+use crate::backlight::NullBacklightController;
+#[cfg(feature = "ui-tft-basic")]
+use crate::backlight::PwmBacklightController;
 use crate::display::{Display, DisplayBackend, DisplayNotifier, ViewSpec};
 use crate::input::{Input, InputChannel};
 use crate::screen::ActiveScreen;
@@ -315,12 +320,24 @@ async fn main(spawner: Spawner) {
     #[cfg(feature = "verbose-logs")]
     spawner.spawn(heap_monitor_task().unwrap());
 
+    // Backlight hardware — like the screen above, a compile-time choice per
+    // `ui-*` feature (see backlight::ActiveBacklight). The LCD's RGB LED
+    // backlight uses GP6-8; the TFT's single-channel `BL` uses GP21 (PWM
+    // slice 2, adjacent to its RST on GP20); the Sharp and OLED panels have
+    // no backlight hardware to drive.
+    #[cfg(feature = "ui-lcd")]
     let backlight_controller =
         BacklightController::new(p.PWM_SLICE3, p.PIN_6, p.PIN_7, p.PWM_SLICE4, p.PIN_8);
 
+    #[cfg(feature = "ui-tft-basic")]
+    let backlight_controller = PwmBacklightController::new(p.PWM_SLICE2, p.PIN_21);
+
+    #[cfg(not(any(feature = "ui-lcd", feature = "ui-tft-basic")))]
+    let backlight_controller = NullBacklightController::new();
+
     let input = Input::new(
-        GpioInput::new(p.PIN_9, Pull::Up),
         GpioInput::new(p.PIN_10, Pull::Up),
+        GpioInput::new(p.PIN_9, Pull::Up),
         GpioInput::new(p.PIN_11, Pull::Up),
         &INPUT_CHANNEL,
         spawner,

@@ -11,7 +11,7 @@ use anova_oven_pico_core::fsm::{
 pub use anova_oven_pico_core::fsm::{AppState, BacklightPolicy};
 
 use crate::api_client::{ApiClient, StateReceiver};
-use crate::backlight::BacklightController;
+use crate::backlight::ActiveBacklight;
 use crate::display::Display;
 use crate::input::{Input, InputEvent};
 
@@ -24,7 +24,7 @@ pub struct Ctx<'a> {
     pub api: &'a ApiClient<'static>,
     pub api_rx: StateReceiver<'static>,
     pub display: &'a Display<'static>,
-    pub backlight: BacklightController,
+    pub backlight: ActiveBacklight,
 }
 
 impl<'a> Ctx<'a> {
