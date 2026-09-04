@@ -1,10 +1,11 @@
+use anova_oven_pico_core::button::{ButtonVerdict, Debouncer};
 use anova_oven_pico_core::encoder::{EncoderTick, QuadratureDecoder};
 use defmt::{info, warn};
 use embassy_executor::{SpawnError, Spawner};
 use embassy_rp::gpio::Input as GpioInput;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant, Timer};
 
 pub type InputChannel = Channel<CriticalSectionRawMutex, InputEvent, 16>;
 
@@ -42,15 +43,76 @@ pub async fn rot_enc_button_task(
     mut button: GpioInput<'static>,
     channel: &'static InputChannel,
 ) -> ! {
-    loop {
-        button.wait_for_falling_edge().await;
-        #[cfg(feature = "verbose-logs")]
-        info!("Rotary encoder button pressed");
-        if channel.try_send(InputEvent::EncoderButton).is_err() {
-            warn!("Input channel full; dropping encoder button event");
-        }
+    let sample_interval = Duration::from_millis(Debouncer::SAMPLE_INTERVAL_MS);
 
-        Timer::after(Duration::from_millis(500)).await;
+    loop {
+        // Level-triggered, so it returns immediately if the line is already
+        // low: unlike an edge wait, nothing is missed in the window between
+        // one excursion ending and the next arming.
+        button.wait_for_low().await;
+
+        let mut debouncer = Debouncer::new();
+        let excursion_start = Instant::now();
+        let mut last_sample = excursion_start;
+
+        loop {
+            Timer::after(sample_interval).await;
+            // Measure the interval rather than assuming it. The display
+            // task flushes SPI blocking on this same executor, so a sample
+            // could in principle land late and has to carry that weight.
+            // Measured cadence says that isn't happening today — this is
+            // insurance (see `anova_oven_pico_core::button`).
+            let now = Instant::now();
+            let elapsed_ms = now.duration_since(last_sample).as_millis() as u32;
+            last_sample = now;
+
+            match debouncer.sample(button.is_low(), elapsed_ms) {
+                ButtonVerdict::Idle => continue,
+                ButtonVerdict::Pressed => {
+                    #[cfg(feature = "verbose-logs")]
+                    info!("Rotary encoder button pressed");
+                    if channel.try_send(InputEvent::EncoderButton).is_err() {
+                        warn!("Input channel full; dropping encoder button event");
+                    }
+                }
+                ButtonVerdict::Released => {
+                    // Contact time, not the excursion: the integrator has to
+                    // discharge before it reports a release, so the excursion
+                    // runs to roughly twice the time the button was actually
+                    // down.
+                    #[cfg(feature = "verbose-logs")]
+                    info!(
+                        "Rotary encoder button released after {}ms of contact",
+                        debouncer.contact_ms()
+                    );
+                    break;
+                }
+                ButtonVerdict::Glitch => {
+                    // Rotating the shaft couples noise onto the switch line
+                    // (see `anova_oven_pico_core::button`). Rejected without
+                    // an event; re-arm immediately so a real press that only
+                    // chattered its way here is caught on the next pass.
+                    //
+                    // Two diagnostics, because two different things look like
+                    // this. `samples` vs the excursion tells starvation (far
+                    // fewer samples than the elapsed time allows) from real
+                    // chatter; `peak` at roughly half the excursion is the
+                    // signature of a clean press that was simply shorter than
+                    // PRESS_MS, which means the threshold is miscalibrated
+                    // rather than the line being noisy.
+                    #[cfg(feature = "verbose-logs")]
+                    info!(
+                        "Rotary encoder button rejected: {}ms contact, {}ms excursion, {} samples, peak {}ms of {}ms",
+                        debouncer.contact_ms(),
+                        excursion_start.elapsed().as_millis(),
+                        debouncer.samples(),
+                        debouncer.peak_charge_ms(),
+                        Debouncer::PRESS_MS,
+                    );
+                    break;
+                }
+            }
+        }
     }
 }
 

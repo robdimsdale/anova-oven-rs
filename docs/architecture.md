@@ -202,6 +202,8 @@ Modules:
   discriminant table.
 - `scheduler` — `EventQueue` driving the pico's poll cadence.
 - `encoder` — QEM quadrature decode + accumulator.
+- `button` — integrating debouncer for the encoder's push button (rejects the
+  noise the shaft couples onto the switch line while rotating).
 - `api` — server URL normalization helper.
 
 Features: `defmt` (enables `defmt::Format` derives), `serde` (enables
@@ -411,7 +413,9 @@ the early Phase-2 plan described:
   the layout decisions live in `anova-oven-pico-core::view_plan` and
   are host-tested. Wiring and per-panel notes:
   [`docs/pico-displays.md`](pico-displays.md).
-- Rotary encoder + push button (input via `embassy-rp` GPIO).
+- Rotary encoder + push button (input via `embassy-rp` GPIO). The button is
+  sampled and integrated rather than edge-triggered — see §1.6 of
+  [`docs/pico-review.md`](pico-review.md).
 - LED backlight on PWM with policies for full / dimmed states.
 - FSM (in `state.rs`) selecting which view to display and when to issue
   Start/Stop commands.
