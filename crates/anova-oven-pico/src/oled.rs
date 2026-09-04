@@ -77,6 +77,17 @@ impl Variant {
             Variant::Ssd1309 => &INIT_SSD1309,
         }
     }
+
+    /// The contrast byte each init table already sends (0x32 for the
+    /// SSD1305, 0x6F for the SSD1309 — the two vendor tables pick different
+    /// "normal" operating points). [`Oled::set_contrast`] restores this on a
+    /// transition back to full brightness.
+    pub fn normal_contrast(self) -> u8 {
+        match self {
+            Variant::Ssd1305 => 0x32,
+            Variant::Ssd1309 => 0x6F,
+        }
+    }
 }
 
 /// SSD1305 power-on configuration, transcribed from Adafruit's own
@@ -218,6 +229,28 @@ where
 
         self.clear_frame();
         self.flush()?;
+        self.commands(&[CMD_DISPLAY_ON])
+    }
+
+    /// Set the SSD1305/1309's contrast register (segment drive current).
+    /// Lower values slow — but do not stop — the organic material's aging,
+    /// since that scales with cumulative current rather than being a
+    /// threshold effect. See [`display_off`](Oled::display_off) for the only
+    /// setting that actually halts it.
+    pub fn set_contrast(&mut self, value: u8) -> Result<(), SPI::Error> {
+        self.commands(&[CMD_SET_CONTRAST, value])
+    }
+
+    /// Blank the panel (`0xAE`) without touching GDDRAM: this cuts pixel
+    /// current to zero, which is what actually stops aging rather than just
+    /// slowing it. The last frame reappears untouched on
+    /// [`display_on`](Oled::display_on).
+    pub fn display_off(&mut self) -> Result<(), SPI::Error> {
+        self.commands(&[CMD_DISPLAY_OFF])
+    }
+
+    /// Re-enable the panel (`0xAF`) after [`display_off`](Oled::display_off).
+    pub fn display_on(&mut self) -> Result<(), SPI::Error> {
         self.commands(&[CMD_DISPLAY_ON])
     }
 

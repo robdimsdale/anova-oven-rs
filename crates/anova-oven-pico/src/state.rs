@@ -41,6 +41,7 @@ impl<'a> Ctx<'a> {
 pub async fn execute(state: AppState, ctx: &mut Ctx<'_>) -> AppState {
     crate::persist::record_app_state(state.discriminant());
     ctx.backlight.apply(state.backlight_policy());
+    ctx.display.set_backlight(state.backlight_policy());
 
     match state {
         AppState::Offline => execute_offline(ctx).await,
@@ -135,10 +136,12 @@ async fn execute_idle(ctx: &mut Ctx<'_>) -> AppState {
             match select(ctx.input.recv(), ctx.api_changed()).await {
                 Either::First(InputEvent::EncoderCW) if !snap.recipes.is_empty() => {
                     ctx.backlight.set_full();
+                    ctx.display.set_backlight(BacklightPolicy::Full);
                     return AppState::BrowseRecipes { index: 0 };
                 }
                 Either::First(_) => {
                     ctx.backlight.set_full();
+                    ctx.display.set_backlight(BacklightPolicy::Full);
                     dim_at = Instant::now() + idle_dim_delay;
                     dimmed = false;
                 }
@@ -148,15 +151,18 @@ async fn execute_idle(ctx: &mut Ctx<'_>) -> AppState {
             match select3(ctx.input.recv(), ctx.api_changed(), Timer::at(dim_at)).await {
                 Either3::First(InputEvent::EncoderCW) if !snap.recipes.is_empty() => {
                     ctx.backlight.set_full();
+                    ctx.display.set_backlight(BacklightPolicy::Full);
                     return AppState::BrowseRecipes { index: 0 };
                 }
                 Either3::First(_) => {
                     ctx.backlight.set_full();
+                    ctx.display.set_backlight(BacklightPolicy::Full);
                     dim_at = Instant::now() + idle_dim_delay;
                 }
                 Either3::Second(()) => {}
                 Either3::Third(()) => {
                     ctx.backlight.set_dim();
+                    ctx.display.set_backlight(BacklightPolicy::Dim);
                     dimmed = true;
                 }
             }

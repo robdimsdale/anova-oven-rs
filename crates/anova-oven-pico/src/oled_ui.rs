@@ -17,13 +17,25 @@
 use embassy_rp::gpio::Output;
 use embassy_rp::peripherals::SPI0;
 use embassy_rp::spi::{Blocking, Spi};
-use embassy_time::Delay;
+use embassy_time::{Delay, Duration, Instant};
 
-use anova_oven_pico_core::fsm::ViewSpec;
+use anova_oven_pico_core::fsm::{BacklightPolicy, ViewSpec};
 
 use crate::display::DisplayBackend;
 use crate::graphics_view::render_view;
 use crate::oled::{Oled, Variant};
+
+/// Contrast used while `BacklightPolicy::Dim` is active — low but not zero,
+/// so the panel is still legible up close. Dimming only slows OLED aging
+/// (it scales with cumulative current, not a threshold), so it is paired
+/// with `OFF_AFTER_DIM` below rather than relied on alone.
+const DIM_CONTRAST: u8 = 0x01;
+
+/// How long to stay dimmed before cutting the panel fully off. This is
+/// materially longer than the FSM's dim delay (currently 5s — see
+/// `AppState::idle_dim_delay`) so a glance at a dim screen doesn't go dark
+/// mid-read; tune on real hardware once burn-in is actually observed.
+const OFF_AFTER_DIM: Duration = Duration::from_secs(300);
 
 /// Which controller the wired board carries. Adafruit revised product 2719 from
 /// SSD1305 to SSD1309 in September 2023 without changing the pinout or the
@@ -39,6 +51,11 @@ type Panel = Oled<Spi<'static, SPI0, Blocking>, Output<'static>, Output<'static>
 
 pub struct OledScreen {
     panel: Panel,
+    /// Set when `BacklightPolicy::Dim` starts; cleared on `Full`. `render`
+    /// checks it each tick and cuts the panel off once `OFF_AFTER_DIM`
+    /// elapses without a `Full` bringing it back.
+    dim_since: Option<Instant>,
+    panel_off: bool,
 }
 
 impl OledScreen {
@@ -50,6 +67,8 @@ impl OledScreen {
     ) -> Self {
         Self {
             panel: Oled::new(spi, dc, cs, rst, VARIANT),
+            dim_since: None,
+            panel_off: false,
         }
     }
 }
@@ -70,9 +89,42 @@ impl DisplayBackend for OledScreen {
 
     /// Draw `view` via the shared layout, then flush the pages that changed.
     /// A failed transfer leaves the driver's shadow untouched, so the next tick
-    /// retries it.
+    /// retries it. Keeps drawing and flushing even while `panel_off` is set —
+    /// GDDRAM writes work regardless of `0xAE`, so the frame is already
+    /// correct and reappears with no extra work the moment the panel comes
+    /// back on.
     async fn render(&mut self, view: &ViewSpec) {
+        if let Some(since) = self.dim_since {
+            if !self.panel_off && since.elapsed() >= OFF_AFTER_DIM {
+                let _ = self.panel.display_off();
+                self.panel_off = true;
+            }
+        }
+
         render_view(&mut self.panel, view);
         let _ = self.panel.flush();
+    }
+
+    /// `Dim` lowers contrast and starts the off-timer; `Full` (including
+    /// `FullThenDimAfter`, whose entry intent is full — see
+    /// `backlight::BacklightController::apply`) restores normal contrast,
+    /// cancels the timer, and wakes the panel back up if it had gone dark.
+    async fn set_backlight(&mut self, policy: BacklightPolicy) {
+        match policy {
+            BacklightPolicy::Dim => {
+                if self.dim_since.is_none() {
+                    self.dim_since = Some(Instant::now());
+                }
+                let _ = self.panel.set_contrast(DIM_CONTRAST);
+            }
+            BacklightPolicy::Full | BacklightPolicy::FullThenDimAfter(_) => {
+                self.dim_since = None;
+                if self.panel_off {
+                    let _ = self.panel.display_on();
+                    self.panel_off = false;
+                }
+                let _ = self.panel.set_contrast(VARIANT.normal_contrast());
+            }
+        }
     }
 }
