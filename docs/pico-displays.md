@@ -130,17 +130,31 @@ timer, probe, steam *and* phase rows needs one more, so the phase row is
 dropped — `fit_line_count` trims from the end, and the planner orders a top-stacked
 plan by importance, so what goes is what mattered least.
 
-### Known gap: burn-in
+### Burn-in mitigation
 
-An OLED dims where it has been lit longest, and this firmware shows a mostly
-static status screen. Nothing mitigates that today. The natural fix reuses the
-`BacklightPolicy` the FSM already computes (`state.rs` calls
-`ctx.backlight.set_dim()` / `set_full()` at exactly the right moments): route
-that to the display backend as well, and have the OLED backend answer it with
-the controller's contrast command (`0x81`) or by parking the panel with
-display-off (`0xAE`), which stops the ageing entirely and preserves GDDRAM.
-That needs a second signal alongside `DisplayNotifier`, which is why it is not
-in the initial backend.
+An OLED ages where it has been lit longest, and this firmware shows a mostly
+static status screen, so `state.rs` routes `BacklightPolicy` to `OledScreen`
+(`display::BacklightNotifier`, a second signal alongside `DisplayNotifier` —
+`display_task` selects on both) in addition to the character LCD's
+`ctx.backlight`, which has no equivalent hardware here (no `BL` pin — see the
+top of this section).
+
+Two tiers, because contrast alone doesn't stop the aging, only slows it —
+aging tracks cumulative current, not a brightness threshold:
+
+- **`Dim`** (the FSM's 5 s idle timeout — `AppState::idle_dim_delay`): drops
+  the contrast register (`0x81`) to `oled_ui::DIM_CONTRAST`. Slows aging
+  roughly in proportion to the current reduction, nothing more.
+- **After `OFF_AFTER_DIM`** (5 minutes dimmed, `oled_ui.rs`) with no `Full` in
+  between: `display-off` (`0xAE`). This is the tier that actually matters —
+  zero segment current, so zero aging — and it's free to hold indefinitely
+  since GDDRAM keeps the frame and `display-on` (`0xAF`) brings it back
+  instantly with nothing to redraw.
+
+`Full` (including `FullThenDimAfter`'s entry intent) cancels the timer,
+restores `Variant::normal_contrast()`, and wakes the panel if it had gone
+dark. The 5-minute threshold is a starting guess, not a measurement — tune it
+once burn-in is actually visible on real hardware.
 
 ## 2.0" colour IPS TFT (Adafruit 4311)
 
@@ -222,6 +236,9 @@ alternate at ≥ 1 Hz or the image degrades.
 4-bit parallel bus on GP16–GP21 (RS=GP17, EN=GP16, D4–D7=GP21/GP20/GP19/GP18),
 with the RGB backlight on the PWM pins GP6/GP7/GP8. This is the only backend
 with a 3-channel RGB backlight — the TFT's single-channel `BL` is driven
-separately (see above); the Sharp and OLED panels have no backlight hardware
-at all, so their build gets a no-op `NullBacklightController`. All three are
-selected by `backlight::ActiveBacklight`, mirroring `screen::ActiveScreen`.
+separately (see above); the Sharp has no backlight hardware at all, so its
+build gets a no-op `NullBacklightController`. These are selected by
+`backlight::ActiveBacklight`, mirroring `screen::ActiveScreen`. The OLED also
+gets `NullBacklightController` here (no `BL` pin to drive either), but it is
+not backlight-blind — see "Burn-in mitigation" above for how it answers the
+same `BacklightPolicy` over SPI instead of GPIO.

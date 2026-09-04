@@ -66,10 +66,16 @@ use crate::backlight::BacklightController;
 use crate::backlight::NullBacklightController;
 #[cfg(feature = "ui-tft-basic")]
 use crate::backlight::PwmBacklightController;
-use crate::display::{Display, DisplayBackend, DisplayNotifier, ViewSpec};
+use crate::display::{BacklightNotifier, Display, DisplayBackend, DisplayNotifier, ViewSpec};
 use crate::input::{Input, InputChannel};
 use crate::screen::ActiveScreen;
 use crate::state::{execute, AppState, Ctx};
+
+// Microsecond timestamps on every defmt log line (via probe-rs's `{t}` log-format
+// field), reading the RP2040's free-running hardware timer — cheap, lock-free,
+// interrupt-safe. Needed to tell whether two events (e.g. an encoder tick and a
+// spurious button press) were truly simultaneous or just adjacent in the log.
+defmt::timestamp!("{=u64:us}", Instant::now().as_micros());
 
 const WIFI_SSID: &str = env!("ANOVA_WIFI_SSID");
 const WIFI_PASSWORD: &str = env!("ANOVA_WIFI_PASSWORD");
@@ -100,6 +106,7 @@ static NVRAM: &cyw43::Aligned<cyw43::A4, [u8]> =
     &cyw43::Aligned(*include_bytes!("../nvram_rp2040.bin"));
 static CLM: &[u8] = include_bytes!("../firmware/43439A0_clm.bin");
 static DISPLAY_NOTIFIER: DisplayNotifier = Signal::new();
+static BACKLIGHT_NOTIFIER: BacklightNotifier = Signal::new();
 static INPUT_CHANNEL: InputChannel = Channel::new();
 static API_COMMANDS: CommandChannel = Channel::new();
 static API_STATE: StateWatch = Watch::new();
@@ -315,7 +322,7 @@ async fn main(spawner: Spawner) {
     watchdog.start(Duration::from_secs(WATCHDOG_TIMEOUT_SECS));
     spawner.spawn(watchdog_feeder_task(watchdog).unwrap());
 
-    let display = Display::new(screen, &DISPLAY_NOTIFIER, spawner).unwrap();
+    let display = Display::new(screen, &DISPLAY_NOTIFIER, &BACKLIGHT_NOTIFIER, spawner).unwrap();
 
     #[cfg(feature = "verbose-logs")]
     spawner.spawn(heap_monitor_task().unwrap());
