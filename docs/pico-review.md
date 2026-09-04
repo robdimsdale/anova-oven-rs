@@ -83,10 +83,67 @@ embassy-rp's async GPIO. Fine for hand speed; fast spins lose detents. The QEM t
 accumulator decode itself is correct and the direction-reversal reset is a nice touch.
 Acceptable for this use case — note it, don't necessarily fix it.
 
-### 1.6 [L] Button task: 500 ms blanking, no release wait — `input.rs:44-53`
+### 1.6 [L] ✅ DONE Button task: 500 ms blanking, no release wait — `input.rs:44-53`
+
+> Fixed: the task now blocks on a level-triggered `wait_for_low()` and then samples every
+> 5 ms through `pico_core::button::Debouncer` (Kuhn integrator, 50 ms of net-low evidence
+> to confirm a press, discharge to zero to confirm the release). One event per physical
+> press, no blanking window, and double-clicks survive.
+>
+> Two follow-ups, both driven by field measurement rather than theory:
+>
+> **The threshold was miscalibrated.** 50 ms was chosen to clear the ~35 ms noise
+> excursions seen *before* the switch line got its RC filter. With the filter fitted the
+> noise is gone, but quick taps measure only 20-35 ms of contact, so every one of them was
+> being rejected. Now 12 ms, sampled every 2 ms (six samples of evidence). A sample's
+> contribution is capped at half the threshold, so no single late sample can confirm a
+> press on its own.
+>
+> **The logs were measuring the wrong thing**, which is what made the miscalibration hard
+> to see: they reported the *excursion*, which includes the integrator's discharge ramp
+> and so runs to roughly twice the contact time. A 44 ms press logged as "88 ms" and read
+> like a stall rather than a short press. Rejections now log contact time, excursion,
+> sample count and peak charge, which separates the three failure modes:
+>
+> | signature | meaning |
+> | --- | --- |
+> | `peak` ≈ half the excursion | clean press, shorter than `PRESS_MS` — threshold too high |
+> | far fewer samples than `excursion / SAMPLE_INTERVAL_MS` | the sampling loop was starved |
+> | many samples, `peak` never climbing | the line genuinely chattered |
+>
+> The integrator also charges in elapsed milliseconds rather than sample counts, so a
+> stalled executor cannot under-count a press. Measurement says the loop is currently
+> sampling on time (~5.3-5.9 ms against a 5 ms nominal), so that part is insurance, not a
+> fix for an observed fault.
+
 `wait_for_falling_edge` then unconditional `Timer::after(500ms)`. A held button emits one
 event per 500 ms; double-clicks within 500 ms are swallowed. Likely intentional debounce
 but the value is large and it debounces by time rather than by release edge. Minor UX nit.
+
+In the field it turned out to be more than a nit: with no debounce at all on the leading
+edge, noise coupled from the A/B lines while turning the shaft produced spurious
+`EncoderButton` events (observed excursions from 106 µs to ~35 ms, against ~150 ms for a
+real press), which fired `/start` and `/stop`. Two further edge-reader hazards the
+rewrite removes: `embassy-rp` clears latched edges when arming a future, so a release
+that lands before `wait_for_rising_edge()` is armed is lost (that's what the "still held
+after 500 ms lockout" logs actually were), and a press arriving during the blanking
+window is dropped entirely.
+
+The hardware side is still worth doing, since the firmware filter buys immunity at the
+cost of a 50 ms confirmation delay. The filter wants three parts, at the Pico end of the
+loom rather than at the encoder, so the whole wire run sits inside it:
+
+| Part | Value | Buys |
+| --- | --- | --- |
+| Cap, GP11 → GND | 100 nF | Swamps capacitively coupled noise (a few pF of coupling against 100 nF is a ~1/20000 divider). |
+| Series R, GP11 → switch | 1 kΩ | Gives the *falling* edge a time constant. Without it a momentary contact shorts the cap through the wire and the pin sees a clean fast low — the cap does nothing. |
+| Pull-up, 3V3 → GP11 | 10 kΩ | Replaces the RP2040's weak ~50-80 kΩ internal one, cutting the line's impedance and the release time constant (~6 ms → ~1 ms). |
+
+With those values a 106 µs contact blip only pulls the pin to ~2 V — it never crosses
+V_IL — while a real press crosses in ~160 µs. Closure energy is ½CV² = 0.54 µJ, and the
+series resistor caps the inrush at 3.3 mA, so contact erosion is not a concern. The pin's
+Schmitt trigger (on by default in `PADS_BANK0`) is what keeps the slowed edges from
+chattering; don't disable it.
 
 ### 1.7 [L] Hardcoded network seed — `main.rs:251`
 `seed = 0x0123_4567_89ab_cdef` feeds embassy-net's TCP ISN / ephemeral port

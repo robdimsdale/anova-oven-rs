@@ -17,6 +17,7 @@
 extern crate alloc;
 
 pub mod api;
+pub mod button;
 pub mod encoder;
 pub mod fsm;
 pub mod persist_data;
