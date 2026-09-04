@@ -80,7 +80,8 @@
   embedded-hal = "1"
   # Graphical backends only (pulled in by `_graphics`). embedded-graphics is a
   # pure no_std graphics lib. Both panels use the blocking `embedded-hal`
-  # SpiBus (already a dep) — see sharp.rs for why not async/DMA.
+  # SpiBus (already a dep) — see docs/pico-display-dma.md for why not async/DMA
+  # (a driver rewrite plus a cancellation hazard, not a HAL limitation).
   embedded-graphics = { version = "0.8", optional = true }
   # Bitmap fonts (u8g2 collection) for distance-readable text. Renders straight
   # to an embedded-graphics DrawTarget via its FontRenderer; pulled in only by

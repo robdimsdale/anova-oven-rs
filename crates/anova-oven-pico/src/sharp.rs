@@ -23,8 +23,10 @@
 //! ~50 ms frame is the worst case, not the norm: a few changed text lines
 //! transfer (and bit-reverse) in well under a millisecond. Even a full flush
 //! stays well within the 8 s watchdog and doesn't disturb cyw43's autonomous
-//! PIO/DMA radio path. (Async/DMA would need a second DMA channel's `DMA_IRQ_0`
-//! binding, which cyw43 already owns exclusively — see main.rs.)
+//! PIO/DMA radio path. DMA is available if this ever needs it — a second
+//! channel can share `DMA_IRQ_0` with cyw43 — but converting costs an async
+//! `flush` and brings a cancellation hazard the compiler can't catch; see
+//! `docs/pico-display-dma.md`.
 
 use embedded_graphics::{
     draw_target::DrawTarget,

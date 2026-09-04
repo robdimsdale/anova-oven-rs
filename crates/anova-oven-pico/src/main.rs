@@ -203,9 +203,10 @@ async fn main(spawner: Spawner) {
     #[cfg(feature = "ui-sharp-basic")]
     let mut screen: ActiveScreen = {
         // Sharp Memory Display on SPI0: SCK=GP18, MOSI=GP19, active-high CS=GP17.
-        // Mode 0, 2 MHz (panel max). Blocking (no DMA): async DMA would need a
-        // second channel's DMA_IRQ_0 binding, which cyw43 already owns, and the
-        // dirty-checked ~50 ms flush (~1/s) is fine under the 8 s watchdog.
+        // Mode 0, 2 MHz (panel max). Blocking: the dirty-checked ~50 ms
+        // worst-case flush (~1/s) is fine under the 8 s watchdog and nothing
+        // is being starved by it. DMA is possible (docs/pico-display-dma.md),
+        // just not currently worth the async conversion.
         let mut spi_cfg = embassy_rp::spi::Config::default();
         spi_cfg.frequency = 2_000_000;
         spi_cfg.phase = embassy_rp::spi::Phase::CaptureOnFirstTransition;
@@ -220,8 +221,8 @@ async fn main(spawner: Spawner) {
         // 2.42" 128x64 OLED on SPI0: SCK=GP18, MOSI=GP19, active-low CS=GP17,
         // D/C=GP16, RESET=GP20. Mode 0 at 4 MHz — the SSD1305's serial
         // interface tops out around there, and a full 1 KB frame still costs
-        // only ~2 ms. Blocking for the same reason as the Sharp: cyw43 owns the
-        // DMA_IRQ_0 binding an async SPI would need.
+        // only ~2 ms — far too little to justify an async/DMA conversion
+        // (docs/pico-display-dma.md).
         let mut spi_cfg = embassy_rp::spi::Config::default();
         spi_cfg.frequency = 4_000_000;
         spi_cfg.phase = embassy_rp::spi::Phase::CaptureOnFirstTransition;
@@ -241,8 +242,9 @@ async fn main(spawner: Spawner) {
         // active-low CS=GP17, D/C=GP16, RESET=GP20 — the same five pins the
         // OLED uses. Mode 0 at 32 MHz: the ST7789 will take ~62 MHz, but 32
         // keeps margin on jumper wires and still puts a worst-case full
-        // repaint (~150 KB) at ~38 ms. Blocking for the same reason as the
-        // other panels: cyw43 owns the DMA_IRQ_0 binding an async SPI needs.
+        // repaint (~150 KB) at ~38 ms. Blocking, though of the four panels
+        // this is the one where DMA would actually pay — see
+        // docs/pico-display-dma.md if that becomes worth doing.
         let mut spi_cfg = embassy_rp::spi::Config::default();
         spi_cfg.frequency = 32_000_000;
         spi_cfg.phase = embassy_rp::spi::Phase::CaptureOnFirstTransition;
