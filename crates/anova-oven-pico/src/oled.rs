@@ -20,8 +20,9 @@
 //! reports of blank panels at Adafruit's 8 MHz library default are common, so
 //! `main.rs` clocks SPI0 at 4 MHz. Even so a full 1 KB frame is ~2 ms, which is
 //! why this driver — unlike `sharp.rs`, whose full frame costs ~50 ms — is
-//! blocking with plenty of margin under the 8 s watchdog. (Async/DMA would need
-//! a second DMA channel's `DMA_IRQ_0` binding, which cyw43 already owns.)
+//! blocking with plenty of margin under the 8 s watchdog — and at 2 ms this is
+//! the panel least worth converting to DMA (see
+//! `docs/pico-display-dma.md`).
 //!
 //! **Memory layout.** GDDRAM is page-major: one page is an 8-pixel-tall,
 //! 128-byte-wide band, and bit `n` of a byte is the pixel `n` rows down inside
