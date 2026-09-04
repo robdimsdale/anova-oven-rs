@@ -600,6 +600,7 @@ error-handling policy).
 - Pico OTA brief: [`docs/pico-ota.md`](pico-ota.md)
 - Pico transport security brief: [`docs/pico-transport-security.md`](pico-transport-security.md)
 - Pico reset-button note: [`docs/pico-reset-button.md`](pico-reset-button.md)
+- Display SPI / DMA investigation: [`docs/pico-display-dma.md`](pico-display-dma.md)
 - Pico crate review: [`docs/pico-review.md`](pico-review.md)
 - Exploration / debugging archive: [`docs/exploration/`](exploration/)
 - Community protocol docs (Go client): `../anova-oven-api/`
