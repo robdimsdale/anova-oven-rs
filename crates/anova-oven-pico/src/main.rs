@@ -345,9 +345,9 @@ async fn main(spawner: Spawner) {
     let backlight_controller = NullBacklightController::new();
 
     let input = Input::new(
-        GpioInput::new(p.PIN_10, Pull::Up),
-        GpioInput::new(p.PIN_9, Pull::Up),
-        GpioInput::new(p.PIN_11, Pull::Up),
+        GpioInput::new(p.PIN_1, Pull::Up),
+        GpioInput::new(p.PIN_2, Pull::Up),
+        GpioInput::new(p.PIN_0, Pull::Up),
         &INPUT_CHANNEL,
         spawner,
     )
