@@ -200,9 +200,16 @@ where
 }
 
 /// Decide the [`ScreenPlan`] for `view`. `content_width` is the usable width
-/// (panel width minus margins) used for wrapping; `measure` reports rendered
-/// text widths for a given [`FontRole`].
-pub fn plan_view<M>(view: &ViewSpec, content_width: u32, measure: M) -> ScreenPlan
+/// (panel width minus margins) used for wrapping; `status_age_secs` is how
+/// long ago the view's server data was fetched
+/// ([`ViewSpec::status_age_secs`]), which advances the cook timer between
+/// polls; `measure` reports rendered text widths for a given [`FontRole`].
+pub fn plan_view<M>(
+    view: &ViewSpec,
+    content_width: u32,
+    status_age_secs: u64,
+    measure: M,
+) -> ScreenPlan
 where
     M: Fn(FontRole, &str) -> u32,
 {
@@ -352,9 +359,13 @@ where
                 lines,
             }
         }
-        ViewSpec::Status { status, cook } => {
-            plan_status(status.as_ref(), cook.as_ref(), content_width, &measure)
-        }
+        ViewSpec::Status { status, cook, .. } => plan_status(
+            status.as_ref(),
+            cook.as_ref(),
+            content_width,
+            status_age_secs,
+            &measure,
+        ),
     }
 }
 
@@ -362,6 +373,7 @@ fn plan_status<M>(
     status: Option<&OvenStatus>,
     cook: Option<&CurrentCook>,
     content_width: u32,
+    status_age_secs: u64,
     measure: &M,
 ) -> ScreenPlan
 where
@@ -386,7 +398,7 @@ where
             planline(FontRole::Giant, format!("{cur:.0}F")),
             planline(FontRole::Hero, String::from(status.phase())),
         ];
-        push_detail_rows(&mut lines, status, cooking);
+        push_detail_rows(&mut lines, status, cooking, status_age_secs);
         return ScreenPlan {
             placement: Placement::Centered,
             lines,
@@ -419,7 +431,7 @@ where
     }
     lines.push(planline(FontRole::Hero, temp));
 
-    push_detail_rows(&mut lines, status, cooking);
+    push_detail_rows(&mut lines, status, cooking, status_age_secs);
 
     ScreenPlan {
         placement: Placement::TopStacked,
@@ -429,8 +441,15 @@ where
 
 /// The rows below the headline, in descending importance — `fit_line_count`
 /// trims from the end, so the order is what a short panel drops first.
-fn push_detail_rows(lines: &mut Vec<PlanLine>, status: &OvenStatus, cooking: bool) {
-    if let Some(remaining) = status.timer_remaining_secs() {
+fn push_detail_rows(
+    lines: &mut Vec<PlanLine>,
+    status: &OvenStatus,
+    cooking: bool,
+    status_age_secs: u64,
+) {
+    // Counted down from the fetch time, not straight off the wire, so the row
+    // ticks every second instead of only when a poll lands.
+    if let Some(remaining) = status.timer_remaining_secs_after(status_age_secs) {
         let (h, m, s) = (remaining / 3600, (remaining % 3600) / 60, remaining % 60);
         let timer = if h > 0 {
             format!("Timer  {h}:{m:02}:{s:02}")
@@ -526,8 +545,9 @@ mod tests {
         let view = ViewSpec::Status {
             status: Some(oven("idle")),
             cook: None,
+            fetched_at: None,
         };
-        let plan = plan_view(&view, 300, measure);
+        let plan = plan_view(&view, 300, 0, measure);
 
         // The whole panel goes to the temperature: giant and centred, with
         // "Idle" under it. No setpoint on the temperature line (there is none
@@ -547,8 +567,10 @@ mod tests {
             &ViewSpec::Status {
                 status: Some(status),
                 cook: None,
+                fetched_at: None,
             },
             300,
+            0,
             measure,
         );
 
@@ -568,8 +590,9 @@ mod tests {
         let view = ViewSpec::Status {
             status: Some(oven("cook")),
             cook: None,
+            fetched_at: None,
         };
-        let plan = plan_view(&view, 300, measure);
+        let plan = plan_view(&view, 300, 0, measure);
 
         // Manual cook (no CurrentCook), hero shows current -> target, and a
         // phase row is present (Preheating: timer idle, no elapsed time).
@@ -584,6 +607,32 @@ mod tests {
     }
 
     #[test]
+    fn timer_row_counts_down_between_polls() {
+        let mut status = oven("cook");
+        status.timer_mode = String::from("running");
+        status.timer_total_secs = 600;
+        status.timer_current_secs = 60; // 540 left when the poll landed
+        let view = ViewSpec::Status {
+            status: Some(status),
+            cook: None,
+            fetched_at: None,
+        };
+
+        let timer_row = |age| {
+            plan_view(&view, 300, age, measure)
+                .lines
+                .into_iter()
+                .find(|l| l.text.starts_with("Timer"))
+                .map(|l| l.text)
+        };
+
+        // Same server data, three animation ticks apart: the row keeps time.
+        assert_eq!(timer_row(0).as_deref(), Some("Timer  09:00"));
+        assert_eq!(timer_row(1).as_deref(), Some("Timer  08:59"));
+        assert_eq!(timer_row(61).as_deref(), Some("Timer  07:59"));
+    }
+
+    #[test]
     fn steam_setpoint_is_a_cooking_row_only() {
         // The oven keeps reporting the finished cook's steam setpoint while
         // idle; it belongs to the cook, so only the cooking screen shows it.
@@ -593,8 +642,10 @@ mod tests {
             &ViewSpec::Status {
                 status: Some(idle.clone()),
                 cook: None,
+                fetched_at: None,
             },
             300,
+            0,
             measure,
         );
         assert!(!plan.lines.iter().any(|l| l.text.starts_with("Steam")));
@@ -605,8 +656,10 @@ mod tests {
             &ViewSpec::Status {
                 status: Some(cooking),
                 cook: None,
+                fetched_at: None,
             },
             300,
+            0,
             measure,
         );
         assert!(plan.lines.contains(&pl(FontRole::Body, "Steam  60%")));
@@ -699,7 +752,7 @@ mod tests {
 
     #[test]
     fn transient_screen_is_centered() {
-        let plan = plan_view(&ViewSpec::WifiInit, 300, measure);
+        let plan = plan_view(&ViewSpec::WifiInit, 300, 0, measure);
         assert_eq!(plan.placement, Placement::Centered);
         assert_eq!(plan.lines, [pl(FontRole::Title, "Connecting to Wi-Fi")]);
     }
@@ -713,6 +766,7 @@ mod tests {
                 title: String::new(),
             },
             300,
+            0,
             measure,
         );
         assert_eq!(empty.placement, Placement::Centered);
@@ -725,6 +779,7 @@ mod tests {
                 title: String::from("Cake"),
             },
             300,
+            0,
             measure,
         );
         assert_eq!(populated.placement, Placement::TopStacked);

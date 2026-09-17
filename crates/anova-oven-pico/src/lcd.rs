@@ -110,9 +110,15 @@ impl LcdController {
                 let _ = write!(row1, "Stale {}m - check", disconnected_secs / 60);
                 self.write_row(1, row1.as_str()).await;
             }
-            ViewSpec::Status { status, cook } => {
-                self.render_status_display(status.as_ref(), cook.as_ref())
-                    .await;
+            ViewSpec::Status { status, cook, .. } => {
+                // The age of the fetch, not the fetch itself, is what advances
+                // the timer row between polls — see `render_status_display`.
+                self.render_status_display(
+                    status.as_ref(),
+                    cook.as_ref(),
+                    view.status_age_secs(Instant::now()),
+                )
+                .await;
             }
             ViewSpec::RecipeBrowser {
                 count,
@@ -161,10 +167,14 @@ impl LcdController {
         }
     }
 
+    /// `status_age_secs` is how long ago `status` was fetched: the timer row
+    /// counts down from there rather than showing the last number the server
+    /// sent, so it ticks every second instead of once per poll.
     async fn render_status_display(
         &mut self,
         status: Option<&anova_oven_api::OvenStatus>,
         current_cook: Option<&anova_oven_api::CurrentCook>,
+        status_age_secs: u64,
     ) {
         let Some(status) = status else {
             self.write_row(0, "").await;
@@ -182,8 +192,9 @@ impl LcdController {
             let phase = status.phase();
             let stage_title = current_stage.and_then(|stage| stage.title.as_deref());
             let show_phase = stage_title.is_some_and(|title| !title.eq_ignore_ascii_case(phase));
+            let remaining_secs = status.timer_remaining_secs_after(status_age_secs);
             let has_timer_or_probe =
-                status.timer_remaining_secs().is_some() || status.probe_temperature_c.is_some();
+                remaining_secs.is_some() || status.probe_temperature_c.is_some();
 
             // A manual cook has no recipe, so every stage in it is manual and
             // naming one tells the user nothing they can't see from row 0's
@@ -238,7 +249,7 @@ impl LcdController {
             }
 
             if has_timer_or_probe && slot == slot_idx {
-                if let Some(remaining) = status.timer_remaining_secs() {
+                if let Some(remaining) = remaining_secs {
                     let h = remaining / 3600;
                     let m = (remaining % 3600) / 60;
                     let s = remaining % 60;
