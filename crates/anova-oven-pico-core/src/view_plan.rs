@@ -611,7 +611,7 @@ mod tests {
         let mut status = oven("cook");
         status.timer_mode = String::from("running");
         status.timer_total_secs = 600;
-        status.timer_current_secs = 60; // 540 left when the poll landed
+        status.timer_current_secs = 540; // 9 minutes left when the poll landed
         let view = ViewSpec::Status {
             status: Some(status),
             cook: None,
