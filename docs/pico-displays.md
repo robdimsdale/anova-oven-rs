@@ -17,7 +17,12 @@ most one is enabled; enabling two fails the build with that message.
 
 ## Code layers
 
-The three graphical panels share everything above the wire:
+Every backend starts from the same `ViewSpec` and splits into a host-tested
+planner plus a target-only renderer. The three graphical panels share one
+planner; the character LCD has its own, because it degrades along a different
+axis (see "Why the LCD plans separately" below).
+
+The graphical panels share everything above the wire:
 
 ```
 ViewSpec                        (fsm.rs — what the FSM wants shown)
@@ -37,9 +42,46 @@ layout code should not need to change beyond possibly a font tier:
 `graphics_view` picks its tier from the panel's reported size, and trims
 trailing lines that don't fit.
 
+The character LCD has the same shape, one planner over:
+
+```
+ViewSpec                        (fsm.rs — what the FSM wants shown)
+  └── lcd_plan::plan_lcd        (pico-core, host-tested: the pinned top row,
+      │                          and the rows that share the bottom one)
+      └── lcd_plan::LcdAnimator (pico-core, host-tested: which slot is up,
+          │                      where each marquee has got to, what changed)
+          └── lcd.rs → HD44780  (cursor moves and byte strobes, nothing else)
+```
+
+### Why the LCD plans separately
+
+A `ScreenPlan` and an `LcdPlan` answer the same question and reach opposite
+answers, because the panels run out of room in different directions.
+
+A graphical panel trades **content for space**: `fit_line_count` drops trailing
+rows, and `plan_view` orders a top-stacked plan by importance so what goes is
+what mattered least. The LCD has 32 cells total — not enough for a cooking
+status on any ordering — so it trades **space for time** instead: the bottom row
+rotates through its candidates, and a row wider than 16 cells marquees rather
+than wrapping or ellipsising. Nothing is dropped; it just takes a few seconds to
+see all of it.
+
+Merging the two would mean a plan type carrying both strategies, with each
+backend ignoring the other's fields. They stay separate planners over the one
+shared `ViewSpec`, sharing the derivations that are genuinely common
+(`view_plan::recipe_browser_header`, `api::celcius_to_fahrenheit`,
+`OvenStatus::timer_remaining_secs_after`).
+
+If the graphical panels ever want time-based content too — rotating the detail
+rows the OLED currently drops is the obvious candidate — that calculus changes,
+and the seam to unify on is the *scheduling* (rotation groups, overflow policy,
+per-row anchoring), not the font metrics.
+
+### Time is an input, not an ambient read
+
 `display_task` re-renders the current `ViewSpec` every 50 ms animation tick,
 not just when a new one arrives, and the planner is handed the *age* of the
-view's server data (`ViewSpec::status_age_secs`) alongside it. That is what
+view's server data (`ViewSpec::timer_age_secs`) alongside it. That is what
 makes a running cook timer tick: the row is counted down from the fetch time
 (`OvenStatus::timer_remaining_secs_after`) rather than printed off the wire, so
 it moves every second and every poll re-anchors it. Nothing else on the screen
@@ -313,3 +355,19 @@ build gets a no-op `NullBacklightController`. These are selected by
 gets `NullBacklightController` here (no `BL` pin to drive either), but it is
 not backlight-blind — see "Burn-in mitigation" above for how it answers the
 same `BacklightPolicy` over SPI instead of GPIO.
+
+### Layout on 16×2
+
+`lcd.rs` owns only the bus: everything about *what* appears is decided in
+`pico-core`'s `lcd_plan` and is host-tested, timing included (`LcdAnimator::tick`
+is handed `now` rather than reading the clock). The rotation and marquee
+constants live there — a row that fits holds 3 s before handing over, one that
+doesn't scrolls 3 cells per 350 ms with a 1.2 s pause at each end, and a long row
+gets its turn measured by the scroll rather than the hold, so it always shows its
+tail before the next slot comes up.
+
+The one glyph outside ASCII is the degree sign on the idle top row. The driver's
+`CharsetUniversal` has no mapping for it and its `EmptyFallback` would silently
+render a space, so `lcd.rs` writes `0xDF` (the HD44780 ROM's own degree glyph) as
+a raw byte. It counts as one cell, which is why the planner pads rows by `char`
+and not by byte.

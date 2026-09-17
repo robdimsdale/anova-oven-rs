@@ -20,6 +20,7 @@ pub mod api;
 pub mod button;
 pub mod encoder;
 pub mod fsm;
+pub mod lcd_plan;
 pub mod persist_data;
 pub mod reset;
 pub mod scheduler;
