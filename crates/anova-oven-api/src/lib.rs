@@ -190,12 +190,32 @@ impl OvenStatus {
         }
     }
 
-    /// Timer remaining in seconds, if a timer is running.
+    /// Timer remaining in seconds, as of the moment this status was read from
+    /// the oven. `None` if no timer is running.
     pub fn timer_remaining_secs(&self) -> Option<u64> {
+        self.timer_remaining_secs_after(0)
+    }
+
+    /// [`Self::timer_remaining_secs`] as it reads `elapsed_secs` after this
+    /// status was fetched.
+    ///
+    /// The oven's timer does not wait for us to poll it, so a client that only
+    /// ever shows the last number it was sent ticks in poll-sized jumps and
+    /// stalls outright whenever a poll is late. Extrapolating from the fetch
+    /// time instead gives a timer that counts at 1 Hz on its own and is
+    /// re-anchored by every poll, so it can't drift.
+    ///
+    /// Only a *running* timer is extrapolated — a paused or finished one is
+    /// whatever the oven last said. The extrapolation is open-ended, on the
+    /// assumption that the caller stops showing a status it can no longer
+    /// refresh (the Pico firmware takes the screen over with `ServerOffline`
+    /// after three failed polls).
+    pub fn timer_remaining_secs_after(&self, elapsed_secs: u64) -> Option<u64> {
         if self.timer_mode == "running" && self.timer_total_secs > 0 {
             Some(
                 self.timer_total_secs
-                    .saturating_sub(self.timer_current_secs),
+                    .saturating_sub(self.timer_current_secs)
+                    .saturating_sub(elapsed_secs),
             )
         } else {
             None
@@ -421,9 +441,10 @@ impl CurrentCook {
 mod tests {
     use super::*;
 
-    #[test]
-    fn oven_status_round_trip() {
-        let status = OvenStatus {
+    /// A mid-cook status: 3600s timer with 300 on the clock, every field
+    /// populated. Tests mutate what they care about.
+    fn cooking_status() -> OvenStatus {
+        OvenStatus {
             mode: "cook".into(),
             temperature_unit: "F".into(),
             temperature_c: 200.0,
@@ -460,7 +481,12 @@ mod tests {
             active_stage_id: None,
             cook_progress: None,
             upstream: None,
-        };
+        }
+    }
+
+    #[test]
+    fn oven_status_round_trip() {
+        let status = cooking_status();
         let json = serde_json::to_string(&status).unwrap();
         let parsed: OvenStatus = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.mode, "cook");
@@ -470,6 +496,24 @@ mod tests {
         assert_eq!(parsed.fan_speed, 100);
         assert!(parsed.heating_element_top_on);
         assert!(!parsed.door_open);
+    }
+
+    #[test]
+    fn timer_extrapolates_from_the_fetch_but_never_past_zero() {
+        let mut status = cooking_status();
+
+        // 3600 total, 300 on the clock: 3300 left at the moment of the fetch,
+        // one less for each second since.
+        assert_eq!(status.timer_remaining_secs(), Some(3300));
+        assert_eq!(status.timer_remaining_secs_after(1), Some(3299));
+        assert_eq!(status.timer_remaining_secs_after(3300), Some(0));
+        // A stale status parks at zero rather than wrapping around.
+        assert_eq!(status.timer_remaining_secs_after(9999), Some(0));
+
+        // Only a running timer is extrapolated: a paused one is not ticking,
+        // so the answer is the same however long ago we asked.
+        status.timer_mode = "idle".into();
+        assert_eq!(status.timer_remaining_secs_after(10), None);
     }
 
     #[test]

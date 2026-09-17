@@ -10,6 +10,7 @@
 //! — live in [`anova_oven_pico_core::view_plan`] so they can be unit-tested on
 //! the host.
 
+use embassy_time::Instant;
 use embedded_graphics::{pixelcolor::BinaryColor, prelude::*};
 
 use u8g2_fonts::{
@@ -155,7 +156,13 @@ where
     let mx = margin_x(size);
     let content_w = (size.width as i32 - 2 * mx).max(0) as u32;
 
-    let plan = plan_view(view, content_w, |role, s| text_width(theme.font(role), s));
+    // `display_task` re-renders the same `ViewSpec` every animation tick, so
+    // the age of its data is the only input that moves between polls — it is
+    // what lets the cook timer count in real time (see `plan_view`).
+    let age = view.status_age_secs(Instant::now());
+    let plan = plan_view(view, content_w, age, |role, s| {
+        text_width(theme.font(role), s)
+    });
 
     // A plan is sized for its content, not for this panel, so drop the trailing
     // lines that don't fit rather than clipping the last one through the middle
