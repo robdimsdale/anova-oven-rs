@@ -56,6 +56,22 @@ temperature clipped:
 Note that the TFT and the Sharp are the same height but not the same tier:
 `fub35` needs 320 px for a hero the 320-wide panel has only 300 px for.
 
+The **giant** role is the exception to the width rule. It carries one thing —
+the idle temperature, worst case `-888F` — so it is never wrapped and never
+ellipsised, and what bounds it is the height of the centred idle block (giant
+temperature over a hero `Idle`):
+
+| Tier | Giant font | Widest giant vs. content width | Idle block vs. panel height |
+| --- | --- | --- | --- |
+| compact | fub20 | 70 px vs. 120 px | 30 + 19 = 49 px vs. 64 px |
+| middle | fub42 | 152 px vs. 300 px | 63 + 55 = 118 px vs. 240 px |
+| large | fub42 | 152 px vs. 376 px | 63 + 66 = 129 px vs. 240 px |
+
+The two 240-high panels share `fub42` because it is the largest *usable* size,
+not because they ran out of room: `fub49` ships numerals-only and has no `F`.
+Giant fonts are the `_tr` (ASCII) cut rather than `_tf` — no ellipsis ever
+reaches this role, and `_tr`'s tighter default line height shortens the block.
+
 ## 2.42" OLED (Adafruit 2719)
 
 ### Controller variant — read this first
@@ -129,6 +145,10 @@ title, the hero temperature and three detail rows. A cooking status with
 timer, probe, steam *and* phase rows needs one more, so the phase row is
 dropped — `fit_line_count` trims from the end, and the planner orders a top-stacked
 plan by importance, so what goes is what mattered least.
+
+The idle screen is the one this panel has the *most* room for, since it spends
+its whole height on two lines: a fub20 temperature over a 9x18B `Idle`, 49 px
+of the 64 available.
 
 ### Burn-in mitigation
 
