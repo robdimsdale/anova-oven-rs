@@ -20,7 +20,14 @@ use crate::fsm::ViewSpec;
 /// measurement closure must use the *same* mapping so wrap decisions match.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FontRole {
-    /// Largest — the glanceable headline (temperature).
+    /// Larger than [`FontRole::Hero`], and reserved for the idle temperature:
+    /// that line is one short number (`"212F"`, at worst `"-888F"`), never
+    /// wrapped and never ellipsised, so it can be sized far past the width
+    /// budget the hero line has to keep for `"888F -> 888F"`. Renderers may
+    /// back it with a digits-and-uppercase font only — don't put prose in it.
+    Giant,
+    /// Largest of the general-purpose roles — the glanceable headline
+    /// (temperature) on a screen that also carries other rows.
     Hero,
     /// Large — titles and prompts.
     Title,
@@ -368,6 +375,24 @@ where
     };
 
     let cooking = status.is_cooking();
+    let cur = celcius_to_fahrenheit(status.current_temperature_c());
+
+    // Idle is a glance screen, not a readout: nothing is running, so there is
+    // no cook to name and no setpoint to chase. Give the whole panel to the
+    // temperature — [`FontRole::Giant`], centred — with the mode word under
+    // it, and let any detail row the oven still reports follow below.
+    if !cooking {
+        let mut lines = alloc::vec![
+            planline(FontRole::Giant, format!("{cur:.0}F")),
+            planline(FontRole::Hero, String::from(status.phase())),
+        ];
+        push_detail_rows(&mut lines, status, cooking);
+        return ScreenPlan {
+            placement: Placement::Centered,
+            lines,
+        };
+    }
+
     let mut lines = Vec::new();
 
     // Title: cook name, else manual-cook indicator, else the oven mode.
@@ -387,18 +412,24 @@ where
         measure,
     );
 
-    // Hero temperature: current reading, plus the target while actively
-    // cooking. When idle there's no meaningful setpoint, so current only.
-    let cur = celcius_to_fahrenheit(status.current_temperature_c());
+    // Hero temperature: current reading and the target we're heating towards.
     let mut temp = format!("{cur:.0}F");
-    if cooking {
-        if let Some(target_c) = status.target_temperature_c {
-            temp.push_str(&format!(" -> {:.0}F", celcius_to_fahrenheit(target_c)));
-        }
+    if let Some(target_c) = status.target_temperature_c {
+        temp.push_str(&format!(" -> {:.0}F", celcius_to_fahrenheit(target_c)));
     }
     lines.push(planline(FontRole::Hero, temp));
 
-    // Detail rows.
+    push_detail_rows(&mut lines, status, cooking);
+
+    ScreenPlan {
+        placement: Placement::TopStacked,
+        lines,
+    }
+}
+
+/// The rows below the headline, in descending importance — `fit_line_count`
+/// trims from the end, so the order is what a short panel drops first.
+fn push_detail_rows(lines: &mut Vec<PlanLine>, status: &OvenStatus, cooking: bool) {
     if let Some(remaining) = status.timer_remaining_secs() {
         let (h, m, s) = (remaining / 3600, (remaining % 3600) / 60, remaining % 60);
         let timer = if h > 0 {
@@ -424,11 +455,6 @@ where
             FontRole::Body,
             format!("Phase  {}", status.phase()),
         ));
-    }
-
-    ScreenPlan {
-        placement: Placement::TopStacked,
-        lines,
     }
 }
 
@@ -493,19 +519,44 @@ mod tests {
     }
 
     #[test]
-    fn idle_status_shows_current_only_and_no_phase() {
+    fn idle_status_is_a_centered_giant_temperature_over_the_mode() {
         let view = ViewSpec::Status {
             status: Some(oven("idle")),
             cook: None,
         };
         let plan = plan_view(&view, 300, measure);
 
-        assert_eq!(plan.placement, Placement::TopStacked);
-        // Title (mode) + hero current temperature, nothing else: no target on
-        // the hero line, and no redundant "Phase Idle" row.
+        // The whole panel goes to the temperature: giant and centred, with
+        // "Idle" under it. No setpoint on the temperature line (there is none
+        // when nothing is running) and no title row repeating the mode.
+        assert_eq!(plan.placement, Placement::Centered);
         assert_eq!(
             plan.lines,
-            [pl(FontRole::Title, "idle"), pl(FontRole::Hero, "212F")]
+            [pl(FontRole::Giant, "212F"), pl(FontRole::Hero, "Idle")]
+        );
+    }
+
+    #[test]
+    fn idle_status_keeps_a_probe_reading_below_the_mode() {
+        let mut status = oven("idle");
+        status.probe_temperature_c = Some(60.0); // 140F
+        let plan = plan_view(
+            &ViewSpec::Status {
+                status: Some(status),
+                cook: None,
+            },
+            300,
+            measure,
+        );
+
+        // A probe left in the oven still reads while idle, so it keeps its row.
+        assert_eq!(
+            plan.lines,
+            [
+                pl(FontRole::Giant, "212F"),
+                pl(FontRole::Hero, "Idle"),
+                pl(FontRole::Body, "Probe  140F"),
+            ]
         );
     }
 
@@ -545,10 +596,14 @@ mod tests {
         assert_eq!(lines, ["aa bb", "cc d…"]);
     }
 
-    /// Fake metrics: Hero 20/16, Title 12/10, Body 10/8 (line/ink), so a
-    /// trailing line's 2px of leading is allowed to overhang.
+    /// Fake metrics: Giant 30/24, Hero 20/16, Title 12/10, Body 10/8
+    /// (line/ink), so a trailing line's leading is allowed to overhang.
     fn metrics(role: FontRole) -> LineMetrics {
         match role {
+            FontRole::Giant => LineMetrics {
+                line_height: 30,
+                ink_height: 24,
+            },
             FontRole::Hero => LineMetrics {
                 line_height: 20,
                 ink_height: 16,
