@@ -224,6 +224,10 @@ pub enum ViewSpec {
     Status {
         status: Option<anova_oven_api::OvenStatus>,
         cook: Option<anova_oven_api::CurrentCook>,
+        /// When `status` was last fetched from the server, so the renderer can
+        /// tell how stale the readings in it are. `None` before the first
+        /// successful poll. See [`ViewSpec::status_age_secs`].
+        fetched_at: Option<Instant>,
     },
     RecipeBrowser {
         count: usize,
@@ -245,6 +249,27 @@ pub enum ViewSpec {
         panic_count: u32,
         message: Option<String>,
     },
+}
+
+impl ViewSpec {
+    /// How long ago the server data behind this view was fetched, in whole
+    /// seconds. Zero for the views that carry none, and for a status that
+    /// predates the first successful poll.
+    ///
+    /// Renderers hand this to `view_plan::plan_view`, which uses it to
+    /// extrapolate a running cook timer (see
+    /// [`anova_oven_api::OvenStatus::timer_remaining_secs_after`]) — the
+    /// display task re-renders the same `ViewSpec` every animation tick, so
+    /// this is what makes a between-polls tick show a different number.
+    pub fn status_age_secs(&self, now: Instant) -> u64 {
+        match self {
+            ViewSpec::Status {
+                fetched_at: Some(fetched_at),
+                ..
+            } => now.saturating_duration_since(*fetched_at).as_secs(),
+            _ => 0,
+        }
+    }
 }
 
 /// Decide which "base" state to enter when arriving from an unrelated state
@@ -271,6 +296,7 @@ pub fn idle_view(snap: &ApiSnapshot) -> ViewSpec {
         ViewSpec::Status {
             status: snap.status.clone(),
             cook: snap.current_cook.clone(),
+            fetched_at: snap.last_success_at,
         }
     }
 }
@@ -303,6 +329,7 @@ pub fn cooking_view(snap: &ApiSnapshot, optimistic_recipe_title: Option<&str>) -
     ViewSpec::Status {
         status: snap.status.clone(),
         cook,
+        fetched_at: snap.last_success_at,
     }
 }
 
@@ -321,7 +348,11 @@ pub fn optimistic_idle_view(snap: &ApiSnapshot) -> ViewSpec {
         optimistic
     });
 
-    ViewSpec::Status { status, cook: None }
+    ViewSpec::Status {
+        status,
+        cook: None,
+        fetched_at: snap.last_success_at,
+    }
 }
 
 /// If the server has flagged that the next stage is ready (multi-stage
@@ -733,6 +764,38 @@ mod tests {
         }
     }
 
+    // --- status_age_secs ---
+
+    #[test]
+    fn status_age_is_measured_from_the_last_successful_poll() {
+        let mut snap = snapshot();
+        snap.status = Some(idle_status());
+        snap.last_success_at = Some(Instant::from_secs(100));
+
+        let view = idle_view(&snap);
+        assert_eq!(view.status_age_secs(Instant::from_secs(100)), 0);
+        assert_eq!(view.status_age_secs(Instant::from_secs(107)), 7);
+        // A clock that appears to run backwards (it can't, but the type
+        // allows it) reads as fresh rather than as a huge age.
+        assert_eq!(view.status_age_secs(Instant::from_secs(90)), 0);
+    }
+
+    #[test]
+    fn status_age_is_zero_without_a_fetch_or_a_status_view() {
+        let mut snap = snapshot();
+        snap.status = Some(idle_status());
+        // has_first_data() is false, so this is the Connecting placeholder —
+        // no server data behind it to age.
+        assert_eq!(idle_view(&snap).status_age_secs(Instant::from_secs(100)), 0);
+
+        snap.last_success_at = Some(Instant::from_secs(10));
+        snap.current_cook = None;
+        assert_eq!(
+            ViewSpec::ServerOffline.status_age_secs(Instant::from_secs(100)),
+            0
+        );
+    }
+
     // --- optimistic_idle_view ---
 
     #[test]
@@ -748,6 +811,7 @@ mod tests {
             ViewSpec::Status {
                 status: Some(s),
                 cook,
+                ..
             } => {
                 assert_eq!(s.mode.as_str(), IDLE);
                 assert_eq!(s.timer_mode.as_str(), IDLE);
@@ -764,7 +828,7 @@ mod tests {
     fn optimistic_idle_with_no_status_yields_none() {
         let snap = snapshot();
         match optimistic_idle_view(&snap) {
-            ViewSpec::Status { status, cook } => {
+            ViewSpec::Status { status, cook, .. } => {
                 assert!(status.is_none());
                 assert!(cook.is_none());
             }

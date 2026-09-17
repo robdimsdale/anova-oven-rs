@@ -37,6 +37,14 @@ layout code should not need to change beyond possibly a font tier:
 `graphics_view` picks its tier from the panel's reported size, and trims
 trailing lines that don't fit.
 
+`display_task` re-renders the current `ViewSpec` every 50 ms animation tick,
+not just when a new one arrives, and the planner is handed the *age* of the
+view's server data (`ViewSpec::status_age_secs`) alongside it. That is what
+makes a running cook timer tick: the row is counted down from the fetch time
+(`OvenStatus::timer_remaining_secs_after`) rather than printed off the wire, so
+it moves every second and every poll re-anchors it. Nothing else on the screen
+is extrapolated — a temperature we have not been told about has not changed.
+
 Every graphical driver here is a **1-bit** `DrawTarget`, including the colour
 TFT. That is not an oversight — see the TFT section below for why, and for what
 colour the panel does get.
