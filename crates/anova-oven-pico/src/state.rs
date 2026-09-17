@@ -6,7 +6,7 @@ use embassy_time::{Duration, Instant, Timer};
 
 use anova_oven_pico_core::fsm::{
     active_recipe_title, baseline_state_for, cooking_view, idle_view, next_stage_prompt,
-    optimistic_idle_view, ViewSpec,
+    optimistic_idle_view, recipe_browser_view, ViewSpec,
 };
 pub use anova_oven_pico_core::fsm::{AppState, BacklightPolicy};
 
@@ -259,11 +259,8 @@ async fn execute_browse(mut index: usize, ctx: &mut Ctx<'_>) -> AppState {
         }
 
         index = index.min(snap.recipes.len() - 1);
-        ctx.display.render(ViewSpec::RecipeBrowser {
-            count: snap.recipes.len(),
-            index,
-            title: snap.recipes[index].title.clone(),
-        });
+        ctx.display
+            .render(recipe_browser_view(&snap.recipes, index));
 
         match select3(ctx.input.recv(), ctx.api_changed(), Timer::at(deadline)).await {
             Either3::First(InputEvent::EncoderCW) => {
