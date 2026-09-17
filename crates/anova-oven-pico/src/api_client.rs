@@ -292,7 +292,7 @@ impl<'a> ApiRuntime<'a> {
         .await
         {
             Ok(Ok(status)) => {
-                self.snapshot.status = Some(status);
+                self.snapshot.install_status(status, Instant::now());
                 self.record_fast_poll_success();
             }
             Ok(Err(_)) => {
