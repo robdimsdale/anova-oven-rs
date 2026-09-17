@@ -5,6 +5,8 @@ use alloc::vec::Vec;
 use embassy_rp::gpio::Output;
 use embassy_time::{Delay, Duration, Instant};
 
+use anova_oven_pico_core::view_plan::recipe_browser_header;
+
 use crate::api::celcius_to_fahrenheit;
 use crate::display::{DisplayBackend, ViewSpec};
 
@@ -121,11 +123,13 @@ impl LcdController {
                 .await;
             }
             ViewSpec::RecipeBrowser {
+                source,
                 count,
                 index,
                 title,
             } => {
-                self.render_recipe_browser(*count, *index, title).await;
+                self.render_recipe_browser(*source, *count, *index, title)
+                    .await;
             }
             ViewSpec::StopConfirmation { status, cook } => {
                 self.render_stop_confirmation(status.as_ref(), cook.as_ref())
@@ -313,14 +317,20 @@ impl LcdController {
         }
     }
 
-    async fn render_recipe_browser(&mut self, count: usize, index: usize, title: &str) {
+    async fn render_recipe_browser(
+        &mut self,
+        source: anova_oven_api::RecipeSource,
+        count: usize,
+        index: usize,
+        title: &str,
+    ) {
         if count == 0 {
             self.write_row(0, "No recipes").await;
             self.write_row(1, "").await;
             return;
         }
 
-        let header = alloc::format!("Recipe {}/{}", index + 1, count);
+        let header = recipe_browser_header(source, index, count);
         self.write_row(0, &header).await;
         self.write_row(1, title).await;
     }

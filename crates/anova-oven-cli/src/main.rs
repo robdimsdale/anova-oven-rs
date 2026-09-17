@@ -10,7 +10,7 @@
 //! anova-oven-cli history
 //! ```
 
-use anova_oven_api::{CurrentCook, HistoryEntry, OvenStatus, Recipe};
+use anova_oven_api::{CurrentCook, HistoryEntry, OvenStatus, Recipe, RecipeSource};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -178,6 +178,13 @@ fn print_status(s: &OvenStatus) {
 fn print_recipe(r: &Recipe) {
     println!("{}", r.title);
     println!("  ID:     {}", r.id);
+    println!(
+        "  Source: {}",
+        match r.source {
+            RecipeSource::Own => "mine",
+            RecipeSource::Bookmarked => "bookmark",
+        }
+    );
     println!("  Stages: {}", r.stage_count);
     for (i, stage) in r.stages.iter().enumerate() {
         print_stage(i, stage);

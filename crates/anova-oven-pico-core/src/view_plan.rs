@@ -11,10 +11,21 @@
 
 use alloc::{format, string::String, vec::Vec};
 
-use anova_oven_api::{CurrentCook, OvenStatus};
+use anova_oven_api::{CurrentCook, OvenStatus, RecipeSource};
 
 use crate::api::celcius_to_fahrenheit;
 use crate::fsm::ViewSpec;
+
+/// The recipe browser's header, e.g. "My recipe 2/3" or "Bookmark 1/4".
+/// `index` is zero-based within the recipes of `source`. Kept to 16 chars for
+/// up to 99 of each so it fits the character LCD without scrolling.
+pub fn recipe_browser_header(source: RecipeSource, index: usize, count: usize) -> String {
+    let label = match source {
+        RecipeSource::Own => "My recipe",
+        RecipeSource::Bookmarked => "Bookmark",
+    };
+    format!("{label} {}/{}", index + 1, count)
+}
 
 /// Which font a line uses. The renderer maps these to concrete fonts, and its
 /// measurement closure must use the *same* mapping so wrap decisions match.
@@ -295,6 +306,7 @@ where
             }
         }
         ViewSpec::RecipeBrowser {
+            source,
             count,
             index,
             title,
@@ -308,7 +320,7 @@ where
                 let mut lines = Vec::new();
                 lines.push(planline(
                     FontRole::Body,
-                    format!("Recipe {}/{}", index + 1, count),
+                    recipe_browser_header(*source, *index, *count),
                 ));
                 push_wrapped(
                     &mut lines,
@@ -766,6 +778,7 @@ mod tests {
     fn recipe_browser_empty_vs_populated() {
         let empty = plan_view(
             &ViewSpec::RecipeBrowser {
+                source: RecipeSource::Own,
                 count: 0,
                 index: 0,
                 title: String::new(),
@@ -779,6 +792,7 @@ mod tests {
 
         let populated = plan_view(
             &ViewSpec::RecipeBrowser {
+                source: RecipeSource::Bookmarked,
                 count: 3,
                 index: 0,
                 title: String::from("Cake"),
@@ -791,9 +805,23 @@ mod tests {
         assert_eq!(
             populated.lines,
             [
-                pl(FontRole::Body, "Recipe 1/3"),
+                pl(FontRole::Body, "Bookmark 1/3"),
                 pl(FontRole::Title, "Cake")
             ]
         );
+    }
+
+    #[test]
+    fn recipe_browser_header_labels_each_source() {
+        assert_eq!(
+            recipe_browser_header(RecipeSource::Own, 1, 3),
+            "My recipe 2/3"
+        );
+        assert_eq!(
+            recipe_browser_header(RecipeSource::Bookmarked, 0, 4),
+            "Bookmark 1/4"
+        );
+        // The longest two-digit header still fits a 16-column LCD row.
+        assert!(recipe_browser_header(RecipeSource::Own, 98, 99).len() <= 16);
     }
 }

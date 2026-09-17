@@ -233,6 +233,21 @@ pub struct Recipe {
     /// Number of cook stages (convenience field for list views).
     pub stage_count: usize,
     pub stages: Vec<Stage>,
+    /// Whether the user wrote this recipe or bookmarked someone else's.
+    /// Defaults to [`RecipeSource::Own`] so older servers still parse.
+    #[serde(default)]
+    pub source: RecipeSource,
+}
+
+/// Where a [`Recipe`] in the user's list came from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecipeSource {
+    /// A recipe the user created.
+    #[default]
+    Own,
+    /// Someone else's recipe the user bookmarked.
+    Bookmarked,
 }
 
 /// A single cook stage within a recipe.
@@ -524,6 +539,7 @@ mod tests {
             id: "abc123".into(),
             title: "Roast Chicken".into(),
             stage_count: 2,
+            source: RecipeSource::Bookmarked,
             stages: vec![
                 Stage {
                     id: None,
@@ -570,6 +586,15 @@ mod tests {
         assert_eq!(parsed.id, "abc123");
         assert_eq!(parsed.stages.len(), 2);
         assert_eq!(parsed.stages[1].duration_secs, Some(3600));
+        assert_eq!(parsed.source, RecipeSource::Bookmarked);
+        assert!(json.contains(r#""source":"bookmarked""#));
+    }
+
+    #[test]
+    fn recipe_without_source_defaults_to_own() {
+        let json = r#"{"id":"a","title":"T","stage_count":0,"stages":[]}"#;
+        let parsed: Recipe = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.source, RecipeSource::Own);
     }
 
     #[test]
