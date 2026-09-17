@@ -221,9 +221,7 @@ fn print_current_cook(c: &CurrentCook, status: Option<&OvenStatus>) {
         }
         if let Some(probe_c) = s.probe_temperature_c {
             let probe_target = s
-                .cook_progress
-                .as_ref()
-                .and_then(|p| c.stages.get(p.current_stage_index))
+                .current_stage(&c.stages)
                 .and_then(|stage| stage.probe_target_c);
             if let Some(target) = probe_target {
                 println!(

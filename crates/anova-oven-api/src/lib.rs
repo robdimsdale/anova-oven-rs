@@ -194,6 +194,30 @@ impl OvenStatus {
         }
     }
 
+    /// Which of `stages` this status is reporting on, if it can be resolved.
+    ///
+    /// Two sources, most authoritative first:
+    ///
+    /// 1. [`Self::cook_progress`], the server's tracked index. That tracker
+    ///    already prefers the oven's own `activeStageIndex` and falls back to a
+    ///    heuristic of its own, so it is the best answer available.
+    /// 2. [`Self::active_stage_index`] raw, for a status read before the
+    ///    tracker has caught up (mid-startup, or the first poll of a cook).
+    ///
+    /// `None` when neither is present, or when the index is out of range for
+    /// `stages` — a cook whose stage list has not been fetched yet, say.
+    /// Callers should degrade to what they can say without naming a stage
+    /// rather than guessing, because guessing is what this replaced: matching
+    /// on [`Stage::kind`] silently picks the wrong stage in any cook with two
+    /// stages of the same kind.
+    pub fn current_stage<'a>(&self, stages: &'a [Stage]) -> Option<&'a Stage> {
+        self.cook_progress
+            .as_ref()
+            .map(|p| p.current_stage_index)
+            .or(self.active_stage_index)
+            .and_then(|i| stages.get(i))
+    }
+
     /// Seconds left on the timer as of the moment this status was read from
     /// the oven — the same direction the oven's own panel counts. `None` if no
     /// timer is running.
@@ -440,17 +464,6 @@ impl CurrentCook {
             &self.recipe_title
         }
     }
-
-    /// Find the stage matching the oven's current phase.
-    ///
-    /// This heuristic is broken for multi-stage cooks where multiple stages
-    /// share the same [`Stage::kind`]. Prefer reading
-    /// [`OvenStatus::cook_progress`] (`current_stage_index`) when available.
-    #[deprecated(note = "use OvenStatus:: instead")]
-    pub fn current_stage(&self, status: &OvenStatus) -> Option<&Stage> {
-        let kind = status.stage_kind();
-        self.stages.iter().find(|s| s.kind == kind)
-    }
 }
 
 #[cfg(test)]
@@ -531,6 +544,102 @@ mod tests {
         // so the answer is the same however long ago we asked.
         status.timer_mode = "idle".into();
         assert_eq!(status.timer_remaining_secs_after(10), None);
+    }
+
+    /// A stage carrying only the fields the resolver's callers read back.
+    fn stage(kind: &str, title: &str) -> Stage {
+        Stage {
+            id: None,
+            kind: kind.into(),
+            temperature_c: 200.0,
+            temperature_bulbs_mode: None,
+            duration_secs: None,
+            timer_added: None,
+            probe_added: None,
+            probe_target_c: None,
+            steam_pct: 0.0,
+            fan_speed: 100,
+            user_action_required: None,
+            rack_position: None,
+            heating_element_top: None,
+            heating_element_rear: None,
+            heating_element_bottom: None,
+            vent_open: None,
+            title: Some(title.into()),
+        }
+    }
+
+    fn progress_at(index: usize) -> CookProgress {
+        CookProgress {
+            recipe_title: "Roast Chicken".into(),
+            current_stage_index: index,
+            total_stage_count: 3,
+            current_stage_description: "stage".into(),
+            current_stage_kind: "cook".into(),
+            next_stage_ready: false,
+            next_stage_description: None,
+        }
+    }
+
+    /// Preheat, then *two* cook stages — the shape the old kind-matching
+    /// heuristic got wrong, since both of the last two are `"cook"`.
+    fn three_stages() -> Vec<Stage> {
+        vec![
+            stage("preheat", "Preheat"),
+            stage("cook", "Sear"),
+            stage("cook", "Rest"),
+        ]
+    }
+
+    #[test]
+    fn current_stage_reads_the_tracked_index() {
+        let mut status = cooking_status();
+        status.cook_progress = Some(progress_at(2));
+        // Kind-matching would have stopped at "Sear", the first `"cook"` stage.
+        assert_eq!(
+            status.current_stage(&three_stages()).unwrap().title,
+            Some("Rest".into())
+        );
+    }
+
+    #[test]
+    fn current_stage_prefers_the_tracker_over_the_ovens_raw_index() {
+        let mut status = cooking_status();
+        // The tracker has advanced; the oven's own field lags a poll behind.
+        status.cook_progress = Some(progress_at(2));
+        status.active_stage_index = Some(1);
+        assert_eq!(
+            status.current_stage(&three_stages()).unwrap().title,
+            Some("Rest".into())
+        );
+    }
+
+    #[test]
+    fn current_stage_falls_back_to_the_ovens_raw_index() {
+        let mut status = cooking_status();
+        // No tracker yet — mid-startup, or the first poll of a cook.
+        status.active_stage_index = Some(1);
+        assert_eq!(
+            status.current_stage(&three_stages()).unwrap().title,
+            Some("Sear".into())
+        );
+    }
+
+    #[test]
+    fn current_stage_is_unresolved_when_nothing_reports_an_index() {
+        let status = cooking_status();
+        // Better than guessing: callers degrade to what they can say without
+        // naming a stage.
+        assert!(status.current_stage(&three_stages()).is_none());
+    }
+
+    #[test]
+    fn current_stage_is_unresolved_when_the_index_is_out_of_range() {
+        let mut status = cooking_status();
+        status.cook_progress = Some(progress_at(7));
+        assert!(status.current_stage(&three_stages()).is_none());
+        // Notably including a cook whose stages haven't been fetched yet.
+        assert!(status.current_stage(&[]).is_none());
     }
 
     #[test]
