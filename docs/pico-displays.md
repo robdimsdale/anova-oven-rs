@@ -69,13 +69,14 @@ the idle temperature, worst case `-888F` — so it is never wrapped and never
 ellipsised, and what bounds it is the height of the centred idle block (giant
 temperature over a hero `Idle`):
 
-`graphics_view` draws a giant line as **two fonts on one baseline**: the
-digits large, the unit letter at about half their cap height, placed as a
-single block so centring centres the whole temperature. That is how the oven's
-own panel sets it, and it has a practical payoff — the digits no longer need a
-font with letters in it, so they can use the `_tn` (numerals-only) cut, which
-is both the largest size each family ships and the tightest, since a font whose
-glyphs are all digits has a line box to match.
+`graphics_view` draws a giant line as **two fonts sharing a top edge**: the
+digits large, the unit letter at about half their cap height and hung from the
+top of the line, level with the tops of the digits. The pair is placed as a
+single block, so centring centres the whole temperature. Besides reading the
+way a unit beside a big number should, it has a practical payoff — the digits
+no longer need a font with letters in it, so they can use the `_tn`
+(numerals-only) cut, which is both the largest size each family ships and the
+tightest, since a font whose glyphs are all digits has a line box to match.
 
 | Tier | Giant / unit | Widest giant vs. content width | Idle block vs. panel height |
 | --- | --- | --- | --- |
