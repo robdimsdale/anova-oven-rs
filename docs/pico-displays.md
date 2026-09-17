@@ -69,20 +69,57 @@ the idle temperature, worst case `-888F` — so it is never wrapped and never
 ellipsised, and what bounds it is the height of the centred idle block (giant
 temperature over a hero `Idle`):
 
-| Tier | Giant font | Widest giant vs. content width | Idle block vs. panel height |
+`graphics_view` draws a giant line as **two fonts on one baseline**: the
+digits large, the unit letter at about half their cap height, placed as a
+single block so centring centres the whole temperature. That is how the oven's
+own panel sets it, and it has a practical payoff — the digits no longer need a
+font with letters in it, so they can use the `_tn` (numerals-only) cut, which
+is both the largest size each family ships and the tightest, since a font whose
+glyphs are all digits has a line box to match.
+
+| Tier | Giant / unit | Widest giant vs. content width | Idle block vs. panel height |
 | --- | --- | --- | --- |
-| compact | fub20 | 70 px vs. 120 px | 30 + 19 = 49 px vs. 64 px |
-| middle | logisoso58 | 186 px vs. 300 px | 86 + 55 = 141 px vs. 240 px |
-| large | logisoso58 | 186 px vs. 376 px | 86 + 66 = 152 px vs. 240 px |
+| compact | fub25_tn / t0_11b | 74 px vs. 120 px | 32 + 19 = 51 px vs. 64 px |
+| middle | fub49_tn / fub20 | 155 px vs. 300 px | 60 + 55 = 115 px vs. 240 px |
+| large | fub49_tn / fub25 | 159 px vs. 376 px | 60 + 66 = 126 px vs. 240 px |
 
-The two 240-high panels share `logisoso58` because it is the largest *usable*
-size, not because they ran out of room: it is the biggest font in the crate
-that still has an `F` in it, and everything larger (`fub49`, `logisoso62` and
-up) is numerals-only. The compact tier, by contrast, is a genuine height
-budget — one step up from fub20 is a 66 px block for a 64 px panel.
+`fub49` is where FreeUniversal Bold stops. The crate does ship taller faces —
+logisoso runs to 92 — but they are drawn narrow, so a temperature set in one
+looks stretched beside the rest of the screen rather than bigger. The digits
+are therefore capped by the *catalogue*, not by the panel: a 240-high panel
+would carry a number three times this size.
 
-Giant fonts are the `_tr` (ASCII) cut rather than `_tf` — no ellipsis ever
-reaches this role, and `_tr`'s tighter default line height shortens the block.
+### Going bigger than the catalogue: glyphs of our own
+
+`u8g2_fonts::Font` is a public trait whose only item is `const DATA: &'static
+[u8]`, so a font of our own is a unit struct and a byte slice — no fork, and
+`FontRenderer::new::<OurDigits>()` then works like any other font:
+
+```rust
+pub struct OvenDigits;
+impl u8g2_fonts::Font for OvenDigits {
+    const DATA: &'static [u8] = include_bytes!("../fonts/oven_digits.u8g2font");
+}
+```
+
+The work is producing that payload for the ~13 glyphs this screen needs
+(`0`–`9`, `-`, `F`, `C`). Two routes:
+
+- **u8g2 format.** Generate a BDF at the size we want and run u8g2's own
+  `bdfconv` over it. The format is a 23-byte header plus per-glyph RLE, and the
+  header's metrics are `i8`, which caps a glyph at 127 px — still 2.5x what we
+  have now. Writing the encoder ourselves instead is a day's fiddly work, but
+  it is verifiable: this crate's reader is the spec, so a host test can
+  round-trip every glyph.
+- **Skip the font layer.** The giant line is already special-cased in
+  `draw_line`, so it could just as well draw `ImageRaw<BinaryColor>` bitmaps
+  from a generated table. No format work, no 127 px cap, full control of
+  proportions and letter-spacing. Cost is about 1.3 KB per 120 px glyph, so
+  ~17 KB of the 2 MB flash for the set.
+
+Either way the glyphs themselves come from a typeface we can redistribute, and
+the generator (a script that rasterises a TTF) belongs in `scripts/` with its
+output checked in, so a normal build needs no font toolchain.
 
 ## 2.42" OLED (Adafruit 2719)
 
@@ -159,9 +196,9 @@ dropped — `fit_line_count` trims from the end, and the planner orders a top-st
 plan by importance, so what goes is what mattered least.
 
 The idle screen is the one this panel has the *most* room for, since it spends
-its whole height on two lines: a fub20 temperature over a 9x18B `Idle`, 49 px
+its whole height on two lines: a fub25 temperature over a 9x18B `Idle`, 51 px
 of the 64 available. It is also the one tier whose giant font is capped by the
-panel rather than by the font catalogue.
+panel rather than by the font catalogue — one size up would need 66 px.
 
 ### Burn-in mitigation
 
