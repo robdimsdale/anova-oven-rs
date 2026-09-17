@@ -34,6 +34,9 @@ const PAPER: BinaryColor = BinaryColor::Off;
 /// renderers; the same mapping backs the wrap-measurement closure below.
 struct Theme {
     giant: FontRenderer,
+    /// The unit letter on a [`FontRole::Giant`] line, set a size down on the
+    /// digits' own baseline — see [`draw_line`].
+    giant_unit: FontRenderer,
     hero: FontRenderer,
     title: FontRenderer,
     body: FontRenderer,
@@ -71,29 +74,30 @@ impl Theme {
 /// instead (9x18B over 9x15B, same width). Vertical room is the softer
 /// constraint: [`fit_line_count`] drops detail rows that don't fit.
 ///
-/// The *giant* role escapes that budget: it only ever carries the idle
-/// temperature, whose worst case is `"-888F"`, so it is sized by height —
-/// what the centred idle block (giant + hero) can stand on the panel:
+/// The *giant* role escapes that budget. It only ever carries the idle
+/// temperature, and [`draw_line`] splits that into digits and unit, so the
+/// digits can use a `_tn` (numerals-only) font — the biggest cut of each
+/// family, and the tightest, since a font whose glyphs are all digits has a
+/// line box to match. What bounds it is the height of the centred idle block
+/// (giant over hero) on the panel:
 ///
-/// | Tier | Giant | Widest giant vs. content | Idle block vs. panel height |
+/// | Tier | Giant / unit | Widest giant vs. content | Idle block vs. panel height |
 /// | --- | --- | --- | --- |
-/// | compact | fub20 | 70px vs. 120px | 30 + 19 = 49px vs. 64px |
-/// | middle | logisoso58 | 186px vs. 300px | 86 + 55 = 141px vs. 240px |
-/// | large | logisoso58 | 186px vs. 376px | 86 + 66 = 152px vs. 240px |
+/// | compact | fub25_tn / t0_11b | 74px vs. 120px | 32 + 19 = 51px vs. 64px |
+/// | middle | fub49_tn / fub20 | 155px vs. 300px | 60 + 55 = 115px vs. 240px |
+/// | large | fub49_tn / fub25 | 159px vs. 376px | 60 + 66 = 126px vs. 240px |
 ///
-/// `logisoso58` is the ceiling on the two 240-high panels rather than a budget
-/// they filled: it is the largest font in the crate that still carries an `F`.
-/// Everything above it — `fub49`, `logisoso62` and up — ships numerals-only.
-/// The compact tier is a real height budget: one step up (fub25) makes a 66px
-/// block for a 64px panel.
-///
-/// The giant fonts are the `_tr` (ASCII) cut — the role never carries an
-/// ellipsis, so the `_tf` glyph set buys nothing, and `_tr`'s tighter default
-/// line height makes the idle block shorter into the bargain.
+/// `fub49` is where the FreeUniversal Bold family stops; the crate has taller
+/// faces (logisoso up to 92) but they are drawn narrow, and a temperature set
+/// in one looks stretched next to the rest of the screen. Going meaningfully
+/// larger than this means glyphs of our own — see `docs/pico-displays.md`.
+/// The unit is paired at about half the digits' cap height.
 fn theme_for(size: Size) -> Theme {
     if size.width < 200 || size.height < 120 {
         Theme {
-            giant: FontRenderer::new::<fonts::u8g2_font_fub20_tr>().with_ignore_unknown_chars(true),
+            giant: FontRenderer::new::<fonts::u8g2_font_fub25_tn>().with_ignore_unknown_chars(true),
+            giant_unit: FontRenderer::new::<fonts::u8g2_font_t0_11b_tf>()
+                .with_ignore_unknown_chars(true),
             hero: FontRenderer::new::<fonts::u8g2_font_9x18B_tf>().with_ignore_unknown_chars(true),
             title: FontRenderer::new::<fonts::u8g2_font_t0_11b_tf>()
                 .with_ignore_unknown_chars(true),
@@ -101,7 +105,8 @@ fn theme_for(size: Size) -> Theme {
         }
     } else if size.width < 360 {
         Theme {
-            giant: FontRenderer::new::<fonts::u8g2_font_logisoso58_tr>()
+            giant: FontRenderer::new::<fonts::u8g2_font_fub49_tn>().with_ignore_unknown_chars(true),
+            giant_unit: FontRenderer::new::<fonts::u8g2_font_fub20_tf>()
                 .with_ignore_unknown_chars(true),
             hero: FontRenderer::new::<fonts::u8g2_font_fub30_tf>().with_ignore_unknown_chars(true),
             title: FontRenderer::new::<fonts::u8g2_font_fub20_tf>().with_ignore_unknown_chars(true),
@@ -110,7 +115,8 @@ fn theme_for(size: Size) -> Theme {
         }
     } else {
         Theme {
-            giant: FontRenderer::new::<fonts::u8g2_font_logisoso58_tr>()
+            giant: FontRenderer::new::<fonts::u8g2_font_fub49_tn>().with_ignore_unknown_chars(true),
+            giant_unit: FontRenderer::new::<fonts::u8g2_font_fub25_tf>()
                 .with_ignore_unknown_chars(true),
             hero: FontRenderer::new::<fonts::u8g2_font_fub35_tf>().with_ignore_unknown_chars(true),
             title: FontRenderer::new::<fonts::u8g2_font_fub25_tf>().with_ignore_unknown_chars(true),
@@ -151,6 +157,92 @@ fn text_width(font: &FontRenderer, s: &str) -> u32 {
         .unwrap_or(0)
 }
 
+/// Split a temperature into the number and its unit: `"212F"` -> `("212",
+/// "F")`, `"-40C"` -> `("-40", "C")`. A string with no unit letter is all
+/// number, which is also what keeps the digits-only fonts below honest — the
+/// number half is exactly what a `_tn` face can render.
+fn split_temperature(s: &str) -> (&str, &str) {
+    match s.find(|c: char| c.is_ascii_alphabetic()) {
+        Some(i) => s.split_at(i),
+        None => (s, ""),
+    }
+}
+
+/// Rendered width of a plan line, which for [`FontRole::Giant`] is its two
+/// pieces measured in their own fonts. Backs the planner's wrap measurement,
+/// so a wrap decision sees the width the line will actually be drawn at.
+fn line_width(theme: &Theme, role: FontRole, s: &str) -> u32 {
+    if role == FontRole::Giant {
+        let (number, unit) = split_temperature(s);
+        text_width(&theme.giant, number) + text_width(&theme.giant_unit, unit)
+    } else {
+        text_width(theme.font(role), s)
+    }
+}
+
+/// Draw one plan line with its top edge at `y`, placed horizontally about `x`
+/// by `align`.
+///
+/// A [`FontRole::Giant`] line is a temperature, and it is set the way the
+/// oven's own panel sets one: the digits large, the unit letter about half
+/// that, both sitting on the same baseline so the unit reads as a suffix
+/// rather than as a second, smaller word. The pair is placed as one block, so
+/// centring centres the whole temperature, not the digits with the unit hung
+/// off the side.
+fn draw_line<D>(
+    t: &mut D,
+    theme: &Theme,
+    line: &PlanLine,
+    x: i32,
+    y: i32,
+    align: HorizontalAlignment,
+) where
+    D: DrawTarget<Color = BinaryColor>,
+{
+    if line.role != FontRole::Giant {
+        let _ = theme.font(line.role).render_aligned(
+            line.text.as_str(),
+            Point::new(x, y),
+            VerticalPosition::Top,
+            align,
+            FontColor::Transparent(INK),
+            t,
+        );
+        return;
+    }
+
+    let (number, unit) = split_temperature(&line.text);
+    let number_w = text_width(&theme.giant, number) as i32;
+    let unit_w = text_width(&theme.giant_unit, unit) as i32;
+    let left = match align {
+        HorizontalAlignment::Left => x,
+        HorizontalAlignment::Center => x - (number_w + unit_w) / 2,
+        HorizontalAlignment::Right => x - (number_w + unit_w),
+    };
+    // Where a `VerticalPosition::Top` draw of the giant font would have put
+    // its baseline, so a giant line occupies the same box as any other line.
+    let baseline = y + theme.giant.get_ascent() as i32 + 1;
+
+    let _ = theme.giant.render_aligned(
+        number,
+        Point::new(left, baseline),
+        VerticalPosition::Baseline,
+        HorizontalAlignment::Left,
+        FontColor::Transparent(INK),
+        t,
+    );
+    if !unit.is_empty() {
+        let _ = theme.giant_unit.render_aligned(
+            unit,
+            Point::new(left + number_w, baseline),
+            VerticalPosition::Baseline,
+            HorizontalAlignment::Left,
+            FontColor::Transparent(INK),
+            t,
+        );
+    }
+}
+
 /// Render `view` into `t`, laid out for `t`'s current dimensions.
 pub fn render_view<D>(t: &mut D, view: &ViewSpec)
 where
@@ -166,9 +258,7 @@ where
     // the age of its data is the only input that moves between polls — it is
     // what lets the cook timer count in real time (see `plan_view`).
     let age = view.status_age_secs(Instant::now());
-    let plan = plan_view(view, content_w, age, |role, s| {
-        text_width(theme.font(role), s)
-    });
+    let plan = plan_view(view, content_w, age, |role, s| line_width(&theme, role, s));
 
     // A plan is sized for its content, not for this panel, so drop the trailing
     // lines that don't fit rather than clipping the last one through the middle
@@ -196,16 +286,8 @@ where
     let cx = (size.width as i32) / 2;
     let mut y = ((size.height as i32) - total) / 2;
     for l in lines {
-        let font = theme.font(l.role);
-        let _ = font.render_aligned(
-            l.text.as_str(),
-            Point::new(cx, y),
-            VerticalPosition::Top,
-            HorizontalAlignment::Center,
-            FontColor::Transparent(INK),
-            t,
-        );
-        y += line_height(font);
+        draw_line(t, theme, l, cx, y, HorizontalAlignment::Center);
+        y += line_height(theme.font(l.role));
     }
 }
 
@@ -216,15 +298,7 @@ where
 {
     let mut y = margin_top(size);
     for l in lines {
-        let font = theme.font(l.role);
-        let _ = font.render_aligned(
-            l.text.as_str(),
-            Point::new(mx, y),
-            VerticalPosition::Top,
-            HorizontalAlignment::Left,
-            FontColor::Transparent(INK),
-            t,
-        );
-        y += line_height(font);
+        draw_line(t, theme, l, mx, y, HorizontalAlignment::Left);
+        y += line_height(theme.font(l.role));
     }
 }
