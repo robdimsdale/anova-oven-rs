@@ -344,6 +344,12 @@ SPI0 with an **active-high** CS on GP17, SCK on GP18, MOSI on GP19, at 2 MHz
 quirks: LSB-first wire order, active-high CS, and the VCOM signal that must
 alternate at ≥ 1 Hz or the image degrades.
 
+The first two are handled in software (a plain GPIO for CS, `u8::reverse_bits`
+per byte) rather than in hardware. See `docs/pico-sharp-cs.md` for why an
+external inverter on the PL022's CS line and a PIO implementation were both
+rejected, and for the one cheap optimisation that is worth doing if the
+bit-reversal ever shows up in a profile.
+
 ## 16×2 character LCD
 
 4-bit parallel bus on GP16–GP21 (RS=GP17, EN=GP16, D4–D7=GP21/GP20/GP19/GP18),
