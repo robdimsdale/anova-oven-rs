@@ -255,7 +255,7 @@ where
     // `display_task` re-renders the same `ViewSpec` every animation tick, so
     // the age of its data is the only input that moves between polls — it is
     // what lets the cook timer count in real time (see `plan_view`).
-    let age = view.status_age_secs(Instant::now());
+    let age = view.timer_age_secs(Instant::now());
     let plan = plan_view(view, content_w, age, |role, s| line_width(&theme, role, s));
 
     // A plan is sized for its content, not for this panel, so drop the trailing

@@ -216,14 +216,14 @@ where
 }
 
 /// Decide the [`ScreenPlan`] for `view`. `content_width` is the usable width
-/// (panel width minus margins) used for wrapping; `status_age_secs` is how
+/// (panel width minus margins) used for wrapping; `timer_age_secs` is how
 /// long ago the view's server data was fetched
-/// ([`ViewSpec::status_age_secs`]), which advances the cook timer between
+/// ([`ViewSpec::timer_age_secs`]), which advances the cook timer between
 /// polls; `measure` reports rendered text widths for a given [`FontRole`].
 pub fn plan_view<M>(
     view: &ViewSpec,
     content_width: u32,
-    status_age_secs: u64,
+    timer_age_secs: u64,
     measure: M,
 ) -> ScreenPlan
 where
@@ -380,7 +380,7 @@ where
             status.as_ref(),
             cook.as_ref(),
             content_width,
-            status_age_secs,
+            timer_age_secs,
             &measure,
         ),
     }
@@ -390,7 +390,7 @@ fn plan_status<M>(
     status: Option<&OvenStatus>,
     cook: Option<&CurrentCook>,
     content_width: u32,
-    status_age_secs: u64,
+    timer_age_secs: u64,
     measure: &M,
 ) -> ScreenPlan
 where
@@ -415,7 +415,7 @@ where
             planline(FontRole::Giant, format!("{cur:.0}F")),
             planline(FontRole::Hero, String::from(status.phase())),
         ];
-        push_detail_rows(&mut lines, status, cooking, status_age_secs);
+        push_detail_rows(&mut lines, status, cooking, timer_age_secs);
         return ScreenPlan {
             placement: Placement::Centered,
             lines,
@@ -448,7 +448,7 @@ where
     }
     lines.push(planline(FontRole::Hero, temp));
 
-    push_detail_rows(&mut lines, status, cooking, status_age_secs);
+    push_detail_rows(&mut lines, status, cooking, timer_age_secs);
 
     ScreenPlan {
         placement: Placement::TopStacked,
@@ -462,11 +462,11 @@ fn push_detail_rows(
     lines: &mut Vec<PlanLine>,
     status: &OvenStatus,
     cooking: bool,
-    status_age_secs: u64,
+    timer_age_secs: u64,
 ) {
     // Counted down from the fetch time, not straight off the wire, so the row
     // ticks every second instead of only when a poll lands.
-    if let Some(remaining) = status.timer_remaining_secs_after(status_age_secs) {
+    if let Some(remaining) = status.timer_remaining_secs_after(timer_age_secs) {
         let (h, m, s) = (remaining / 3600, (remaining % 3600) / 60, remaining % 60);
         let timer = if h > 0 {
             format!("Timer  {h}:{m:02}:{s:02}")
@@ -562,7 +562,7 @@ mod tests {
         let view = ViewSpec::Status {
             status: Some(oven("idle")),
             cook: None,
-            fetched_at: None,
+            timer_anchor: None,
         };
         let plan = plan_view(&view, 300, 0, measure);
 
@@ -584,7 +584,7 @@ mod tests {
             &ViewSpec::Status {
                 status: Some(status),
                 cook: None,
-                fetched_at: None,
+                timer_anchor: None,
             },
             300,
             0,
@@ -607,7 +607,7 @@ mod tests {
         let view = ViewSpec::Status {
             status: Some(oven("cook")),
             cook: None,
-            fetched_at: None,
+            timer_anchor: None,
         };
         let plan = plan_view(&view, 300, 0, measure);
 
@@ -632,7 +632,7 @@ mod tests {
         let view = ViewSpec::Status {
             status: Some(status),
             cook: None,
-            fetched_at: None,
+            timer_anchor: None,
         };
 
         let timer_row = |age| {
@@ -659,7 +659,7 @@ mod tests {
             &ViewSpec::Status {
                 status: Some(idle.clone()),
                 cook: None,
-                fetched_at: None,
+                timer_anchor: None,
             },
             300,
             0,
@@ -673,7 +673,7 @@ mod tests {
             &ViewSpec::Status {
                 status: Some(cooking),
                 cook: None,
-                fetched_at: None,
+                timer_anchor: None,
             },
             300,
             0,

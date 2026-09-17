@@ -118,7 +118,7 @@ impl LcdController {
                 self.render_status_display(
                     status.as_ref(),
                     cook.as_ref(),
-                    view.status_age_secs(Instant::now()),
+                    view.timer_age_secs(Instant::now()),
                 )
                 .await;
             }
@@ -171,14 +171,15 @@ impl LcdController {
         }
     }
 
-    /// `status_age_secs` is how long ago `status` was fetched: the timer row
-    /// counts down from there rather than showing the last number the server
-    /// sent, so it ticks every second instead of once per poll.
+    /// `timer_age_secs` is how long ago the timer reading in `status` was
+    /// first seen: the timer row counts down from there rather than showing
+    /// the last number the server sent, so it ticks every second instead of
+    /// once per poll.
     async fn render_status_display(
         &mut self,
         status: Option<&anova_oven_api::OvenStatus>,
         current_cook: Option<&anova_oven_api::CurrentCook>,
-        status_age_secs: u64,
+        timer_age_secs: u64,
     ) {
         let Some(status) = status else {
             self.write_row(0, "").await;
@@ -196,7 +197,7 @@ impl LcdController {
             let phase = status.phase();
             let stage_title = current_stage.and_then(|stage| stage.title.as_deref());
             let show_phase = stage_title.is_some_and(|title| !title.eq_ignore_ascii_case(phase));
-            let remaining_secs = status.timer_remaining_secs_after(status_age_secs);
+            let remaining_secs = status.timer_remaining_secs_after(timer_age_secs);
             let has_timer_or_probe =
                 remaining_secs.is_some() || status.probe_temperature_c.is_some();
 
