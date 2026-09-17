@@ -6,7 +6,7 @@
 //! fonts by a panel-size tier, measuring text (fed back to the planner so wrap
 //! decisions use real glyph widths), dropping lines that don't fit the panel,
 //! and placing the rest. The layout *decisions* — which text to show, how to
-//! wrap a recipe title, the idle current-only readout, centred vs. top-stacked
+//! wrap a recipe title, the idle giant-temperature readout, centred vs. top-stacked
 //! — live in [`anova_oven_pico_core::view_plan`] so they can be unit-tested on
 //! the host.
 
@@ -32,6 +32,7 @@ const PAPER: BinaryColor = BinaryColor::Off;
 /// Concrete fonts for a panel size. Maps the planner's [`FontRole`]s to u8g2
 /// renderers; the same mapping backs the wrap-measurement closure below.
 struct Theme {
+    giant: FontRenderer,
     hero: FontRenderer,
     title: FontRenderer,
     body: FontRenderer,
@@ -40,6 +41,7 @@ struct Theme {
 impl Theme {
     fn font(&self, role: FontRole) -> &FontRenderer {
         match role {
+            FontRole::Giant => &self.giant,
             FontRole::Hero => &self.hero,
             FontRole::Title => &self.title,
             FontRole::Body => &self.body,
@@ -67,9 +69,26 @@ impl Theme {
 /// Where a bigger hero won't fit, the compact tier buys legibility in height
 /// instead (9x18B over 9x15B, same width). Vertical room is the softer
 /// constraint: [`fit_line_count`] drops detail rows that don't fit.
+///
+/// The *giant* role escapes that budget: it only ever carries the idle
+/// temperature, whose worst case is `"-888F"`, so it is sized by height —
+/// what the centred idle block (giant + hero) can stand on the panel:
+///
+/// | Tier | Giant | Widest giant vs. content | Idle block vs. panel height |
+/// | --- | --- | --- | --- |
+/// | compact | fub20 | 70px vs. 120px | 30 + 19 = 49px vs. 64px |
+/// | middle | fub42 | 152px vs. 300px | 63 + 55 = 118px vs. 240px |
+/// | large | fub42 | 152px vs. 376px | 63 + 66 = 129px vs. 240px |
+///
+/// `fub42` is the ceiling rather than a height budget: `fub49` ships in a
+/// numerals-only charset, which has no `F`. The giant fonts are the `_tr`
+/// (ASCII) cut — the role never carries an ellipsis, so the `_tf` glyph set
+/// buys nothing, and `_tr`'s tighter default line height makes the idle block
+/// shorter into the bargain.
 fn theme_for(size: Size) -> Theme {
     if size.width < 200 || size.height < 120 {
         Theme {
+            giant: FontRenderer::new::<fonts::u8g2_font_fub20_tr>().with_ignore_unknown_chars(true),
             hero: FontRenderer::new::<fonts::u8g2_font_9x18B_tf>().with_ignore_unknown_chars(true),
             title: FontRenderer::new::<fonts::u8g2_font_t0_11b_tf>()
                 .with_ignore_unknown_chars(true),
@@ -77,6 +96,7 @@ fn theme_for(size: Size) -> Theme {
         }
     } else if size.width < 360 {
         Theme {
+            giant: FontRenderer::new::<fonts::u8g2_font_fub42_tr>().with_ignore_unknown_chars(true),
             hero: FontRenderer::new::<fonts::u8g2_font_fub30_tf>().with_ignore_unknown_chars(true),
             title: FontRenderer::new::<fonts::u8g2_font_fub20_tf>().with_ignore_unknown_chars(true),
             body: FontRenderer::new::<fonts::u8g2_font_helvB14_tf>()
@@ -84,6 +104,7 @@ fn theme_for(size: Size) -> Theme {
         }
     } else {
         Theme {
+            giant: FontRenderer::new::<fonts::u8g2_font_fub42_tr>().with_ignore_unknown_chars(true),
             hero: FontRenderer::new::<fonts::u8g2_font_fub35_tf>().with_ignore_unknown_chars(true),
             title: FontRenderer::new::<fonts::u8g2_font_fub25_tf>().with_ignore_unknown_chars(true),
             body: FontRenderer::new::<fonts::u8g2_font_helvB18_tf>()
