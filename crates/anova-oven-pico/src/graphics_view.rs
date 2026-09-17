@@ -78,7 +78,8 @@ impl Theme {
 /// temperature, and [`draw_line`] splits that into digits and unit, so the
 /// digits can use a `_tn` (numerals-only) font — the biggest cut of each
 /// family, and the tightest, since a font whose glyphs are all digits has a
-/// line box to match. What bounds it is the height of the centred idle block
+/// line box to match. The unit hangs from the top of the line, level with the
+/// tops of the digits. What bounds it is the height of the centred idle block
 /// (giant over hero) on the panel:
 ///
 /// | Tier | Giant / unit | Widest giant vs. content | Idle block vs. panel height |
@@ -183,12 +184,13 @@ fn line_width(theme: &Theme, role: FontRole, s: &str) -> u32 {
 /// Draw one plan line with its top edge at `y`, placed horizontally about `x`
 /// by `align`.
 ///
-/// A [`FontRole::Giant`] line is a temperature, and it is set the way the
-/// oven's own panel sets one: the digits large, the unit letter about half
-/// that, both sitting on the same baseline so the unit reads as a suffix
-/// rather than as a second, smaller word. The pair is placed as one block, so
-/// centring centres the whole temperature, not the digits with the unit hung
-/// off the side.
+/// A [`FontRole::Giant`] line is a temperature: the digits large, the unit
+/// letter about half that and hung from the *top* of the line, level with the
+/// tops of the digits, the way a unit is set beside a big number. Both parts
+/// are drawn from the same top edge, so the shared line box is what aligns
+/// them — there is no baseline to keep in step. The pair is placed as one
+/// block, so centring centres the whole temperature rather than the digits
+/// with the unit hung off the side.
 fn draw_line<D>(
     t: &mut D,
     theme: &Theme,
@@ -219,14 +221,10 @@ fn draw_line<D>(
         HorizontalAlignment::Center => x - (number_w + unit_w) / 2,
         HorizontalAlignment::Right => x - (number_w + unit_w),
     };
-    // Where a `VerticalPosition::Top` draw of the giant font would have put
-    // its baseline, so a giant line occupies the same box as any other line.
-    let baseline = y + theme.giant.get_ascent() as i32 + 1;
-
     let _ = theme.giant.render_aligned(
         number,
-        Point::new(left, baseline),
-        VerticalPosition::Baseline,
+        Point::new(left, y),
+        VerticalPosition::Top,
         HorizontalAlignment::Left,
         FontColor::Transparent(INK),
         t,
@@ -234,8 +232,8 @@ fn draw_line<D>(
     if !unit.is_empty() {
         let _ = theme.giant_unit.render_aligned(
             unit,
-            Point::new(left + number_w, baseline),
-            VerticalPosition::Baseline,
+            Point::new(left + number_w, y),
+            VerticalPosition::Top,
             HorizontalAlignment::Left,
             FontColor::Transparent(INK),
             t,
