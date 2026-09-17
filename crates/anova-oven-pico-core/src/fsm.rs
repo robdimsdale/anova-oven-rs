@@ -229,7 +229,10 @@ pub enum ViewSpec {
         /// successful poll. See [`ViewSpec::status_age_secs`].
         fetched_at: Option<Instant>,
     },
+    /// One recipe in the browser. `index`/`count` are its position within
+    /// the recipes sharing its `source`, not within the whole list.
     RecipeBrowser {
+        source: anova_oven_api::RecipeSource,
         count: usize,
         index: usize,
         title: String,
@@ -330,6 +333,20 @@ pub fn cooking_view(snap: &ApiSnapshot, optimistic_recipe_title: Option<&str>) -
         status: snap.status.clone(),
         cook,
         fetched_at: snap.last_success_at,
+    }
+}
+
+/// The browser view for `recipes[index]`. The rotation still walks the one
+/// flat list; only the position shown is counted within the recipe's own
+/// source, so the user sees "My recipe 2/3" then "Bookmark 1/4".
+pub fn recipe_browser_view(recipes: &[anova_oven_api::Recipe], index: usize) -> ViewSpec {
+    let recipe = &recipes[index];
+    let same_source = |r: &&anova_oven_api::Recipe| r.source == recipe.source;
+    ViewSpec::RecipeBrowser {
+        source: recipe.source,
+        count: recipes.iter().filter(same_source).count(),
+        index: recipes[..index].iter().filter(same_source).count(),
+        title: recipe.title.clone(),
     }
 }
 
@@ -879,6 +896,49 @@ mod tests {
     }
 
     // --- active_recipe_title ---
+
+    fn recipe(title: &str, source: anova_oven_api::RecipeSource) -> anova_oven_api::Recipe {
+        anova_oven_api::Recipe {
+            id: title.into(),
+            title: title.into(),
+            stage_count: 0,
+            stages: Vec::new(),
+            source,
+        }
+    }
+
+    #[test]
+    fn recipe_browser_view_counts_within_source() {
+        use anova_oven_api::RecipeSource::{Bookmarked, Own};
+        let recipes = [
+            recipe("A", Own),
+            recipe("B", Own),
+            recipe("X", Bookmarked),
+            recipe("Y", Bookmarked),
+            recipe("Z", Bookmarked),
+        ];
+        let positions: Vec<_> = (0..recipes.len())
+            .map(|i| match recipe_browser_view(&recipes, i) {
+                ViewSpec::RecipeBrowser {
+                    source,
+                    count,
+                    index,
+                    title,
+                } => (source, index, count, title),
+                _ => panic!("expected a recipe browser view"),
+            })
+            .collect();
+        assert_eq!(
+            positions,
+            [
+                (Own, 0, 2, String::from("A")),
+                (Own, 1, 2, String::from("B")),
+                (Bookmarked, 0, 3, String::from("X")),
+                (Bookmarked, 1, 3, String::from("Y")),
+                (Bookmarked, 2, 3, String::from("Z")),
+            ]
+        );
+    }
 
     #[test]
     fn active_recipe_title_prefers_current_cook() {

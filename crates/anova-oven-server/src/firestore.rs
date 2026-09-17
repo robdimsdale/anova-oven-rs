@@ -436,7 +436,7 @@ fn oven_cooks_query_by(order_field: &str, limit: u32) -> RunQueryRequest {
 
 // ─── High-level fetch functions ────────────────────────────────────────────────
 
-fn parse_recipe_doc(doc: Document) -> anova_oven_api::Recipe {
+fn parse_recipe_doc(doc: Document, source: anova_oven_api::RecipeSource) -> anova_oven_api::Recipe {
     let id = doc.id().to_string();
     let json = doc.to_json();
 
@@ -469,6 +469,7 @@ fn parse_recipe_doc(doc: Document) -> anova_oven_api::Recipe {
         title,
         stage_count,
         stages,
+        source,
     }
 }
 
@@ -505,7 +506,7 @@ pub async fn fetch_recipes(
     let mut recipes: Vec<anova_oven_api::Recipe> = items
         .into_iter()
         .filter_map(|item| item.document)
-        .map(parse_recipe_doc)
+        .map(|doc| parse_recipe_doc(doc, anova_oven_api::RecipeSource::Own))
         .collect();
 
     // Normalize all recipes for Anova compatibility (fan speed, etc)
@@ -592,7 +593,10 @@ async fn fetch_bookmarked_recipes(
         let Ok(doc): Result<Document, _> = resp.json().await else {
             continue;
         };
-        recipes.push(parse_recipe_doc(doc));
+        recipes.push(parse_recipe_doc(
+            doc,
+            anova_oven_api::RecipeSource::Bookmarked,
+        ));
     }
 
     Ok(recipes)
