@@ -78,14 +78,18 @@ impl Theme {
 /// | Tier | Giant | Widest giant vs. content | Idle block vs. panel height |
 /// | --- | --- | --- | --- |
 /// | compact | fub20 | 70px vs. 120px | 30 + 19 = 49px vs. 64px |
-/// | middle | fub42 | 152px vs. 300px | 63 + 55 = 118px vs. 240px |
-/// | large | fub42 | 152px vs. 376px | 63 + 66 = 129px vs. 240px |
+/// | middle | logisoso58 | 186px vs. 300px | 86 + 55 = 141px vs. 240px |
+/// | large | logisoso58 | 186px vs. 376px | 86 + 66 = 152px vs. 240px |
 ///
-/// `fub42` is the ceiling rather than a height budget: `fub49` ships in a
-/// numerals-only charset, which has no `F`. The giant fonts are the `_tr`
-/// (ASCII) cut — the role never carries an ellipsis, so the `_tf` glyph set
-/// buys nothing, and `_tr`'s tighter default line height makes the idle block
-/// shorter into the bargain.
+/// `logisoso58` is the ceiling on the two 240-high panels rather than a budget
+/// they filled: it is the largest font in the crate that still carries an `F`.
+/// Everything above it — `fub49`, `logisoso62` and up — ships numerals-only.
+/// The compact tier is a real height budget: one step up (fub25) makes a 66px
+/// block for a 64px panel.
+///
+/// The giant fonts are the `_tr` (ASCII) cut — the role never carries an
+/// ellipsis, so the `_tf` glyph set buys nothing, and `_tr`'s tighter default
+/// line height makes the idle block shorter into the bargain.
 fn theme_for(size: Size) -> Theme {
     if size.width < 200 || size.height < 120 {
         Theme {
@@ -97,7 +101,8 @@ fn theme_for(size: Size) -> Theme {
         }
     } else if size.width < 360 {
         Theme {
-            giant: FontRenderer::new::<fonts::u8g2_font_fub42_tr>().with_ignore_unknown_chars(true),
+            giant: FontRenderer::new::<fonts::u8g2_font_logisoso58_tr>()
+                .with_ignore_unknown_chars(true),
             hero: FontRenderer::new::<fonts::u8g2_font_fub30_tf>().with_ignore_unknown_chars(true),
             title: FontRenderer::new::<fonts::u8g2_font_fub20_tf>().with_ignore_unknown_chars(true),
             body: FontRenderer::new::<fonts::u8g2_font_helvB14_tf>()
@@ -105,7 +110,8 @@ fn theme_for(size: Size) -> Theme {
         }
     } else {
         Theme {
-            giant: FontRenderer::new::<fonts::u8g2_font_fub42_tr>().with_ignore_unknown_chars(true),
+            giant: FontRenderer::new::<fonts::u8g2_font_logisoso58_tr>()
+                .with_ignore_unknown_chars(true),
             hero: FontRenderer::new::<fonts::u8g2_font_fub35_tf>().with_ignore_unknown_chars(true),
             title: FontRenderer::new::<fonts::u8g2_font_fub25_tf>().with_ignore_unknown_chars(true),
             body: FontRenderer::new::<fonts::u8g2_font_helvB18_tf>()

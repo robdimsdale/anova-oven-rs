@@ -72,11 +72,15 @@ temperature over a hero `Idle`):
 | Tier | Giant font | Widest giant vs. content width | Idle block vs. panel height |
 | --- | --- | --- | --- |
 | compact | fub20 | 70 px vs. 120 px | 30 + 19 = 49 px vs. 64 px |
-| middle | fub42 | 152 px vs. 300 px | 63 + 55 = 118 px vs. 240 px |
-| large | fub42 | 152 px vs. 376 px | 63 + 66 = 129 px vs. 240 px |
+| middle | logisoso58 | 186 px vs. 300 px | 86 + 55 = 141 px vs. 240 px |
+| large | logisoso58 | 186 px vs. 376 px | 86 + 66 = 152 px vs. 240 px |
 
-The two 240-high panels share `fub42` because it is the largest *usable* size,
-not because they ran out of room: `fub49` ships numerals-only and has no `F`.
+The two 240-high panels share `logisoso58` because it is the largest *usable*
+size, not because they ran out of room: it is the biggest font in the crate
+that still has an `F` in it, and everything larger (`fub49`, `logisoso62` and
+up) is numerals-only. The compact tier, by contrast, is a genuine height
+budget — one step up from fub20 is a 66 px block for a 64 px panel.
+
 Giant fonts are the `_tr` (ASCII) cut rather than `_tf` — no ellipsis ever
 reaches this role, and `_tr`'s tighter default line height shortens the block.
 
@@ -156,7 +160,8 @@ plan by importance, so what goes is what mattered least.
 
 The idle screen is the one this panel has the *most* room for, since it spends
 its whole height on two lines: a fub20 temperature over a 9x18B `Idle`, 49 px
-of the 64 available.
+of the 64 available. It is also the one tier whose giant font is capped by the
+panel rather than by the font catalogue.
 
 ### Burn-in mitigation
 
