@@ -185,7 +185,19 @@ impl LcdController {
             let has_timer_or_probe =
                 status.timer_remaining_secs().is_some() || status.probe_temperature_c.is_some();
 
-            let num_items: u64 = 2 + u64::from(show_phase) + u64::from(has_timer_or_probe);
+            // A manual cook has no recipe, so every stage in it is manual and
+            // naming one tells the user nothing they can't see from row 0's
+            // "Manual cook". Drop the slot rather than spend a rotation on it.
+            let stage_row = match stage_title {
+                Some(title) => Some(alloc::format!("Stage: {title}")),
+                None if cook.recipe_title == "[manual]" => None,
+                None => Some(alloc::format!("Stage: {phase}")),
+            };
+
+            let num_items: u64 = 1
+                + u64::from(stage_row.is_some())
+                + u64::from(show_phase)
+                + u64::from(has_timer_or_probe);
 
             if self.row1_animation_done() {
                 let current = self.row1_slot.unwrap_or(0);
@@ -199,15 +211,12 @@ impl LcdController {
             let slot = self.row1_slot.unwrap_or(0).min(num_items - 1);
             let mut slot_idx = 0;
 
-            if slot == slot_idx {
-                let row1 = match stage_title {
-                    Some(title) => alloc::format!("Stage: {title}"),
-                    None if cook.recipe_title == "[manual]" => String::from("Manual stage"),
-                    None => alloc::format!("Stage: {phase}"),
-                };
-                self.write_row(1, &row1).await;
+            if let Some(stage_row) = stage_row {
+                if slot == slot_idx {
+                    self.write_row(1, &stage_row).await;
+                }
+                slot_idx += 1;
             }
-            slot_idx += 1;
 
             if slot == slot_idx {
                 let current_f = celcius_to_fahrenheit(status.current_temperature_c());
