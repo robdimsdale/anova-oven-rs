@@ -445,12 +445,15 @@ fn push_detail_rows(lines: &mut Vec<PlanLine>, status: &OvenStatus, cooking: boo
             format!("Probe  {:.0}F", celcius_to_fahrenheit(probe_c)),
         ));
     }
-    if let Some(steam) = status.steam_target_pct {
-        lines.push(planline(FontRole::Body, format!("Steam  {steam:.0}%")));
-    }
-    // Phase (Preheating/Cooking) only while cooking — "Phase  Idle" would just
-    // repeat the idle title above.
+    // The last two rows are cook-only. Steam is a *setpoint*: it means
+    // something only while a cook is driving towards it, and the oven keeps
+    // reporting the last one after the cook ends, where it reads as a promise
+    // the idle oven is not keeping. Phase would just say "Idle", which the
+    // screen already says in the hero font.
     if cooking {
+        if let Some(steam) = status.steam_target_pct {
+            lines.push(planline(FontRole::Body, format!("Steam  {steam:.0}%")));
+        }
         lines.push(planline(
             FontRole::Body,
             format!("Phase  {}", status.phase()),
@@ -578,6 +581,35 @@ mod tests {
                 pl(FontRole::Body, "Phase  Preheating"),
             ]
         );
+    }
+
+    #[test]
+    fn steam_setpoint_is_a_cooking_row_only() {
+        // The oven keeps reporting the finished cook's steam setpoint while
+        // idle; it belongs to the cook, so only the cooking screen shows it.
+        let mut idle = oven("idle");
+        idle.steam_target_pct = Some(60.0);
+        let plan = plan_view(
+            &ViewSpec::Status {
+                status: Some(idle.clone()),
+                cook: None,
+            },
+            300,
+            measure,
+        );
+        assert!(!plan.lines.iter().any(|l| l.text.starts_with("Steam")));
+
+        let mut cooking = idle;
+        cooking.mode = String::from("cook");
+        let plan = plan_view(
+            &ViewSpec::Status {
+                status: Some(cooking),
+                cook: None,
+            },
+            300,
+            measure,
+        );
+        assert!(plan.lines.contains(&pl(FontRole::Body, "Steam  60%")));
     }
 
     #[test]
