@@ -23,8 +23,12 @@ pub enum FontRole {
     /// Larger than [`FontRole::Hero`], and reserved for the idle temperature:
     /// that line is one short number (`"212F"`, at worst `"-888F"`), never
     /// wrapped and never ellipsised, so it can be sized far past the width
-    /// budget the hero line has to keep for `"888F -> 888F"`. Renderers may
-    /// back it with a digits-and-uppercase font only — don't put prose in it.
+    /// budget the hero line has to keep for `"888F -> 888F"`.
+    ///
+    /// The text is a number followed by its unit letter, and a renderer is
+    /// free to set the two differently — the firmware draws the unit at about
+    /// half the digits' size on the same baseline, which is what lets the
+    /// digits use a numerals-only font. So: temperatures only, no prose.
     Giant,
     /// Largest of the general-purpose roles — the glanceable headline
     /// (temperature) on a screen that also carries other rows.
