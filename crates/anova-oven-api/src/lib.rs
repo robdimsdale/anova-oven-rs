@@ -31,7 +31,11 @@ pub struct OvenStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub probe_temperature_c: Option<f32>,
 
-    /// Timer elapsed, in seconds.
+    /// Seconds left on the timer — the oven's `timer.current` counts *down*
+    /// from [`Self::timer_total_secs`] towards zero, and reads as the full
+    /// duration both before a stage's timer starts and after it expires.
+    /// (The WebSocket field was long documented here as seconds *elapsed*;
+    /// it isn't — a display showing `total - current` counts up.)
     pub timer_current_secs: u64,
     /// Timer total duration, in seconds.
     pub timer_total_secs: u64,
@@ -190,8 +194,9 @@ impl OvenStatus {
         }
     }
 
-    /// Timer remaining in seconds, as of the moment this status was read from
-    /// the oven. `None` if no timer is running.
+    /// Seconds left on the timer as of the moment this status was read from
+    /// the oven — the same direction the oven's own panel counts. `None` if no
+    /// timer is running.
     pub fn timer_remaining_secs(&self) -> Option<u64> {
         self.timer_remaining_secs_after(0)
     }
@@ -212,11 +217,7 @@ impl OvenStatus {
     /// after three failed polls).
     pub fn timer_remaining_secs_after(&self, elapsed_secs: u64) -> Option<u64> {
         if self.timer_mode == "running" && self.timer_total_secs > 0 {
-            Some(
-                self.timer_total_secs
-                    .saturating_sub(self.timer_current_secs)
-                    .saturating_sub(elapsed_secs),
-            )
+            Some(self.timer_current_secs.saturating_sub(elapsed_secs))
         } else {
             None
         }
@@ -502,11 +503,12 @@ mod tests {
     fn timer_extrapolates_from_the_fetch_but_never_past_zero() {
         let mut status = cooking_status();
 
-        // 3600 total, 300 on the clock: 3300 left at the moment of the fetch,
-        // one less for each second since.
-        assert_eq!(status.timer_remaining_secs(), Some(3300));
-        assert_eq!(status.timer_remaining_secs_after(1), Some(3299));
-        assert_eq!(status.timer_remaining_secs_after(3300), Some(0));
+        // `timer_current_secs` *is* the time left (3600 total, 300 to go, 5
+        // minutes into an hour-long cook), one less for each second since the
+        // fetch.
+        assert_eq!(status.timer_remaining_secs(), Some(300));
+        assert_eq!(status.timer_remaining_secs_after(1), Some(299));
+        assert_eq!(status.timer_remaining_secs_after(300), Some(0));
         // A stale status parks at zero rather than wrapping around.
         assert_eq!(status.timer_remaining_secs_after(9999), Some(0));
 
