@@ -27,8 +27,9 @@ pub enum FontRole {
     ///
     /// The text is a number followed by its unit letter, and a renderer is
     /// free to set the two differently — the firmware draws the unit at about
-    /// half the digits' size on the same baseline, which is what lets the
-    /// digits use a numerals-only font. So: temperatures only, no prose.
+    /// half the digits' size, hung from the top of the line, which is what
+    /// lets the digits use a numerals-only font. So: temperatures only, no
+    /// prose.
     Giant,
     /// Largest of the general-purpose roles — the glanceable headline
     /// (temperature) on a screen that also carries other rows.
