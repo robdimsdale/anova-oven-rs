@@ -18,7 +18,10 @@
 //! clock in the tests below.
 //!
 //! The firmware's `lcd.rs` is left with the HD44780 itself: move the cursor,
-//! strobe the bytes for whichever rows a tick reports as changed.
+//! strobe the bytes for whichever *cells* a tick reports as changed. That the
+//! unit is a cell and not a row is a real saving rather than a tidiness — the
+//! bus costs ~4.1 ms a character, so a repainted row outlasts the 50 ms render
+//! tick. See [`CellSpan`] and the timing table in `lcd.rs`.
 
 use alloc::{format, string::String, vec::Vec};
 
@@ -347,19 +350,65 @@ impl RowAnim {
     }
 }
 
+/// A run of cells to write, and the column its first cell sits at.
+///
+/// Spans cover *changed* cells only, and are never bridged across unchanged
+/// ones. On this panel a cursor move costs exactly what one character write
+/// costs — both are one full bus transaction, see the timings in `lcd.rs` — so
+/// jumping a gap of `n` unchanged cells to save one cursor move breaks even at
+/// `n = 1` and loses beyond it. Maximal runs it is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CellSpan {
+    /// Column of the first cell, in `0..LCD_WIDTH`.
+    pub col: u8,
+    /// The cells to write there, one per `char`.
+    pub text: String,
+}
+
+/// The runs of `next` that differ from `prev`, left to right.
+///
+/// Both are fully rendered rows and so the same length. A mismatch could only
+/// mean a bug upstream, and is answered with a whole-row rewrite rather than a
+/// half-updated row.
+fn changed_spans(prev: &str, next: &str) -> Vec<CellSpan> {
+    if prev.chars().count() != next.chars().count() {
+        return alloc::vec![CellSpan {
+            col: 0,
+            text: String::from(next),
+        }];
+    }
+
+    let mut spans: Vec<CellSpan> = Vec::new();
+    let mut run: Option<CellSpan> = None;
+    for (i, (p, n)) in prev.chars().zip(next.chars()).enumerate() {
+        if p != n {
+            run.get_or_insert_with(|| CellSpan {
+                col: i as u8,
+                text: String::new(),
+            })
+            .text
+            .push(n);
+        } else if let Some(span) = run.take() {
+            spans.push(span);
+        }
+    }
+    spans.extend(run);
+    spans
+}
+
 /// One physical row: its animation, plus what the panel is currently showing.
 #[derive(Default)]
 struct RowState {
     anim: Option<RowAnim>,
-    /// The exact cells last handed to the panel, so an unchanged row costs no
-    /// bus traffic.
+    /// The exact cells the panel is currently showing, which is what the next
+    /// render is diffed against.
     last_rendered: Option<String>,
 }
 
 impl RowState {
-    /// Advance this row to `text` at `now` and return the [`LCD_WIDTH`] cells
-    /// to write — or `None` when the panel already shows them.
-    fn advance(&mut self, text: &str, now: Instant) -> Option<String> {
+    /// Advance this row to `text` at `now` and return the runs of cells that
+    /// need writing — empty when the panel already shows the right thing.
+    fn advance(&mut self, text: &str, now: Instant) -> Vec<CellSpan> {
         let text_changed = self.anim.as_ref().is_none_or(|a| a.text != text);
         if text_changed {
             self.anim = Some(RowAnim::new(text, now));
@@ -370,17 +419,22 @@ impl RowState {
         let (visible, stepped) = anim.visible_window(now);
 
         // A marquee that hasn't stepped has nothing new to show. Checked before
-        // the render so a paused marquee costs nothing at all.
+        // rendering so a paused marquee costs nothing at all, not even a diff.
         if scrolls && !text_changed && !stepped {
-            return None;
+            return Vec::new();
         }
 
         let rendered = pad_to_width(&visible);
-        if self.last_rendered.as_deref() == Some(rendered.as_str()) {
-            return None;
-        }
-        self.last_rendered = Some(rendered.clone());
-        Some(rendered)
+        let spans = match self.last_rendered.as_deref() {
+            Some(prev) => changed_spans(prev, &rendered),
+            // Nothing known to be on the panel yet, so send all of it.
+            None => alloc::vec![CellSpan {
+                col: 0,
+                text: rendered.clone(),
+            }],
+        };
+        self.last_rendered = Some(rendered);
+        spans
     }
 
     fn cycle_done(&self, now: Instant) -> bool {
@@ -394,12 +448,25 @@ impl RowState {
     }
 }
 
-/// What to write to the panel this tick. A `None` row is one the panel is
-/// already showing correctly, and rewriting it would be wasted bus time.
+/// What to write to the panel this tick: per row, the runs of cells that
+/// changed. An empty row is one the panel is already showing correctly.
+///
+/// Spans rather than whole rows because the bus is slow enough for it to
+/// matter: a full 16-cell row is about 70 ms (`lcd.rs` has the arithmetic)
+/// against a 50 ms render tick, so a cook timer going `05:00` to `04:59` sends
+/// three characters in two spans instead of repainting the row, and a screen
+/// that hasn't changed sends nothing at all.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LcdFrame {
-    pub row0: Option<String>,
-    pub row1: Option<String>,
+    pub row0: Vec<CellSpan>,
+    pub row1: Vec<CellSpan>,
+}
+
+impl LcdFrame {
+    /// Whether this tick has nothing to write at all.
+    pub fn is_empty(&self) -> bool {
+        self.row0.is_empty() && self.row1.is_empty()
+    }
 }
 
 /// Resolves an [`LcdPlan`] against the clock: which slot the bottom row is
@@ -909,49 +976,196 @@ mod tests {
         assert_eq!(plan.row1_slots, ["Stage: Roast", "212F", "Phase: Cooking"]);
     }
 
+    // --- LcdAnimator ---
+
+    fn span(col: u8, text: &str) -> CellSpan {
+        CellSpan {
+            col,
+            text: String::from(text),
+        }
+    }
+
+    /// A stand-in for the panel: applies each frame exactly the way `lcd.rs`
+    /// does, so a test can assert both what was *written* (the spans, and what
+    /// they cost) and what the panel reads once they land. Keeping the two
+    /// separate is the point — a diff that writes fewer cells is only correct
+    /// if the row still ends up right.
+    struct Panel {
+        cells: [[char; LCD_WIDTH]; 2],
+        anim: LcdAnimator,
+    }
+
+    impl Panel {
+        fn new() -> Self {
+            Self {
+                cells: [[' '; LCD_WIDTH]; 2],
+                anim: LcdAnimator::new(),
+            }
+        }
+
+        /// Tick the animator at `ms`, apply the frame, and hand it back.
+        fn tick(&mut self, plan: &LcdPlan, ms: u64) -> LcdFrame {
+            let frame = self.anim.tick(plan, t(ms));
+            for (row, spans) in [(0usize, &frame.row0), (1usize, &frame.row1)] {
+                for span in spans {
+                    for (i, ch) in span.text.chars().enumerate() {
+                        self.cells[row][span.col as usize + i] = ch;
+                    }
+                }
+            }
+            frame
+        }
+
+        fn row(&self, row: usize) -> String {
+            self.cells[row].iter().collect()
+        }
+    }
+
+    /// What a frame costs on the bus, in write_byte-equivalents: one cursor
+    /// move per span plus one write per cell. See the timing table in `lcd.rs`
+    /// — a cursor move and a character cost the same, which is what makes this
+    /// a fair single number.
+    fn bus_writes(frame: &LcdFrame) -> usize {
+        [&frame.row0, &frame.row1]
+            .into_iter()
+            .flatten()
+            .map(|s| 1 + s.text.chars().count())
+            .sum()
+    }
+
     // --- LcdAnimator: rows that fit ---
 
     #[test]
-    fn a_row_is_padded_to_the_full_width() {
-        let mut anim = LcdAnimator::new();
-        let frame = anim.tick(&rows("Anova Oven", "Connecting..."), t(0));
-        // Padded, not trimmed: the write has to overwrite whatever the
-        // previous screen left in the trailing cells.
-        assert_eq!(frame.row0.as_deref(), Some("Anova Oven      "));
-        assert_eq!(frame.row1.as_deref(), Some("Connecting...   "));
+    fn the_first_write_of_a_row_sends_all_of_it() {
+        let mut p = Panel::new();
+        let frame = p.tick(&rows("Anova Oven", "Connecting..."), 0);
+
+        // Nothing is known to be on the panel yet, so both rows go out whole —
+        // padded, not trimmed, since the cells beyond the text have to be
+        // cleared too.
+        assert_eq!(frame.row0, [span(0, "Anova Oven      ")]);
+        assert_eq!(frame.row1, [span(0, "Connecting...   ")]);
+        assert_eq!(p.row(0), "Anova Oven      ");
+        assert_eq!(p.row(1), "Connecting...   ");
     }
 
     #[test]
     fn a_degree_sign_costs_one_cell_not_two() {
-        let mut anim = LcdAnimator::new();
-        let frame = anim.tick(&rows("212°F", "idle"), t(0));
-        let row0 = frame.row0.expect("first tick always writes");
+        let mut p = Panel::new();
+        p.tick(&rows("212°F", "idle"), 0);
         // Two bytes of UTF-8, one cell on the panel: 5 characters of text and
         // 11 of padding.
-        assert_eq!(row0.chars().count(), LCD_WIDTH);
-        assert_eq!(row0, "212°F           ");
+        assert_eq!(p.row(0), "212°F           ");
+        assert_eq!(p.row(0).chars().count(), LCD_WIDTH);
     }
 
     #[test]
-    fn an_unchanged_row_is_written_once_and_then_left_alone() {
-        let mut anim = LcdAnimator::new();
+    fn a_steady_screen_writes_nothing() {
+        let mut p = Panel::new();
         let plan = rows("Anova Oven", "Connecting...");
 
-        assert!(anim.tick(&plan, t(0)).row0.is_some());
+        assert!(!p.tick(&plan, 0).is_empty());
         // Nothing has changed, so there is nothing to send to the panel.
-        assert_eq!(anim.tick(&plan, t(50)), LcdFrame::default());
-        assert_eq!(anim.tick(&plan, t(100)), LcdFrame::default());
+        assert!(p.tick(&plan, 50).is_empty());
+        assert!(p.tick(&plan, 100).is_empty());
+        assert_eq!(p.row(1), "Connecting...   ");
     }
 
     #[test]
-    fn a_changed_row_is_rewritten() {
-        let mut anim = LcdAnimator::new();
-        anim.tick(&rows("Anova Oven", "Init: WIFI..."), t(0));
+    fn a_changed_row_is_rewritten_and_an_unchanged_one_is_not() {
+        let mut p = Panel::new();
+        p.tick(&rows("Anova Oven", "Init: WIFI..."), 0);
 
-        let frame = anim.tick(&rows("Anova Oven", "Init: DHCP..."), t(50));
-        // Only the row that actually changed.
-        assert_eq!(frame.row0, None);
-        assert_eq!(frame.row1.as_deref(), Some("Init: DHCP...   "));
+        let frame = p.tick(&rows("Anova Oven", "Init: DHCP..."), 50);
+        assert!(frame.row0.is_empty());
+        assert_eq!(p.row(1), "Init: DHCP...   ");
+    }
+
+    // --- LcdAnimator: writing only the cells that changed ---
+
+    #[test]
+    fn only_the_cells_that_changed_are_written() {
+        let mut p = Panel::new();
+        p.tick(&rows("Roast Chicken", "Timer: 05:00"), 0);
+
+        let frame = p.tick(&rows("Roast Chicken", "Timer: 04:59"), 1000);
+
+        // "Timer: 05:00" -> "Timer: 04:59" differs at cell 8, and at 10-11.
+        // Cell 9 (the colon) is untouched and splits the run in two.
+        assert_eq!(frame.row1, [span(8, "4"), span(10, "59")]);
+        // The pinned title costs nothing.
+        assert!(frame.row0.is_empty());
+        // Two cursor moves plus three characters, against 17 for the row.
+        assert_eq!(bus_writes(&frame), 5);
+        // And the row still reads correctly, which is the whole point.
+        assert_eq!(p.row(1), "Timer: 04:59    ");
+    }
+
+    #[test]
+    fn a_one_digit_temperature_change_costs_one_cell() {
+        let mut p = Panel::new();
+        p.tick(&rows("212°F", "idle"), 0);
+
+        let frame = p.tick(&rows("213°F", "idle"), 1000);
+        assert_eq!(frame.row0, [span(2, "3")]);
+        // A cursor move and one character: ~8 ms rather than ~70 ms.
+        assert_eq!(bus_writes(&frame), 2);
+        assert_eq!(p.row(0), "213°F           ");
+    }
+
+    #[test]
+    fn runs_are_not_bridged_across_unchanged_cells() {
+        let mut p = Panel::new();
+        p.tick(&rows("AAAAAAAAAAAAAAAA", "x"), 0);
+
+        // Change the first and last cells only. Bridging them would be one
+        // span of 16 characters; two spans of one cost 4 writes instead of 17.
+        let frame = p.tick(&rows("BAAAAAAAAAAAAAAB", "x"), 1000);
+        assert_eq!(frame.row0, [span(0, "B"), span(15, "B")]);
+        assert_eq!(bus_writes(&frame), 4);
+        assert_eq!(p.row(0), "BAAAAAAAAAAAAAAB");
+    }
+
+    #[test]
+    fn adjacent_changed_cells_share_one_span() {
+        let mut p = Panel::new();
+        p.tick(&rows("AAAAAAAAAAAAAAAA", "x"), 0);
+
+        let frame = p.tick(&rows("AAABBBAAAAAAAAAA", "x"), 1000);
+        // One seek, three characters — splitting these would pay for two more
+        // cursor moves and save nothing.
+        assert_eq!(frame.row0, [span(3, "BBB")]);
+        assert_eq!(bus_writes(&frame), 4);
+    }
+
+    #[test]
+    fn a_rotation_writes_only_where_the_two_slots_differ() {
+        let mut p = Panel::new();
+        let plan = LcdPlan {
+            row0: String::from("Roast Chicken"),
+            row1_slots: alloc::vec![String::from("Stage: Roast"), String::from("Stage: Rests"),],
+        };
+        p.tick(&plan, 0);
+        p.tick(&plan, 3000);
+
+        // The slots share their "Stage: " prefix, so handing over costs only
+        // the cells that actually differ.
+        let frame = p.tick(&plan, 3050);
+        assert_eq!(frame.row1, [span(8, "ests")]);
+        assert_eq!(p.row(1), "Stage: Rests    ");
+    }
+
+    #[test]
+    fn a_marquee_step_still_rewrites_the_row_it_scrolls() {
+        let mut p = Panel::new();
+        let plan = rows("Anova Oven", LONG);
+        p.tick(&plan, 0);
+
+        // Every cell moves when the window slides, so there is nothing for the
+        // diff to save here — it just must not make it *worse*.
+        let frame = p.tick(&plan, 1200);
+        assert_eq!(frame.row1, [span(0, "w Roasted Pork S")]);
+        assert_eq!(bus_writes(&frame), 17);
     }
 
     // --- LcdAnimator: the marquee ---
@@ -961,68 +1175,61 @@ mod tests {
 
     #[test]
     fn a_long_row_holds_still_before_it_starts_scrolling() {
-        let mut anim = LcdAnimator::new();
+        let mut p = Panel::new();
         let plan = rows("Anova Oven", LONG);
 
-        let first = anim.tick(&plan, t(0)).row1.expect("first tick writes");
-        assert_eq!(first, "Slow Roasted Por");
+        p.tick(&plan, 0);
+        assert_eq!(p.row(1), "Slow Roasted Por");
 
         // Inside the opening pause: one scroll step's worth of time has passed
         // but the row must not have moved, or the first word is unreadable.
-        assert_eq!(anim.tick(&plan, t(350)).row1, None);
-        assert_eq!(anim.tick(&plan, t(1199)).row1, None);
+        assert!(p.tick(&plan, 350).row1.is_empty());
+        assert!(p.tick(&plan, 1199).row1.is_empty());
     }
 
     #[test]
     fn a_long_row_marquees_three_cells_at_a_time() {
-        let mut anim = LcdAnimator::new();
+        let mut p = Panel::new();
         let plan = rows("Anova Oven", LONG);
-        anim.tick(&plan, t(0));
+        p.tick(&plan, 0);
 
         // First step lands as the opening pause expires.
-        assert_eq!(
-            anim.tick(&plan, t(1200)).row1.as_deref(),
-            Some("w Roasted Pork S")
-        );
+        p.tick(&plan, 1200);
+        assert_eq!(p.row(1), "w Roasted Pork S");
         // Then one step per SCROLL_STEP, and nothing in between.
-        assert_eq!(anim.tick(&plan, t(1400)).row1, None);
+        assert!(p.tick(&plan, 1400).row1.is_empty());
         // Second step takes it to the tail (6 cells of overflow, 3 per step).
-        assert_eq!(
-            anim.tick(&plan, t(1550)).row1.as_deref(),
-            Some("oasted Pork Sh..")
-        );
+        p.tick(&plan, 1550);
+        assert_eq!(p.row(1), "oasted Pork Sh..");
     }
 
     #[test]
     fn a_long_row_pauses_on_its_tail_then_wraps_to_the_start() {
-        let mut anim = LcdAnimator::new();
+        let mut p = Panel::new();
         let plan = rows("Anova Oven", LONG);
-        anim.tick(&plan, t(0));
-        anim.tick(&plan, t(1200)); // offset 3
-        anim.tick(&plan, t(1550)); // offset 6 == overflow, tail reached
+        p.tick(&plan, 0);
+        p.tick(&plan, 1200); // offset 3
+        p.tick(&plan, 1550); // offset 6 == overflow, tail reached
 
         // Held on the tail for the end pause, even though steps are due.
-        assert_eq!(anim.tick(&plan, t(1900)).row1, None);
-        assert_eq!(anim.tick(&plan, t(2749)).row1, None);
+        assert!(p.tick(&plan, 1900).row1.is_empty());
+        assert!(p.tick(&plan, 2749).row1.is_empty());
         // Then back to the start for another pass — a single long row has
         // nothing to hand over to, so it loops.
-        assert_eq!(
-            anim.tick(&plan, t(2750)).row1.as_deref(),
-            Some("Slow Roasted Por")
-        );
+        p.tick(&plan, 2750);
+        assert_eq!(p.row(1), "Slow Roasted Por");
     }
 
     #[test]
     fn a_row_that_changes_mid_scroll_starts_over() {
-        let mut anim = LcdAnimator::new();
-        anim.tick(&rows("Anova Oven", LONG), t(0));
-        anim.tick(&rows("Anova Oven", LONG), t(1200)); // scrolled to offset 3
+        let mut p = Panel::new();
+        p.tick(&rows("Anova Oven", LONG), 0);
+        p.tick(&rows("Anova Oven", LONG), 1200); // scrolled to offset 3
 
-        let other = "Braised Short Ribs Ext";
-        let frame = anim.tick(&rows("Anova Oven", other), t(1300));
+        p.tick(&rows("Anova Oven", "Braised Short Ribs Ext"), 1300);
         // New text, so it reads from its own first character rather than
         // inheriting the previous row's scroll position.
-        assert_eq!(frame.row1.as_deref(), Some("Braised Short Ri"));
+        assert_eq!(p.row(1), "Braised Short Ri");
     }
 
     // --- LcdAnimator: slot rotation ---
@@ -1036,104 +1243,97 @@ mod tests {
 
     #[test]
     fn the_bottom_row_rotates_once_a_slot_has_had_its_turn() {
-        let mut anim = LcdAnimator::new();
+        let mut p = Panel::new();
         let plan = two_slot_plan();
 
-        assert_eq!(
-            anim.tick(&plan, t(0)).row1.as_deref(),
-            Some("212F>230F       ")
-        );
+        p.tick(&plan, 0);
+        assert_eq!(p.row(1), "212F>230F       ");
         // Still inside the hold.
-        assert_eq!(anim.tick(&plan, t(2999)).row1, None);
+        assert!(p.tick(&plan, 2999).row1.is_empty());
         // The hold expires *during* this tick, which is what arms the rotation.
-        assert_eq!(anim.tick(&plan, t(3000)).row1, None);
+        assert!(p.tick(&plan, 3000).row1.is_empty());
         // So the next tick is the one that swaps the slot.
-        assert_eq!(
-            anim.tick(&plan, t(3050)).row1.as_deref(),
-            Some("Timer: 05:00    ")
-        );
+        p.tick(&plan, 3050);
+        assert_eq!(p.row(1), "Timer: 05:00    ");
     }
 
     #[test]
     fn rotation_comes_back_round_to_the_first_slot() {
-        let mut anim = LcdAnimator::new();
+        let mut p = Panel::new();
         let plan = two_slot_plan();
-        anim.tick(&plan, t(0));
-        anim.tick(&plan, t(3000));
-        anim.tick(&plan, t(3050)); // -> slot 1
-        anim.tick(&plan, t(6050)); // slot 1's hold expires
+        p.tick(&plan, 0);
+        p.tick(&plan, 3000);
+        p.tick(&plan, 3050); // -> slot 1
+        p.tick(&plan, 6050); // slot 1's hold expires
 
-        assert_eq!(
-            anim.tick(&plan, t(6100)).row1.as_deref(),
-            Some("212F>230F       ")
-        );
+        p.tick(&plan, 6100);
+        assert_eq!(p.row(1), "212F>230F       ");
     }
 
     #[test]
     fn the_top_row_stays_put_while_the_bottom_rotates() {
-        let mut anim = LcdAnimator::new();
+        let mut p = Panel::new();
         let plan = two_slot_plan();
 
-        assert!(anim.tick(&plan, t(0)).row0.is_some());
-        anim.tick(&plan, t(3000));
-        let rotated = anim.tick(&plan, t(3050));
+        assert!(!p.tick(&plan, 0).row0.is_empty());
+        p.tick(&plan, 3000);
+        let rotated = p.tick(&plan, 3050);
 
         // The cook name is pinned: rotating the bottom row must not cost a
-        // redundant rewrite of the top one.
-        assert_eq!(rotated.row0, None);
-        assert!(rotated.row1.is_some());
+        // single write on the top one.
+        assert!(rotated.row0.is_empty());
+        assert!(!rotated.row1.is_empty());
+        assert_eq!(p.row(0), "Roast Chicken   ");
     }
 
     #[test]
     fn rotation_waits_for_a_long_slot_to_finish_scrolling() {
-        let mut anim = LcdAnimator::new();
         let plan = LcdPlan {
             row0: String::from("Roast Chicken"),
             row1_slots: alloc::vec![String::from(LONG), String::from("Timer: 05:00")],
         };
-        anim.tick(&plan, t(0));
 
+        let mut p = Panel::new();
+        p.tick(&plan, 0);
         // Past MIN_SLOT_HOLD, but this slot is measured by its marquee: it has
         // not shown its tail yet, so it keeps the row.
-        let frame = anim.tick(&plan, t(3050));
-        assert_ne!(frame.row1.as_deref(), Some("Timer: 05:00    "));
+        p.tick(&plan, 3050);
+        assert_ne!(p.row(1), "Timer: 05:00    ");
 
         // Tail reached at 1550 and the end pause runs to 2750, so that is the
         // tick that hands the row over.
-        let mut anim = LcdAnimator::new();
-        anim.tick(&plan, t(0));
-        anim.tick(&plan, t(1200)); // offset 3
-        anim.tick(&plan, t(1550)); // offset 6: tail on screen, turn served
-        assert_eq!(
-            anim.tick(&plan, t(2750)).row1.as_deref(),
-            Some("Timer: 05:00    ")
-        );
+        let mut p = Panel::new();
+        p.tick(&plan, 0);
+        p.tick(&plan, 1200); // offset 3
+        p.tick(&plan, 1550); // offset 6: tail on screen, turn served
+        p.tick(&plan, 2750);
+        assert_eq!(p.row(1), "Timer: 05:00    ");
     }
 
     #[test]
     fn losing_a_slot_clamps_the_rotation_instead_of_reading_past_the_end() {
-        let mut anim = LcdAnimator::new();
+        let mut p = Panel::new();
         let plan = two_slot_plan();
-        anim.tick(&plan, t(0));
-        anim.tick(&plan, t(3000));
-        anim.tick(&plan, t(3050)); // showing slot 1
+        p.tick(&plan, 0);
+        p.tick(&plan, 3000);
+        p.tick(&plan, 3050); // showing slot 1
 
         // The timer runs out, so the plan comes back a slot shorter.
-        let shorter = rows("Roast Chicken", "212F>230F");
-        let frame = anim.tick(&shorter, t(3100));
-        assert_eq!(frame.row1.as_deref(), Some("212F>230F       "));
+        p.tick(&rows("Roast Chicken", "212F>230F"), 3100);
+        assert_eq!(p.row(1), "212F>230F       ");
     }
 
     #[test]
     fn a_single_slot_plan_never_rotates() {
-        let mut anim = LcdAnimator::new();
+        let mut p = Panel::new();
         let plan = rows("Anova Oven", "Connecting...");
-        anim.tick(&plan, t(0));
+        p.tick(&plan, 0);
 
         // Well past the hold: with nothing to hand over to, the row is simply
         // left alone rather than being rewritten on a phantom rotation.
         for ms in [3000, 3050, 6000, 9000] {
-            assert_eq!(anim.tick(&plan, t(ms)), LcdFrame::default());
+            assert!(p.tick(&plan, ms).is_empty());
         }
+        assert_eq!(p.row(1), "Connecting...   ");
     }
 }
