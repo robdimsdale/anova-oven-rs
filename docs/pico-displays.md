@@ -49,7 +49,8 @@ ViewSpec                        (fsm.rs — what the FSM wants shown)
   └── lcd_plan::plan_lcd        (pico-core, host-tested: the pinned top row,
       │                          and the rows that share the bottom one)
       └── lcd_plan::LcdAnimator (pico-core, host-tested: which slot is up,
-          │                      where each marquee has got to, what changed)
+          │                      where each marquee has got to, which *cells*
+          │                      changed)
           └── lcd.rs → HD44780  (cursor moves and byte strobes, nothing else)
 ```
 
@@ -371,6 +372,40 @@ constants live there — a row that fits holds 3 s before handing over, one that
 doesn't scrolls 3 cells per 350 ms with a 1.2 s pause at each end, and a long row
 gets its turn measured by the scroll rather than the hold, so it always shows its
 tail before the next slot comes up.
+
+### Why it writes cells, not rows
+
+This bus is slow, and the panel isn't the reason. `hd44780-driver` holds `EN`
+for `delay_ms(2)` per nibble, so every byte — character or command alike — costs
+two of those plus a 100 µs settle:
+
+| | cost |
+| --- | --- |
+| one character, or one cursor move | ~4.1 ms |
+| a full 16-cell row (cursor + 16 characters) | ~70 ms |
+| both rows | ~139 ms |
+
+`display_task` renders every 50 ms, so repainting a single whole row already
+costs more than a tick. Nothing hangs — the delays are `.await`ed, so the
+executor keeps running — but it means suppressing needless writes is load
+bearing, not a nicety.
+
+So `LcdAnimator` diffs against what the panel is showing and emits only the runs
+of cells that changed. A cook timer going `05:00` → `04:59` is two spans and
+three characters (~20 ms, against ~70 ms for the row); a one-digit temperature
+change is a single cell (~8 ms); a screen that hasn't changed is free. A marquee
+step moves every cell and so still costs a full row, which is the floor.
+
+Runs are never bridged across unchanged cells, because a cursor move costs
+*exactly* one character write: jumping a gap of `n` unchanged cells to save one
+cursor move breaks even at `n = 1` and loses beyond it. Maximal runs of changed
+cells is therefore the optimum, and needs no tuning.
+
+The 2 ms pulse is the driver's own choice — roughly 4000× the ~450 ns the
+HD44780 datasheet asks for. Shortening it is the larger win still on the table,
+but it means changing the dependency and verifying on real hardware.
+
+### The degree glyph
 
 The one glyph outside ASCII is the degree sign on the idle top row. The driver's
 `CharsetUniversal` has no mapping for it and its `EmptyFallback` would silently
