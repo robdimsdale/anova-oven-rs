@@ -377,6 +377,15 @@ fn evaluate_stage_completion(
     } else {
         stage.duration_secs.unwrap_or(0) > 0
     };
+    //
+    // NOTE: `timer_current_secs` counts *down* (see `OvenStatus`), so this
+    // fires on the oven parking the timer back at its full duration once the
+    // stage ends — not on a count-up reaching it, which is what this condition
+    // was written for. The `timer_has_run` guard above is what keeps the
+    // identical reading at stage *start* from firing it. It has held up in
+    // practice, but it is testing a side effect: if a stage ever stops
+    // completing, check whether that oven leaves `current` at 0 instead, and
+    // key this off `timer_mode` leaving `"running"` after having run.
     if has_timer
         && *timer_has_run
         && status.timer_total_secs > 0

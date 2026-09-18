@@ -183,7 +183,7 @@ Periodic oven state. Roughly every 10 min when idle, every 10s during a cook
 | `steamGenerators.mode` | `"idle"`, `"running"` |
 | `temperatureBulbs.mode` | `"dry"`, `"wet"` |
 | `timer.mode` | `"idle"`, `"running"` |
-| `timer.current` | Seconds elapsed |
+| `timer.current` | Seconds **remaining** (counts down to 0) |
 | `timer.initial` | Seconds total |
 | `state.mode` | `"idle"` when not cooking |
 | `lamp.preference` | `"on"`, `"off"` |

@@ -52,7 +52,8 @@ Target capabilities:
   │  plain HTTP     │         │                     │
   │  (embassy-net,  │         │                     │
   │  no TLS).       │         │                     │
-  │  LCD + encoder  │         │                     │
+  │  Display +      │         │                     │
+  │  encoder        │         │                     │
   │  + button +     │         │                     │
   │  /health        │         │                     │
   │  (picoserve).   │         │                     │
@@ -201,6 +202,8 @@ Modules:
   discriminant table.
 - `scheduler` — `EventQueue` driving the pico's poll cadence.
 - `encoder` — QEM quadrature decode + accumulator.
+- `button` — integrating debouncer for the encoder's push button (rejects the
+  noise the shaft couples onto the switch line while rotating).
 - `api` — server URL normalization helper.
 
 Features: `defmt` (enables `defmt::Format` derives), `serde` (enables
@@ -399,9 +402,20 @@ plain HTTP. Logs via defmt-rtt.
 The firmware is a full appliance UI, not the "poll once and log" prototype
 the early Phase-2 plan described:
 
-- 16×2 HD44780 LCD (4-bit bus, async driver) showing status / cook
-  progress / next-stage prompts / recovery messages.
-- Rotary encoder + push button (input via `embassy-rp` GPIO).
+- One of four display backends, selected at build time by a `ui-*`
+  Cargo feature (or none, for a headless build): a 16×2 HD44780
+  character LCD, a 2.7" 400×240 Sharp Memory Display, a 2.42" 128×64
+  SSD1305/SSD1309 OLED, or a 2.0" 320×240 ST7789 colour IPS TFT — all
+  showing status / cook progress / next-stage prompts / recovery
+  messages. The three graphical panels share their layout code, all
+  three driving a 1-bit `DrawTarget` (the TFT expands to RGB565 at
+  flush time, since a full colour framebuffer would not fit in SRAM);
+  the layout decisions live in `anova-oven-pico-core::view_plan` and
+  are host-tested. Wiring and per-panel notes:
+  [`docs/pico-displays.md`](pico-displays.md).
+- Rotary encoder + push button (input via `embassy-rp` GPIO). The button is
+  sampled and integrated rather than edge-triggered — see §1.6 of
+  [`docs/pico-review.md`](pico-review.md).
 - LED backlight on PWM with policies for full / dimmed states.
 - FSM (in `state.rs`) selecting which view to display and when to issue
   Start/Stop commands.
@@ -581,10 +595,12 @@ error-handling policy).
 
 - WebSocket protocol: [`docs/oven-websocket-api.md`](oven-websocket-api.md)
 - Cloud API (Firestore): [`docs/oven-cloud-api.md`](oven-cloud-api.md)
+- Pico display backends + wiring: [`docs/pico-displays.md`](pico-displays.md)
 - Pico crate drift map: [`docs/pico-crate-drift.md`](pico-crate-drift.md)
 - Pico OTA brief: [`docs/pico-ota.md`](pico-ota.md)
 - Pico transport security brief: [`docs/pico-transport-security.md`](pico-transport-security.md)
 - Pico reset-button note: [`docs/pico-reset-button.md`](pico-reset-button.md)
+- Display SPI / DMA investigation: [`docs/pico-display-dma.md`](pico-display-dma.md)
 - Pico crate review: [`docs/pico-review.md`](pico-review.md)
 - Exploration / debugging archive: [`docs/exploration/`](exploration/)
 - Community protocol docs (Go client): `../anova-oven-api/`

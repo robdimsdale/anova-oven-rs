@@ -10,7 +10,7 @@
 //! anova-oven-cli history
 //! ```
 
-use anova_oven_api::{CurrentCook, HistoryEntry, OvenStatus, Recipe};
+use anova_oven_api::{CurrentCook, HistoryEntry, OvenStatus, Recipe, RecipeSource};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -178,6 +178,13 @@ fn print_status(s: &OvenStatus) {
 fn print_recipe(r: &Recipe) {
     println!("{}", r.title);
     println!("  ID:     {}", r.id);
+    println!(
+        "  Source: {}",
+        match r.source {
+            RecipeSource::Own => "mine",
+            RecipeSource::Bookmarked => "bookmark",
+        }
+    );
     println!("  Stages: {}", r.stage_count);
     for (i, stage) in r.stages.iter().enumerate() {
         print_stage(i, stage);
@@ -214,9 +221,7 @@ fn print_current_cook(c: &CurrentCook, status: Option<&OvenStatus>) {
         }
         if let Some(probe_c) = s.probe_temperature_c {
             let probe_target = s
-                .cook_progress
-                .as_ref()
-                .and_then(|p| c.stages.get(p.current_stage_index))
+                .current_stage(&c.stages)
                 .and_then(|stage| stage.probe_target_c);
             if let Some(target) = probe_target {
                 println!(

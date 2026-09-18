@@ -10,9 +10,26 @@ mod backlight;
 mod display;
 mod health;
 mod input;
+#[cfg(feature = "ui-lcd")]
 mod lcd;
 mod persist;
+mod screen;
+// Shared graphical layout (Layer C), reused by every DrawTarget-based backend.
+#[cfg(feature = "_graphics")]
+mod graphics_view;
+#[cfg(feature = "ui-oled-basic")]
+mod oled;
+#[cfg(feature = "ui-oled-basic")]
+mod oled_ui;
+#[cfg(feature = "ui-sharp-basic")]
+mod sharp;
+#[cfg(feature = "ui-sharp-basic")]
+mod sharp_ui;
 mod state;
+#[cfg(feature = "ui-tft-basic")]
+mod tft;
+#[cfg(feature = "ui-tft-basic")]
+mod tft_ui;
 
 use embedded_alloc::LlffHeap as Heap;
 
@@ -32,7 +49,10 @@ use embassy_rp::watchdog::Watchdog;
 use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
 use embassy_sync::watch::Watch;
-use embassy_time::{with_timeout, Delay, Duration, Instant, Timer};
+#[cfg(feature = "ui-lcd")]
+use embassy_time::Delay;
+use embassy_time::{with_timeout, Duration, Instant, Timer};
+#[cfg(feature = "ui-lcd")]
 use hd44780_driver::{
     bus::FourBitBusPins, memory_map::MemoryMap1602, non_blocking::HD44780,
     setup::DisplayOptions4Bit,
@@ -40,11 +60,22 @@ use hd44780_driver::{
 use static_cell::StaticCell;
 
 use crate::api_client::{ApiClient, CommandChannel, StateWatch};
+#[cfg(feature = "ui-lcd")]
 use crate::backlight::BacklightController;
-use crate::display::{Display, DisplayNotifier, ViewSpec};
+#[cfg(not(any(feature = "ui-lcd", feature = "ui-tft-basic")))]
+use crate::backlight::NullBacklightController;
+#[cfg(feature = "ui-tft-basic")]
+use crate::backlight::PwmBacklightController;
+use crate::display::{BacklightNotifier, Display, DisplayBackend, DisplayNotifier, ViewSpec};
 use crate::input::{Input, InputChannel};
-use crate::lcd::LcdController;
+use crate::screen::ActiveScreen;
 use crate::state::{execute, AppState, Ctx};
+
+// Microsecond timestamps on every defmt log line (via probe-rs's `{t}` log-format
+// field), reading the RP2040's free-running hardware timer — cheap, lock-free,
+// interrupt-safe. Needed to tell whether two events (e.g. an encoder tick and a
+// spurious button press) were truly simultaneous or just adjacent in the log.
+defmt::timestamp!("{=u64:us}", Instant::now().as_micros());
 
 const WIFI_SSID: &str = env!("ANOVA_WIFI_SSID");
 const WIFI_PASSWORD: &str = env!("ANOVA_WIFI_PASSWORD");
@@ -75,6 +106,7 @@ static NVRAM: &cyw43::Aligned<cyw43::A4, [u8]> =
     &cyw43::Aligned(*include_bytes!("../nvram_rp2040.bin"));
 static CLM: &[u8] = include_bytes!("../firmware/43439A0_clm.bin");
 static DISPLAY_NOTIFIER: DisplayNotifier = Signal::new();
+static BACKLIGHT_NOTIFIER: BacklightNotifier = Signal::new();
 static INPUT_CHANNEL: InputChannel = Channel::new();
 static API_COMMANDS: CommandChannel = Channel::new();
 static API_STATE: StateWatch = Watch::new();
@@ -139,26 +171,98 @@ async fn main(spawner: Spawner) {
 
     let p = embassy_rp::init(Default::default());
 
-    let mut lcd_delay = Delay;
-    let lcd = match HD44780::new(
-        DisplayOptions4Bit::new(MemoryMap1602::new()).with_pins(FourBitBusPins {
-            rs: Output::new(p.PIN_17, Level::Low),
-            en: Output::new(p.PIN_16, Level::Low),
-            d4: Output::new(p.PIN_21, Level::Low),
-            d5: Output::new(p.PIN_20, Level::Low),
-            d6: Output::new(p.PIN_19, Level::Low),
-            d7: Output::new(p.PIN_18, Level::Low),
-        }),
-        &mut lcd_delay,
-    )
-    .await
-    {
-        Ok(lcd) => lcd,
-        Err(_) => panic!("LCD init failed"),
+    // Display backend — selected by the `ui-*` feature (see screen.rs). At most
+    // one arm compiles; each produces an `ActiveScreen: DisplayBackend`
+    // (`configure()` / `render(&ViewSpec)`), and with no feature the headless
+    // arm builds a no-op `NullScreen`. All three panels claim pins from the
+    // GP16-GP21 block — the HD44780 uses all six, and the Sharp and the OLED
+    // share SPI0 (SCK=GP18, MOSI=GP19) — which is why this is a compile-time
+    // swap. Wiring for each is in docs/pico-displays.md.
+    #[cfg(feature = "ui-lcd")]
+    let mut screen: ActiveScreen = {
+        let mut lcd_delay = Delay;
+        let lcd = match HD44780::new(
+            DisplayOptions4Bit::new(MemoryMap1602::new()).with_pins(FourBitBusPins {
+                rs: Output::new(p.PIN_17, Level::Low),
+                en: Output::new(p.PIN_16, Level::Low),
+                d4: Output::new(p.PIN_21, Level::Low),
+                d5: Output::new(p.PIN_20, Level::Low),
+                d6: Output::new(p.PIN_19, Level::Low),
+                d7: Output::new(p.PIN_18, Level::Low),
+            }),
+            &mut lcd_delay,
+        )
+        .await
+        {
+            Ok(lcd) => lcd,
+            Err(_) => panic!("LCD init failed"),
+        };
+        crate::lcd::LcdController::new(lcd, lcd_delay)
     };
 
-    let mut lcd_controller = LcdController::new(lcd, lcd_delay);
-    lcd_controller.configure().await;
+    #[cfg(feature = "ui-sharp-basic")]
+    let mut screen: ActiveScreen = {
+        // Sharp Memory Display on SPI0: SCK=GP18, MOSI=GP19, active-high CS=GP17.
+        // Mode 0, 2 MHz (panel max). Blocking: the dirty-checked ~50 ms
+        // worst-case flush (~1/s) is fine under the 8 s watchdog and nothing
+        // is being starved by it. DMA is possible (docs/pico-display-dma.md),
+        // just not currently worth the async conversion.
+        let mut spi_cfg = embassy_rp::spi::Config::default();
+        spi_cfg.frequency = 2_000_000;
+        spi_cfg.phase = embassy_rp::spi::Phase::CaptureOnFirstTransition;
+        spi_cfg.polarity = embassy_rp::spi::Polarity::IdleLow;
+        let spi = embassy_rp::spi::Spi::new_blocking_txonly(p.SPI0, p.PIN_18, p.PIN_19, spi_cfg);
+        let cs = Output::new(p.PIN_17, Level::Low);
+        sharp_ui::SharpScreen::new(spi, cs)
+    };
+
+    #[cfg(feature = "ui-oled-basic")]
+    let mut screen: ActiveScreen = {
+        // 2.42" 128x64 OLED on SPI0: SCK=GP18, MOSI=GP19, active-low CS=GP17,
+        // D/C=GP16, RESET=GP20. Mode 0 at 4 MHz — the SSD1305's serial
+        // interface tops out around there, and a full 1 KB frame still costs
+        // only ~2 ms — far too little to justify an async/DMA conversion
+        // (docs/pico-display-dma.md).
+        let mut spi_cfg = embassy_rp::spi::Config::default();
+        spi_cfg.frequency = 4_000_000;
+        spi_cfg.phase = embassy_rp::spi::Phase::CaptureOnFirstTransition;
+        spi_cfg.polarity = embassy_rp::spi::Polarity::IdleLow;
+        let spi = embassy_rp::spi::Spi::new_blocking_txonly(p.SPI0, p.PIN_18, p.PIN_19, spi_cfg);
+        oled_ui::OledScreen::new(
+            spi,
+            Output::new(p.PIN_16, Level::Low),  // D/C
+            Output::new(p.PIN_17, Level::High), // CS, idle deselected
+            Output::new(p.PIN_20, Level::High), // RESET, idle released
+        )
+    };
+
+    #[cfg(feature = "ui-tft-basic")]
+    let mut screen: ActiveScreen = {
+        // 2.0" 320x240 colour IPS TFT on SPI0: SCK=GP18, MOSI=GP19,
+        // active-low CS=GP17, D/C=GP16, RESET=GP20 — the same five pins the
+        // OLED uses. Mode 0 at 32 MHz: the ST7789 will take ~62 MHz, but 32
+        // keeps margin on jumper wires and still puts a worst-case full
+        // repaint (~150 KB) at ~38 ms. Blocking, though of the four panels
+        // this is the one where DMA would actually pay — see
+        // docs/pico-display-dma.md if that becomes worth doing.
+        let mut spi_cfg = embassy_rp::spi::Config::default();
+        spi_cfg.frequency = 32_000_000;
+        spi_cfg.phase = embassy_rp::spi::Phase::CaptureOnFirstTransition;
+        spi_cfg.polarity = embassy_rp::spi::Polarity::IdleLow;
+        let spi = embassy_rp::spi::Spi::new_blocking_txonly(p.SPI0, p.PIN_18, p.PIN_19, spi_cfg);
+        tft_ui::TftScreen::new(
+            spi,
+            Output::new(p.PIN_16, Level::Low),  // D/C
+            Output::new(p.PIN_17, Level::High), // CS, idle deselected
+            Output::new(p.PIN_20, Level::High), // RESET, idle released
+        )
+    };
+
+    // Headless: no panel wired, display task drives a no-op backend.
+    #[cfg(not(any(feature = "ui-lcd", feature = "_graphics")))]
+    let mut screen: ActiveScreen = crate::display::NullScreen::new();
+
+    screen.configure().await;
 
     // Log the persisted counters, breadcrumbs, and message every boot so
     // an attached probe sees them immediately, regardless of whether
@@ -205,7 +309,7 @@ async fn main(spawner: Spawner) {
             "New panic since last display: panic_count={} reset_count={}",
             recovery.panic_count, recovery.reset_count,
         );
-        show_recovery_view(&mut lcd_controller, &recovery).await;
+        show_recovery_view(&mut screen, &recovery).await;
         persist::mark_displayed();
     }
 
@@ -220,18 +324,30 @@ async fn main(spawner: Spawner) {
     watchdog.start(Duration::from_secs(WATCHDOG_TIMEOUT_SECS));
     spawner.spawn(watchdog_feeder_task(watchdog).unwrap());
 
-    let display = Display::new(lcd_controller, &DISPLAY_NOTIFIER, spawner).unwrap();
+    let display = Display::new(screen, &DISPLAY_NOTIFIER, &BACKLIGHT_NOTIFIER, spawner).unwrap();
 
     #[cfg(feature = "verbose-logs")]
     spawner.spawn(heap_monitor_task().unwrap());
 
+    // Backlight hardware — like the screen above, a compile-time choice per
+    // `ui-*` feature (see backlight::ActiveBacklight). The LCD's RGB LED
+    // backlight uses GP6-8; the TFT's single-channel `BL` uses GP21 (PWM
+    // slice 2, adjacent to its RST on GP20); the Sharp and OLED panels have
+    // no backlight hardware to drive.
+    #[cfg(feature = "ui-lcd")]
     let backlight_controller =
         BacklightController::new(p.PWM_SLICE3, p.PIN_6, p.PIN_7, p.PWM_SLICE4, p.PIN_8);
 
+    #[cfg(feature = "ui-tft-basic")]
+    let backlight_controller = PwmBacklightController::new(p.PWM_SLICE2, p.PIN_21);
+
+    #[cfg(not(any(feature = "ui-lcd", feature = "ui-tft-basic")))]
+    let backlight_controller = NullBacklightController::new();
+
     let input = Input::new(
-        GpioInput::new(p.PIN_9, Pull::Up),
-        GpioInput::new(p.PIN_10, Pull::Up),
-        GpioInput::new(p.PIN_11, Pull::Up),
+        GpioInput::new(p.PIN_1, Pull::Up),
+        GpioInput::new(p.PIN_2, Pull::Up),
+        GpioInput::new(p.PIN_0, Pull::Up),
         &INPUT_CHANNEL,
         spawner,
     )
@@ -359,7 +475,7 @@ async fn main(spawner: Spawner) {
     }
 }
 
-async fn show_recovery_view(lcd: &mut LcdController, recovery: &persist::Snapshot) {
+async fn show_recovery_view(screen: &mut ActiveScreen, recovery: &persist::Snapshot) {
     let view = ViewSpec::Recovery {
         reset_count: recovery.reset_count,
         panic_count: recovery.panic_count,
@@ -367,7 +483,7 @@ async fn show_recovery_view(lcd: &mut LcdController, recovery: &persist::Snapsho
     };
     let deadline = Instant::now() + Duration::from_secs(RECOVERY_DISPLAY_SECS);
     while Instant::now() < deadline {
-        lcd.render(&view).await;
+        screen.render(&view).await;
         Timer::after(Duration::from_millis(RECOVERY_RENDER_TICK_MS)).await;
     }
 }

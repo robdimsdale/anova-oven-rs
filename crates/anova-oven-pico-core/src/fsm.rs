@@ -42,6 +42,12 @@ pub struct ApiSnapshot {
     pub recipes: Arc<Vec<anova_oven_api::Recipe>>,
     pub fail_count: u64,
     pub last_success_at: Option<Instant>,
+    /// When the timer reading now in `status` was *first* seen. The oven's
+    /// state only moves on when Anova pushes it, so consecutive polls often
+    /// carry the same timer value; anchoring here (rather than on the last
+    /// poll) is what lets the display count the seconds in between. `None`
+    /// until the first status arrives.
+    pub timer_anchor: Option<Instant>,
 }
 
 impl Default for ApiSnapshot {
@@ -52,11 +58,35 @@ impl Default for ApiSnapshot {
             recipes: Arc::new(Vec::new()),
             fail_count: 0,
             last_success_at: None,
+            timer_anchor: None,
         }
     }
 }
 
 impl ApiSnapshot {
+    /// Install a freshly polled status, re-anchoring the timer only when its
+    /// reading actually moved.
+    ///
+    /// The oven's timer advances upstream, not on our poll schedule, so
+    /// consecutive polls routinely return the same `timer_current_secs`.
+    /// Re-anchoring on every poll would hold [`ViewSpec::timer_age_secs`] at
+    /// zero, and the row would only change when a new value landed — the
+    /// poll-sized steps this extrapolation exists to smooth out. Keeping the
+    /// anchor across an unchanged reading lets the display count on from it at
+    /// 1 Hz, while a changed reading re-anchors so it can't drift.
+    pub fn install_status(&mut self, status: anova_oven_api::OvenStatus, now: Instant) {
+        let moved = self.timer_anchor.is_none()
+            || !self.status.as_ref().is_some_and(|prev| {
+                prev.timer_mode == status.timer_mode
+                    && prev.timer_current_secs == status.timer_current_secs
+                    && prev.timer_total_secs == status.timer_total_secs
+            });
+        if moved {
+            self.timer_anchor = Some(now);
+        }
+        self.status = Some(status);
+    }
+
     pub fn is_offline(&self) -> bool {
         self.fail_count >= OFFLINE_THRESHOLD
     }
@@ -224,8 +254,15 @@ pub enum ViewSpec {
     Status {
         status: Option<anova_oven_api::OvenStatus>,
         cook: Option<anova_oven_api::CurrentCook>,
+        /// When the timer reading in `status` was first seen, so the renderer
+        /// can count on from it between polls. `None` before the first
+        /// successful poll. See [`ViewSpec::timer_age_secs`].
+        timer_anchor: Option<Instant>,
     },
+    /// One recipe in the browser. `index`/`count` are its position within
+    /// the recipes sharing its `source`, not within the whole list.
     RecipeBrowser {
+        source: anova_oven_api::RecipeSource,
         count: usize,
         index: usize,
         title: String,
@@ -245,6 +282,27 @@ pub enum ViewSpec {
         panic_count: u32,
         message: Option<String>,
     },
+}
+
+impl ViewSpec {
+    /// How long ago the timer reading behind this view was first seen, in
+    /// whole seconds. Zero for the views that carry none, and for a status
+    /// that predates the first successful poll.
+    ///
+    /// Renderers hand this to `view_plan::plan_view`, which uses it to
+    /// extrapolate a running cook timer (see
+    /// [`anova_oven_api::OvenStatus::timer_remaining_secs_after`]) — the
+    /// display task re-renders the same `ViewSpec` every animation tick, so
+    /// this is what makes a between-polls tick show a different number.
+    pub fn timer_age_secs(&self, now: Instant) -> u64 {
+        match self {
+            ViewSpec::Status {
+                timer_anchor: Some(anchor),
+                ..
+            } => now.saturating_duration_since(*anchor).as_secs(),
+            _ => 0,
+        }
+    }
 }
 
 /// Decide which "base" state to enter when arriving from an unrelated state
@@ -271,6 +329,7 @@ pub fn idle_view(snap: &ApiSnapshot) -> ViewSpec {
         ViewSpec::Status {
             status: snap.status.clone(),
             cook: snap.current_cook.clone(),
+            timer_anchor: snap.timer_anchor,
         }
     }
 }
@@ -303,6 +362,21 @@ pub fn cooking_view(snap: &ApiSnapshot, optimistic_recipe_title: Option<&str>) -
     ViewSpec::Status {
         status: snap.status.clone(),
         cook,
+        timer_anchor: snap.timer_anchor,
+    }
+}
+
+/// The browser view for `recipes[index]`. The rotation still walks the one
+/// flat list; only the position shown is counted within the recipe's own
+/// source, so the user sees "My recipe 2/3" then "Bookmark 1/4".
+pub fn recipe_browser_view(recipes: &[anova_oven_api::Recipe], index: usize) -> ViewSpec {
+    let recipe = &recipes[index];
+    let same_source = |r: &&anova_oven_api::Recipe| r.source == recipe.source;
+    ViewSpec::RecipeBrowser {
+        source: recipe.source,
+        count: recipes.iter().filter(same_source).count(),
+        index: recipes[..index].iter().filter(same_source).count(),
+        title: recipe.title.clone(),
     }
 }
 
@@ -321,7 +395,11 @@ pub fn optimistic_idle_view(snap: &ApiSnapshot) -> ViewSpec {
         optimistic
     });
 
-    ViewSpec::Status { status, cook: None }
+    ViewSpec::Status {
+        status,
+        cook: None,
+        timer_anchor: snap.timer_anchor,
+    }
 }
 
 /// If the server has flagged that the next stage is ready (multi-stage
@@ -733,6 +811,83 @@ mod tests {
         }
     }
 
+    // --- install_status ---
+
+    #[test]
+    fn install_status_keeps_the_anchor_while_the_timer_reading_holds() {
+        let mut running = idle_status();
+        running.timer_mode = String::from("running");
+        running.timer_total_secs = 600;
+        running.timer_current_secs = 540;
+
+        let mut snap = snapshot();
+        // idle_view only renders a status once a poll has landed.
+        snap.last_success_at = Some(Instant::from_secs(100));
+        snap.install_status(running.clone(), Instant::from_secs(100));
+        assert_eq!(snap.timer_anchor, Some(Instant::from_secs(100)));
+
+        // The oven hasn't pushed a new second yet: the anchor holds, so the
+        // row counts on rather than freezing until the value moves.
+        snap.install_status(running.clone(), Instant::from_secs(101));
+        assert_eq!(snap.timer_anchor, Some(Instant::from_secs(100)));
+        assert_eq!(idle_view(&snap).timer_age_secs(Instant::from_secs(101)), 1);
+
+        // A moved reading re-anchors, so the extrapolation can't drift.
+        let mut ticked = running.clone();
+        ticked.timer_current_secs = 538;
+        snap.install_status(ticked, Instant::from_secs(102));
+        assert_eq!(snap.timer_anchor, Some(Instant::from_secs(102)));
+        assert_eq!(idle_view(&snap).timer_age_secs(Instant::from_secs(102)), 0);
+    }
+
+    #[test]
+    fn install_status_re_anchors_when_only_the_timer_mode_moves() {
+        let mut snap = snapshot();
+        let mut status = idle_status();
+        status.timer_total_secs = 600;
+        status.timer_current_secs = 600;
+        snap.install_status(status.clone(), Instant::from_secs(100));
+
+        status.timer_mode = String::from("running");
+        snap.install_status(status, Instant::from_secs(105));
+        assert_eq!(snap.timer_anchor, Some(Instant::from_secs(105)));
+    }
+
+    // --- timer_age_secs ---
+
+    #[test]
+    fn timer_age_is_measured_from_the_anchor_not_the_last_poll() {
+        let mut snap = snapshot();
+        snap.status = Some(idle_status());
+        snap.last_success_at = Some(Instant::from_secs(107));
+        snap.timer_anchor = Some(Instant::from_secs(100));
+
+        let view = idle_view(&snap);
+        assert_eq!(view.timer_age_secs(Instant::from_secs(100)), 0);
+        // Polls since the anchor don't reset the count.
+        assert_eq!(view.timer_age_secs(Instant::from_secs(107)), 7);
+        // A clock that appears to run backwards (it can't, but the type
+        // allows it) reads as fresh rather than as a huge age.
+        assert_eq!(view.timer_age_secs(Instant::from_secs(90)), 0);
+    }
+
+    #[test]
+    fn timer_age_is_zero_without_an_anchor_or_a_status_view() {
+        let mut snap = snapshot();
+        snap.status = Some(idle_status());
+        // has_first_data() is false, so this is the Connecting placeholder —
+        // no server data behind it to age.
+        assert_eq!(idle_view(&snap).timer_age_secs(Instant::from_secs(100)), 0);
+
+        snap.last_success_at = Some(Instant::from_secs(10));
+        snap.timer_anchor = Some(Instant::from_secs(10));
+        snap.current_cook = None;
+        assert_eq!(
+            ViewSpec::ServerOffline.timer_age_secs(Instant::from_secs(100)),
+            0
+        );
+    }
+
     // --- optimistic_idle_view ---
 
     #[test]
@@ -748,6 +903,7 @@ mod tests {
             ViewSpec::Status {
                 status: Some(s),
                 cook,
+                ..
             } => {
                 assert_eq!(s.mode.as_str(), IDLE);
                 assert_eq!(s.timer_mode.as_str(), IDLE);
@@ -764,7 +920,7 @@ mod tests {
     fn optimistic_idle_with_no_status_yields_none() {
         let snap = snapshot();
         match optimistic_idle_view(&snap) {
-            ViewSpec::Status { status, cook } => {
+            ViewSpec::Status { status, cook, .. } => {
                 assert!(status.is_none());
                 assert!(cook.is_none());
             }
@@ -815,6 +971,49 @@ mod tests {
     }
 
     // --- active_recipe_title ---
+
+    fn recipe(title: &str, source: anova_oven_api::RecipeSource) -> anova_oven_api::Recipe {
+        anova_oven_api::Recipe {
+            id: title.into(),
+            title: title.into(),
+            stage_count: 0,
+            stages: Vec::new(),
+            source,
+        }
+    }
+
+    #[test]
+    fn recipe_browser_view_counts_within_source() {
+        use anova_oven_api::RecipeSource::{Bookmarked, Own};
+        let recipes = [
+            recipe("A", Own),
+            recipe("B", Own),
+            recipe("X", Bookmarked),
+            recipe("Y", Bookmarked),
+            recipe("Z", Bookmarked),
+        ];
+        let positions: Vec<_> = (0..recipes.len())
+            .map(|i| match recipe_browser_view(&recipes, i) {
+                ViewSpec::RecipeBrowser {
+                    source,
+                    count,
+                    index,
+                    title,
+                } => (source, index, count, title),
+                _ => panic!("expected a recipe browser view"),
+            })
+            .collect();
+        assert_eq!(
+            positions,
+            [
+                (Own, 0, 2, String::from("A")),
+                (Own, 1, 2, String::from("B")),
+                (Bookmarked, 0, 3, String::from("X")),
+                (Bookmarked, 1, 3, String::from("Y")),
+                (Bookmarked, 2, 3, String::from("Z")),
+            ]
+        );
+    }
 
     #[test]
     fn active_recipe_title_prefers_current_cook() {

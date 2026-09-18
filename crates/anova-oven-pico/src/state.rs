@@ -6,12 +6,12 @@ use embassy_time::{Duration, Instant, Timer};
 
 use anova_oven_pico_core::fsm::{
     active_recipe_title, baseline_state_for, cooking_view, idle_view, next_stage_prompt,
-    optimistic_idle_view, ViewSpec,
+    optimistic_idle_view, recipe_browser_view, ViewSpec,
 };
 pub use anova_oven_pico_core::fsm::{AppState, BacklightPolicy};
 
 use crate::api_client::{ApiClient, StateReceiver};
-use crate::backlight::BacklightController;
+use crate::backlight::ActiveBacklight;
 use crate::display::Display;
 use crate::input::{Input, InputEvent};
 
@@ -24,7 +24,7 @@ pub struct Ctx<'a> {
     pub api: &'a ApiClient<'static>,
     pub api_rx: StateReceiver<'static>,
     pub display: &'a Display<'static>,
-    pub backlight: BacklightController,
+    pub backlight: ActiveBacklight,
 }
 
 impl<'a> Ctx<'a> {
@@ -41,6 +41,7 @@ impl<'a> Ctx<'a> {
 pub async fn execute(state: AppState, ctx: &mut Ctx<'_>) -> AppState {
     crate::persist::record_app_state(state.discriminant());
     ctx.backlight.apply(state.backlight_policy());
+    ctx.display.set_backlight(state.backlight_policy());
 
     match state {
         AppState::Offline => execute_offline(ctx).await,
@@ -135,10 +136,12 @@ async fn execute_idle(ctx: &mut Ctx<'_>) -> AppState {
             match select(ctx.input.recv(), ctx.api_changed()).await {
                 Either::First(InputEvent::EncoderCW) if !snap.recipes.is_empty() => {
                     ctx.backlight.set_full();
+                    ctx.display.set_backlight(BacklightPolicy::Full);
                     return AppState::BrowseRecipes { index: 0 };
                 }
                 Either::First(_) => {
                     ctx.backlight.set_full();
+                    ctx.display.set_backlight(BacklightPolicy::Full);
                     dim_at = Instant::now() + idle_dim_delay;
                     dimmed = false;
                 }
@@ -148,15 +151,18 @@ async fn execute_idle(ctx: &mut Ctx<'_>) -> AppState {
             match select3(ctx.input.recv(), ctx.api_changed(), Timer::at(dim_at)).await {
                 Either3::First(InputEvent::EncoderCW) if !snap.recipes.is_empty() => {
                     ctx.backlight.set_full();
+                    ctx.display.set_backlight(BacklightPolicy::Full);
                     return AppState::BrowseRecipes { index: 0 };
                 }
                 Either3::First(_) => {
                     ctx.backlight.set_full();
+                    ctx.display.set_backlight(BacklightPolicy::Full);
                     dim_at = Instant::now() + idle_dim_delay;
                 }
                 Either3::Second(()) => {}
                 Either3::Third(()) => {
                     ctx.backlight.set_dim();
+                    ctx.display.set_backlight(BacklightPolicy::Dim);
                     dimmed = true;
                 }
             }
@@ -253,11 +259,8 @@ async fn execute_browse(mut index: usize, ctx: &mut Ctx<'_>) -> AppState {
         }
 
         index = index.min(snap.recipes.len() - 1);
-        ctx.display.render(ViewSpec::RecipeBrowser {
-            count: snap.recipes.len(),
-            index,
-            title: snap.recipes[index].title.clone(),
-        });
+        ctx.display
+            .render(recipe_browser_view(&snap.recipes, index));
 
         match select3(ctx.input.recv(), ctx.api_changed(), Timer::at(deadline)).await {
             Either3::First(InputEvent::EncoderCW) => {

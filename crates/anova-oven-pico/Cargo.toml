@@ -14,7 +14,53 @@
   edition = "2021"
 
 [features]
+  # No display by default: the firmware runs headless (defmt logging only)
+  # via screen::NullScreen. Opt into a panel with one of the ui-* features.
   default = []
+
+  # --- Display backend selection (at most one; none = headless) ---------
+  # The panels can't coexist: they all live in the GP16-GP21 block (the
+  # HD44780 uses all six; the Sharp and the OLED share SPI0 on
+  # SCK=GP18/MOSI=GP19). Choosing a UI therefore swaps both the peripheral
+  # init in main.rs and the render code behind the display task, so it has to
+  # be a cfg feature (a src/bin variant can't touch the shared main.rs).
+  # `screen.rs` picks `ActiveScreen` from whichever is enabled (or NullScreen
+  # when none is) and const-asserts that at most one is. Build:
+  #   cargo run --release                              # headless
+  #   cargo run --release --features ui-lcd            # character LCD
+  #   cargo run --release --features ui-sharp-basic    # Sharp Memory Display
+  #   cargo run --release --features ui-oled-basic     # 2.42" 128x64 OLED
+  #   cargo run --release --features ui-tft-basic      # 2.0" 320x240 colour TFT
+  # See docs/pico-displays.md for wiring and per-panel notes.
+  ui-lcd = ["dep:hd44780-driver"]
+  # First graphical layout for the Adafruit 2.7" Sharp Memory Display
+  # (LS027B7DH01, 400x240). Add future layouts as sibling `ui-sharp-*`
+  # features (see screen.rs / sharp_ui.rs).
+  ui-sharp-basic = ["_graphics"]
+  # First graphical layout for the Adafruit 2.42" 128x64 OLED module
+  # (product 2719, SSD1305/SSD1309). Shares all of the Sharp's layout code —
+  # only the driver differs (see screen.rs / oled_ui.rs / oled.rs).
+  ui-oled-basic = ["_graphics"]
+  # Adafruit revised product 2719 from an SSD1305 to an SSD1309 in September
+  # 2023, keeping the pinout and protocol but changing what the controller
+  # accepts at init. The board can't be identified over a write-only bus, so
+  # the choice is a build flag: add this feature for a board bought since
+  # then. Only meaningful alongside `ui-oled-basic`.
+  oled-ssd1309 = []
+  # First graphical layout for the Adafruit 2.0" 320x240 colour IPS TFT
+  # (product 4311, ST7789). Shares the same layout code as the other graphical
+  # panels: the driver keeps a 1-bit framebuffer and applies colour when it
+  # flushes, because a full RGB565 framebuffer would not fit in RP2040 SRAM
+  # (see screen.rs / tft_ui.rs / tft.rs).
+  ui-tft-basic = ["_graphics"]
+
+  # Internal (not for direct use): the shared 1-bit graphical stack — the
+  # embedded-graphics/u8g2 deps and the `graphics_view` layer that every
+  # pixel-addressed panel renders through. Enabled by each `ui-*` feature that
+  # needs it, so `cfg(feature = "_graphics")` means "some graphical panel is
+  # selected" without enumerating them.
+  _graphics = ["dep:embedded-graphics", "dep:u8g2-fonts"]
+
   # Enables defmt on chatty third-party deps and per-event INFO logs in our
   # own code. Off by default so the RTT buffer stays drainable when no probe
   # is attached. Warnings and errors are always emitted unconditionally.
@@ -27,11 +73,22 @@
   ]
 
 [dependencies]
+  # Character LCD backend only (pulled in by `ui-lcd`; every other config
+  # compiles none of `lcd.rs`, so an unconditional dep reads as unused).
   # Main branch uses embedded-hal 1.0 but is not yet published to crates.io.
-  hd44780-driver = { git = "https://github.com/JohnDoneth/hd44780-driver", branch = "master", features = [
+  hd44780-driver = { git = "https://github.com/JohnDoneth/hd44780-driver", branch = "master", optional = true, features = [
     "async",
   ] }
   embedded-hal = "1"
+  # Graphical backends only (pulled in by `_graphics`). embedded-graphics is a
+  # pure no_std graphics lib. Both panels use the blocking `embedded-hal`
+  # SpiBus (already a dep) — see docs/pico-display-dma.md for why not async/DMA
+  # (a driver rewrite plus a cancellation hazard, not a HAL limitation).
+  embedded-graphics = { version = "0.8", optional = true }
+  # Bitmap fonts (u8g2 collection) for distance-readable text. Renders straight
+  # to an embedded-graphics DrawTarget via its FontRenderer; pulled in only by
+  # the `_graphics` feature.
+  u8g2-fonts = { version = "0.8", optional = true, default-features = false }
 
   anova-oven-api = { path = "../anova-oven-api", default-features = false }
   # Pure-logic core extracted from this crate so it can be host-tested

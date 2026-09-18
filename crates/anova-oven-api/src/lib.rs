@@ -31,7 +31,11 @@ pub struct OvenStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub probe_temperature_c: Option<f32>,
 
-    /// Timer elapsed, in seconds.
+    /// Seconds left on the timer — the oven's `timer.current` counts *down*
+    /// from [`Self::timer_total_secs`] towards zero, and reads as the full
+    /// duration both before a stage's timer starts and after it expires.
+    /// (The WebSocket field was long documented here as seconds *elapsed*;
+    /// it isn't — a display showing `total - current` counts up.)
     pub timer_current_secs: u64,
     /// Timer total duration, in seconds.
     pub timer_total_secs: u64,
@@ -190,13 +194,54 @@ impl OvenStatus {
         }
     }
 
-    /// Timer remaining in seconds, if a timer is running.
+    /// Which of `stages` this status is reporting on, if it can be resolved.
+    ///
+    /// Two sources, most authoritative first:
+    ///
+    /// 1. [`Self::cook_progress`], the server's tracked index. That tracker
+    ///    already prefers the oven's own `activeStageIndex` and falls back to a
+    ///    heuristic of its own, so it is the best answer available.
+    /// 2. [`Self::active_stage_index`] raw, for a status read before the
+    ///    tracker has caught up (mid-startup, or the first poll of a cook).
+    ///
+    /// `None` when neither is present, or when the index is out of range for
+    /// `stages` — a cook whose stage list has not been fetched yet, say.
+    /// Callers should degrade to what they can say without naming a stage
+    /// rather than guessing, because guessing is what this replaced: matching
+    /// on [`Stage::kind`] silently picks the wrong stage in any cook with two
+    /// stages of the same kind.
+    pub fn current_stage<'a>(&self, stages: &'a [Stage]) -> Option<&'a Stage> {
+        self.cook_progress
+            .as_ref()
+            .map(|p| p.current_stage_index)
+            .or(self.active_stage_index)
+            .and_then(|i| stages.get(i))
+    }
+
+    /// Seconds left on the timer as of the moment this status was read from
+    /// the oven — the same direction the oven's own panel counts. `None` if no
+    /// timer is running.
     pub fn timer_remaining_secs(&self) -> Option<u64> {
+        self.timer_remaining_secs_after(0)
+    }
+
+    /// [`Self::timer_remaining_secs`] as it reads `elapsed_secs` after this
+    /// status was fetched.
+    ///
+    /// The oven's timer does not wait for us to poll it, so a client that only
+    /// ever shows the last number it was sent ticks in poll-sized jumps and
+    /// stalls outright whenever a poll is late. Extrapolating from the fetch
+    /// time instead gives a timer that counts at 1 Hz on its own and is
+    /// re-anchored by every poll, so it can't drift.
+    ///
+    /// Only a *running* timer is extrapolated — a paused or finished one is
+    /// whatever the oven last said. The extrapolation is open-ended, on the
+    /// assumption that the caller stops showing a status it can no longer
+    /// refresh (the Pico firmware takes the screen over with `ServerOffline`
+    /// after three failed polls).
+    pub fn timer_remaining_secs_after(&self, elapsed_secs: u64) -> Option<u64> {
         if self.timer_mode == "running" && self.timer_total_secs > 0 {
-            Some(
-                self.timer_total_secs
-                    .saturating_sub(self.timer_current_secs),
-            )
+            Some(self.timer_current_secs.saturating_sub(elapsed_secs))
         } else {
             None
         }
@@ -212,6 +257,21 @@ pub struct Recipe {
     /// Number of cook stages (convenience field for list views).
     pub stage_count: usize,
     pub stages: Vec<Stage>,
+    /// Whether the user wrote this recipe or bookmarked someone else's.
+    /// Defaults to [`RecipeSource::Own`] so older servers still parse.
+    #[serde(default)]
+    pub source: RecipeSource,
+}
+
+/// Where a [`Recipe`] in the user's list came from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecipeSource {
+    /// A recipe the user created.
+    #[default]
+    Own,
+    /// Someone else's recipe the user bookmarked.
+    Bookmarked,
 }
 
 /// A single cook stage within a recipe.
@@ -404,26 +464,16 @@ impl CurrentCook {
             &self.recipe_title
         }
     }
-
-    /// Find the stage matching the oven's current phase.
-    ///
-    /// This heuristic is broken for multi-stage cooks where multiple stages
-    /// share the same [`Stage::kind`]. Prefer reading
-    /// [`OvenStatus::cook_progress`] (`current_stage_index`) when available.
-    #[deprecated(note = "use OvenStatus:: instead")]
-    pub fn current_stage(&self, status: &OvenStatus) -> Option<&Stage> {
-        let kind = status.stage_kind();
-        self.stages.iter().find(|s| s.kind == kind)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn oven_status_round_trip() {
-        let status = OvenStatus {
+    /// A mid-cook status: 3600s timer with 300 on the clock, every field
+    /// populated. Tests mutate what they care about.
+    fn cooking_status() -> OvenStatus {
+        OvenStatus {
             mode: "cook".into(),
             temperature_unit: "F".into(),
             temperature_c: 200.0,
@@ -460,7 +510,12 @@ mod tests {
             active_stage_id: None,
             cook_progress: None,
             upstream: None,
-        };
+        }
+    }
+
+    #[test]
+    fn oven_status_round_trip() {
+        let status = cooking_status();
         let json = serde_json::to_string(&status).unwrap();
         let parsed: OvenStatus = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.mode, "cook");
@@ -473,11 +528,127 @@ mod tests {
     }
 
     #[test]
+    fn timer_extrapolates_from_the_fetch_but_never_past_zero() {
+        let mut status = cooking_status();
+
+        // `timer_current_secs` *is* the time left (3600 total, 300 to go, 5
+        // minutes into an hour-long cook), one less for each second since the
+        // fetch.
+        assert_eq!(status.timer_remaining_secs(), Some(300));
+        assert_eq!(status.timer_remaining_secs_after(1), Some(299));
+        assert_eq!(status.timer_remaining_secs_after(300), Some(0));
+        // A stale status parks at zero rather than wrapping around.
+        assert_eq!(status.timer_remaining_secs_after(9999), Some(0));
+
+        // Only a running timer is extrapolated: a paused one is not ticking,
+        // so the answer is the same however long ago we asked.
+        status.timer_mode = "idle".into();
+        assert_eq!(status.timer_remaining_secs_after(10), None);
+    }
+
+    /// A stage carrying only the fields the resolver's callers read back.
+    fn stage(kind: &str, title: &str) -> Stage {
+        Stage {
+            id: None,
+            kind: kind.into(),
+            temperature_c: 200.0,
+            temperature_bulbs_mode: None,
+            duration_secs: None,
+            timer_added: None,
+            probe_added: None,
+            probe_target_c: None,
+            steam_pct: 0.0,
+            fan_speed: 100,
+            user_action_required: None,
+            rack_position: None,
+            heating_element_top: None,
+            heating_element_rear: None,
+            heating_element_bottom: None,
+            vent_open: None,
+            title: Some(title.into()),
+        }
+    }
+
+    fn progress_at(index: usize) -> CookProgress {
+        CookProgress {
+            recipe_title: "Roast Chicken".into(),
+            current_stage_index: index,
+            total_stage_count: 3,
+            current_stage_description: "stage".into(),
+            current_stage_kind: "cook".into(),
+            next_stage_ready: false,
+            next_stage_description: None,
+        }
+    }
+
+    /// Preheat, then *two* cook stages — the shape the old kind-matching
+    /// heuristic got wrong, since both of the last two are `"cook"`.
+    fn three_stages() -> Vec<Stage> {
+        vec![
+            stage("preheat", "Preheat"),
+            stage("cook", "Sear"),
+            stage("cook", "Rest"),
+        ]
+    }
+
+    #[test]
+    fn current_stage_reads_the_tracked_index() {
+        let mut status = cooking_status();
+        status.cook_progress = Some(progress_at(2));
+        // Kind-matching would have stopped at "Sear", the first `"cook"` stage.
+        assert_eq!(
+            status.current_stage(&three_stages()).unwrap().title,
+            Some("Rest".into())
+        );
+    }
+
+    #[test]
+    fn current_stage_prefers_the_tracker_over_the_ovens_raw_index() {
+        let mut status = cooking_status();
+        // The tracker has advanced; the oven's own field lags a poll behind.
+        status.cook_progress = Some(progress_at(2));
+        status.active_stage_index = Some(1);
+        assert_eq!(
+            status.current_stage(&three_stages()).unwrap().title,
+            Some("Rest".into())
+        );
+    }
+
+    #[test]
+    fn current_stage_falls_back_to_the_ovens_raw_index() {
+        let mut status = cooking_status();
+        // No tracker yet — mid-startup, or the first poll of a cook.
+        status.active_stage_index = Some(1);
+        assert_eq!(
+            status.current_stage(&three_stages()).unwrap().title,
+            Some("Sear".into())
+        );
+    }
+
+    #[test]
+    fn current_stage_is_unresolved_when_nothing_reports_an_index() {
+        let status = cooking_status();
+        // Better than guessing: callers degrade to what they can say without
+        // naming a stage.
+        assert!(status.current_stage(&three_stages()).is_none());
+    }
+
+    #[test]
+    fn current_stage_is_unresolved_when_the_index_is_out_of_range() {
+        let mut status = cooking_status();
+        status.cook_progress = Some(progress_at(7));
+        assert!(status.current_stage(&three_stages()).is_none());
+        // Notably including a cook whose stages haven't been fetched yet.
+        assert!(status.current_stage(&[]).is_none());
+    }
+
+    #[test]
     fn recipe_round_trip() {
         let recipe = Recipe {
             id: "abc123".into(),
             title: "Roast Chicken".into(),
             stage_count: 2,
+            source: RecipeSource::Bookmarked,
             stages: vec![
                 Stage {
                     id: None,
@@ -524,6 +695,15 @@ mod tests {
         assert_eq!(parsed.id, "abc123");
         assert_eq!(parsed.stages.len(), 2);
         assert_eq!(parsed.stages[1].duration_secs, Some(3600));
+        assert_eq!(parsed.source, RecipeSource::Bookmarked);
+        assert!(json.contains(r#""source":"bookmarked""#));
+    }
+
+    #[test]
+    fn recipe_without_source_defaults_to_own() {
+        let json = r#"{"id":"a","title":"T","stage_count":0,"stages":[]}"#;
+        let parsed: Recipe = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.source, RecipeSource::Own);
     }
 
     #[test]
