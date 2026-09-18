@@ -132,8 +132,8 @@ impl<SPI: SpiBus, CS: OutputPin> Sharp<SPI, CS> {
             any = true;
             tx[p] = ((line + 1) as u8).reverse_bits(); // 1-indexed line address
             p += 1;
-            for i in start..end {
-                tx[p] = self.frame[i].reverse_bits();
+            for &byte in &self.frame[start..end] {
+                tx[p] = byte.reverse_bits();
                 p += 1;
             }
             tx[p] = 0x00; // end of line
