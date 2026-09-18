@@ -32,7 +32,7 @@
   #   cargo run --release --features ui-oled-basic     # 2.42" 128x64 OLED
   #   cargo run --release --features ui-tft-basic      # 2.0" 320x240 colour TFT
   # See docs/pico-displays.md for wiring and per-panel notes.
-  ui-lcd = []
+  ui-lcd = ["dep:hd44780-driver"]
   # First graphical layout for the Adafruit 2.7" Sharp Memory Display
   # (LS027B7DH01, 400x240). Add future layouts as sibling `ui-sharp-*`
   # features (see screen.rs / sharp_ui.rs).
@@ -73,8 +73,10 @@
   ]
 
 [dependencies]
+  # Character LCD backend only (pulled in by `ui-lcd`; every other config
+  # compiles none of `lcd.rs`, so an unconditional dep reads as unused).
   # Main branch uses embedded-hal 1.0 but is not yet published to crates.io.
-  hd44780-driver = { git = "https://github.com/JohnDoneth/hd44780-driver", branch = "master", features = [
+  hd44780-driver = { git = "https://github.com/JohnDoneth/hd44780-driver", branch = "master", optional = true, features = [
     "async",
   ] }
   embedded-hal = "1"
