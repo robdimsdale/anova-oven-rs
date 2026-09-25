@@ -29,3 +29,7 @@
   tracing = "0.1"
   tracing-appender = "0.2"
   tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+  metrics = "0.24"
+  # No default features: we render via our own axum route (`/metrics`), so
+  # the bundled hyper listener and push-gateway client are not needed.
+  metrics-exporter-prometheus = { version = "0.18", default-features = false }
