@@ -19,6 +19,11 @@ use crate::firestore::{self, FirebaseSession};
 use crate::liveness::Liveness;
 use crate::protocol;
 use crate::runtime::types::{WsCommand, WsEvent};
+use crate::telemetry;
+
+fn count_frame(kind: &'static str) {
+    metrics::counter!(telemetry::WS_FRAMES, "kind" => kind).increment(1);
+}
 
 /// Firebase ID tokens are valid for ~60 minutes. Refresh a little early so a
 /// reconnect never presents an about-to-expire token to Anova's gateway.
@@ -299,6 +304,7 @@ pub async fn run(
             Err(e) => warn!(error = %e, "[ws] connection error"),
         }
         liveness.set_connected(false);
+        metrics::counter!(telemetry::WS_RECONNECTS).increment(1);
         let _ = evt_tx.send(WsEvent::Disconnected).await;
         info!("[ws] reconnecting in 5s");
         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -372,9 +378,11 @@ async fn connect_and_run(
                     // freshness signal — only EVENT_APO_STATE resets the
                     // deadline below.
                     Some(Ok(msg)) if msg.is_ping() || msg.is_pong() => {
+                        count_frame(if msg.is_ping() { "ping" } else { "pong" });
                         trace!(kind = if msg.is_ping() { "ping" } else { "pong" }, "[ws] control frame");
                     }
                     Some(Ok(msg)) if msg.is_close() => {
+                        count_frame("close");
                         let reason = msg
                             .as_close()
                             .map(|(code, text)| format!("{code:?}: {text}"))
@@ -385,6 +393,7 @@ async fn connect_and_run(
                         let raw_bytes = msg.as_payload();
                         match protocol::parse_message(raw_bytes) {
                             Ok(protocol::Event::ApoState(payload)) => {
+                                count_frame("state");
                                 // The freshness signal for both the reconnect
                                 // watchdog and `/health`: this is the frame whose
                                 // absence means "stale data".
@@ -411,6 +420,7 @@ async fn connect_and_run(
                                 }
                             }
                             Ok(protocol::Event::ApoWifiList { cooker_id: id }) => {
+                                count_frame("wifi_list");
                                 if let Some(id) = id {
                                     info!(cooker_id = %id, "[ws] cooker id received");
                                     cooker_id = Some(id.clone());
@@ -420,6 +430,7 @@ async fn connect_and_run(
                                 }
                             }
                             Ok(protocol::Event::Response { request_id, status }) => {
+                                count_frame("response");
                                 let response_payload = serde_json::from_slice::<serde_json::Value>(raw_bytes)
                                     .ok()
                                     .and_then(|v| v.get("payload").cloned());
@@ -434,9 +445,11 @@ async fn connect_and_run(
                                 }
                             }
                             Ok(event) => {
+                                count_frame("other");
                                 trace!(event = ?event, "[ws] event");
                             }
                             Err(e) => {
+                                count_frame("parse_error");
                                 warn!(error = %e, "[ws] parse error");
                                 let _ = evt_tx.send(WsEvent::ParseError { detail: e.to_string() }).await;
                             }

@@ -2,7 +2,8 @@
 //!
 //! Owns Firebase session lifecycle, retry/timeout policy, and Firestore IO.
 
-use std::time::Duration;
+use std::future::Future;
+use std::time::{Duration, Instant};
 
 use reqwest::Client;
 use tokio::sync::mpsc;
@@ -10,6 +11,7 @@ use tracing::{info, warn};
 
 use crate::firestore::{self, FirebaseSession, FirestoreError};
 use crate::runtime::types::{FirestoreCommand, FirestoreEvent, FirestoreTaskError};
+use crate::telemetry;
 
 const DEFAULT_RECIPES_REFRESH_TIMEOUT_SECS: u64 = 15;
 const DEFAULT_HISTORY_REFRESH_TIMEOUT_SECS: u64 = 15;
@@ -47,21 +49,21 @@ impl FirestoreProcessor {
         while let Some(cmd) = self.cmd_rx.recv().await {
             match cmd {
                 FirestoreCommand::RefreshRecipes => {
-                    let out = self.refresh_recipes().await;
+                    let out = instrumented("refresh_recipes", self.refresh_recipes()).await;
                     let _ = self
                         .evt_tx
                         .send(FirestoreEvent::RecipesRefreshed(out))
                         .await;
                 }
                 FirestoreCommand::RefreshHistory { reason: _ } => {
-                    let out = self.refresh_history().await;
+                    let out = instrumented("refresh_history", self.refresh_history()).await;
                     let _ = self
                         .evt_tx
                         .send(FirestoreEvent::HistoryRefreshed(out))
                         .await;
                 }
                 FirestoreCommand::FetchCurrentCook { reason } => {
-                    let out = self.fetch_current_cook().await;
+                    let out = instrumented("fetch_current_cook", self.fetch_current_cook()).await;
                     let _ = self
                         .evt_tx
                         .send(FirestoreEvent::CurrentCookFetched {
@@ -71,9 +73,11 @@ impl FirestoreProcessor {
                         .await;
                 }
                 FirestoreCommand::PatchCookRecipeRef { cook_id, recipe_id } => {
-                    let out = self
-                        .set_cook_recipe_ref_with_retry(cook_id.clone(), recipe_id.clone())
-                        .await;
+                    let out = instrumented(
+                        "patch_cook_recipe_ref",
+                        self.set_cook_recipe_ref_with_retry(cook_id.clone(), recipe_id.clone()),
+                    )
+                    .await;
                     let _ = self
                         .evt_tx
                         .send(FirestoreEvent::RecipeRefPatched {
@@ -84,7 +88,11 @@ impl FirestoreProcessor {
                         .await;
                 }
                 FirestoreCommand::ResolveManualCookTitle { cook } => {
-                    let out = self.resolve_manual_cook_title(cook).await;
+                    let out = instrumented(
+                        "resolve_manual_cook_title",
+                        self.resolve_manual_cook_title(cook),
+                    )
+                    .await;
                     let _ = self
                         .evt_tx
                         .send(FirestoreEvent::ManualCookTitleResolved {
@@ -283,6 +291,27 @@ impl FirestoreProcessor {
             FirestoreError::Other(e) => Err(FirestoreTaskError::Other(e.to_string())),
         }
     }
+}
+
+/// Time one Firestore operation end to end (retries and session refresh
+/// included) and count it by outcome. `op` is one of the five command kinds,
+/// so the label set stays closed.
+async fn instrumented<T>(
+    op: &'static str,
+    fut: impl Future<Output = Result<T, FirestoreTaskError>>,
+) -> Result<T, FirestoreTaskError> {
+    let started = Instant::now();
+    let out = fut.await;
+    let outcome = match &out {
+        Ok(_) => "ok",
+        Err(FirestoreTaskError::Timeout) => "timeout",
+        Err(FirestoreTaskError::Unauthorized) => "unauthorized",
+        Err(FirestoreTaskError::Other(_)) => "error",
+    };
+    metrics::histogram!(telemetry::FIRESTORE_REQUEST_DURATION, "op" => op)
+        .record(started.elapsed().as_secs_f64());
+    metrics::counter!(telemetry::FIRESTORE_REQUESTS, "op" => op, "outcome" => outcome).increment(1);
+    out
 }
 
 fn approx_eq_f32(a: f32, b: f32, tolerance: f32) -> bool {

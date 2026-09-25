@@ -79,6 +79,16 @@ impl Liveness {
         }
     }
 
+    /// Unix-epoch milliseconds of the last oven-state frame, or `None` if none
+    /// has arrived since startup. `/metrics` publishes this as an absolute
+    /// timestamp rather than an age (see `telemetry::record_liveness`).
+    pub fn last_state_unix_ms(&self) -> Option<u64> {
+        match self.last_state_ms.load(Ordering::Relaxed) {
+            0 => None,
+            ms => Some(ms),
+        }
+    }
+
     /// Whether the upstream WebSocket is currently connected.
     pub fn connected(&self) -> bool {
         self.connected.load(Ordering::Relaxed)
@@ -86,12 +96,9 @@ impl Liveness {
 
     /// Point-in-time view for serialization.
     pub fn snapshot(&self) -> LivenessSnapshot {
-        let last = self.last_state_ms.load(Ordering::Relaxed);
-        let seconds_since_last_state = if last == 0 {
-            None
-        } else {
-            Some(now_ms().saturating_sub(last) / 1000)
-        };
+        let seconds_since_last_state = self
+            .last_state_unix_ms()
+            .map(|last| now_ms().saturating_sub(last) / 1000);
         LivenessSnapshot {
             connected: self.connected.load(Ordering::Relaxed),
             seconds_since_last_state,

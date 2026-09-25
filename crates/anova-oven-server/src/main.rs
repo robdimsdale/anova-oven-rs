@@ -13,6 +13,7 @@ mod protocol;
 mod read_model;
 mod recipe;
 mod runtime;
+mod telemetry;
 
 use std::time::Duration;
 
@@ -128,6 +129,7 @@ fn spawn_tick_loop(evt_tx: mpsc::Sender<StateMachineEvent>, period: Duration, ki
 #[tokio::main]
 async fn main() {
     let _tracing_guard = init_tracing();
+    let metrics = telemetry::install();
 
     // Optional: a static PAT for the WebSocket. When absent, the WS falls back
     // to the auto-refreshing Firebase ID token (see below), which is the more
@@ -280,6 +282,8 @@ async fn main() {
         }
     });
 
+    tokio::spawn(telemetry::run_oven_status_gauges(status_rx.clone()));
+
     let cook_progress_task = CookProgressTask::new(cook_progress_tx);
     spawn_critical(
         "cook-progress",
@@ -315,6 +319,7 @@ async fn main() {
         cook_progress_rx,
         cook_progress_msg_tx,
         liveness,
+        metrics,
     });
 
     let addr = std::env::var("ANOVA_BIND").unwrap_or_else(|_| "0.0.0.0:8080".into());
