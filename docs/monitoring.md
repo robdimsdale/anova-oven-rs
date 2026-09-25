@@ -228,6 +228,10 @@ label in this document is drawn from a closed enum, and that is deliberate.
 
 ## Alerts these metrics exist for
 
+**Not implemented yet.** Alerting (Prometheus rules, Grafana alerts) is skipped
+for now; the metrics ship first. This table records the intent for when it is
+picked up.
+
 The mapping from metric to the failure it makes visible, each of which is
 invisible today.
 
@@ -241,6 +245,16 @@ invisible today.
 | Server restart loop | `changes(anova_process_start_time_seconds[30m]) > 3` | nothing |
 | Door left open mid-cook | `anova_oven_door_open == 1 and anova_oven_cook_active == 1` for 10m | nothing |
 | Water tank empty mid-cook | `anova_oven_water_tank_empty == 1 and anova_oven_cook_active == 1` | nothing |
+
+**The stale-upstream threshold above is wrong for an idle oven.** Anova sends
+`EVENT_APO_STATE` roughly every 10 minutes when idle and every ~10 s while
+cooking (see `DEFAULT_WS_READ_TIMEOUT_SECS` in `main.rs`), so a 120 s threshold
+would fire most of the time the oven is idle. When alerting is picked up, either
+tie the threshold to the idle heartbeat, e.g.
+`time() - anova_upstream_last_state_timestamp_seconds > 1200` (matching
+`ANOVA_WS_READ_TIMEOUT_SECS`), or keep 120 s and scope it to cooks with
+`and anova_oven_cook_active == 1`. Both are worth having: the first catches a
+dead link at any time, the second catches it quickly when it matters.
 
 The oven-domain ones are what justify the exercise to anyone who does not care
 about heap fragmentation. For a cooking appliance the other obvious one is probe
@@ -353,7 +367,8 @@ population becomes large enough for outlier-hunting to mean something. Not befor
 
 ## Implementation notes
 
-Both phases are implemented. Choices the tables above left open:
+Both phases are implemented; alerting is not (see "Alerts these metrics exist
+for"). Choices the tables above left open:
 
 - **Server** (`crates/anova-oven-server/src/telemetry.rs`). Label sets:
   `anova_oven_temp_celsius{bulb}` is `dry`, `dry_top`, `dry_bottom`, `wet`,
