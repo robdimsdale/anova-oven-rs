@@ -36,6 +36,11 @@ pub const METRICS_BUF_LEN: usize = 2048;
 
 pub type MetricsBuf = String<METRICS_BUF_LEN>;
 
+/// `Content-Type` for the Prometheus text exposition format. `0.0.4` is that
+/// format's version (unchanged since Prometheus 0.4); the `version` parameter
+/// is how a scraper tells it apart from OpenMetrics or protobuf.
+pub const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
+
 /// Render `snap` in the Prometheus text exposition format.
 pub fn render(snap: &Snapshot) -> MetricsBuf {
     let mut out = LineTruncatingWriter {

@@ -94,7 +94,7 @@ struct Metrics(anova_oven_pico_core::metrics::MetricsBuf);
 
 impl Content for Metrics {
     fn content_type(&self) -> &'static str {
-        "text/plain; version=0.0.4; charset=utf-8"
+        anova_oven_pico_core::metrics::CONTENT_TYPE
     }
 
     fn content_length(&self) -> usize {
