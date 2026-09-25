@@ -35,6 +35,11 @@ pub const OVEN_COOK_ACTIVE: &str = "anova_oven_cook_active";
 pub const OVEN_DOOR_OPEN: &str = "anova_oven_door_open";
 pub const OVEN_WATER_TANK_EMPTY: &str = "anova_oven_water_tank_empty";
 
+/// `Content-Type` for the Prometheus text exposition format. `0.0.4` is that
+/// format's version (unchanged since Prometheus 0.4); the `version` parameter
+/// is how a scraper tells it apart from OpenMetrics or protobuf.
+pub const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
+
 /// Firestore calls are HTTPS round-trips to Google with retries and a 15s
 /// outer timeout, so the interesting range is ~50ms to ~15s.
 const FIRESTORE_DURATION_BUCKETS: &[f64] = &[0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0];

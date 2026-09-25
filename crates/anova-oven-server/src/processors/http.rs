@@ -61,7 +61,7 @@ async fn handle_metrics(State(state): State<Arc<HttpState>>) -> impl IntoRespons
     telemetry::record_liveness(&state.liveness);
     build_response(
         StatusCode::OK,
-        "text/plain; version=0.0.4; charset=utf-8",
+        telemetry::CONTENT_TYPE,
         state.metrics.render().into_bytes(),
     )
 }
