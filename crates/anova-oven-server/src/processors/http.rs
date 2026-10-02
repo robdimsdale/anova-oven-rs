@@ -12,7 +12,8 @@ use axum::http::header::{CONNECTION, CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing;
-use axum::{Json, Router};
+use axum::{middleware, Json, Router};
+use metrics_exporter_prometheus::PrometheusHandle;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, info, trace, warn};
@@ -20,6 +21,7 @@ use tracing::{debug, info, trace, warn};
 use crate::cook_progress::CookProgressMsg;
 use crate::liveness::Liveness;
 use crate::runtime::types::{SmError, StateMachineCommand};
+use crate::telemetry;
 
 #[derive(Clone)]
 pub struct HttpState {
@@ -27,6 +29,7 @@ pub struct HttpState {
     pub cook_progress_rx: watch::Receiver<Option<CookProgress>>,
     pub cook_progress_msg_tx: mpsc::Sender<CookProgressMsg>,
     pub liveness: Arc<Liveness>,
+    pub metrics: PrometheusHandle,
 }
 
 pub(crate) fn router(state: HttpState) -> Router {
@@ -39,6 +42,8 @@ pub(crate) fn router(state: HttpState) -> Router {
         .route("/start", routing::post(handle_start))
         .route("/current-cook", routing::get(handle_current_cook))
         .route("/health", routing::get(handle_health))
+        .route("/metrics", routing::get(handle_metrics))
+        .layer(middleware::from_fn(telemetry::track_http))
         .with_state(Arc::new(state))
 }
 
@@ -48,6 +53,17 @@ pub(crate) fn router(state: HttpState) -> Router {
 /// inspect the JSON fields.
 async fn handle_health(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
     json_response(StatusCode::OK, &state.liveness.snapshot())
+}
+
+/// Prometheus scrape target. See `docs/monitoring.md`. Liveness gauges are
+/// refreshed here, at scrape time, so they are never staler than the scrape.
+async fn handle_metrics(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
+    telemetry::record_liveness(&state.liveness);
+    build_response(
+        StatusCode::OK,
+        telemetry::CONTENT_TYPE,
+        state.metrics.render().into_bytes(),
+    )
 }
 
 fn build_response(status: StatusCode, content_type: &'static str, body: Vec<u8>) -> Response {
