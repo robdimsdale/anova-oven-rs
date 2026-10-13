@@ -310,6 +310,7 @@ impl Processor {
             status.upstream = Some(anova_oven_api::UpstreamHealth {
                 connected,
                 disconnected_secs: sources.liveness.disconnected_secs(),
+                oven_offline_secs: sources.liveness.oven_offline_secs(),
             });
             status
         });

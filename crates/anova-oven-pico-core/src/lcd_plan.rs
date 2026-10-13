@@ -30,7 +30,7 @@ use embassy_time::{Duration, Instant};
 use anova_oven_api::{CurrentCook, OvenStatus};
 
 use crate::api::celcius_to_fahrenheit;
-use crate::fsm::ViewSpec;
+use crate::fsm::{format_age, StaleCause, ViewSpec};
 use crate::view_plan::recipe_browser_header;
 
 /// Character cells per row on the panel this plans for.
@@ -82,12 +82,27 @@ pub fn plan_lcd(view: &ViewSpec, timer_age_secs: u64) -> LcdPlan {
         ViewSpec::DhcpInit => rows("Anova Oven", "Init: DHCP..."),
         ViewSpec::Connecting => rows("Anova Oven", "Connecting..."),
         ViewSpec::ServerOffline => rows("Server Offline", "Check backend"),
-        ViewSpec::UpstreamStale { disconnected_secs } => rows(
+        // Both second rows overflow 16 cells and marquee.
+        ViewSpec::UpstreamStale {
+            cause: StaleCause::AnovaLink,
+            secs,
+        } => rows(
             "Anova Link Down",
-            // By the time this view is up, `disconnected_secs` is past the
-            // grace window (60s), so the minute count is always >= 1. The row
-            // overflows 16 cells and marquees.
-            format!("Stale {}m - check", disconnected_secs / 60),
+            format!("Stale {} - check", format_age(*secs)),
+        ),
+        ViewSpec::UpstreamStale {
+            cause: StaleCause::OvenOffline,
+            secs,
+        } => rows(
+            "Oven Offline",
+            format!("{} - check its WiFi", format_age(*secs)),
+        ),
+        ViewSpec::UpstreamStale {
+            cause: StaleCause::NoOvenState,
+            secs,
+        } => rows(
+            "Waiting for Oven",
+            format!("{} - no data yet", format_age(*secs)),
         ),
         ViewSpec::Status { status, cook, .. } => {
             plan_status(status.as_ref(), cook.as_ref(), timer_age_secs)
@@ -628,15 +643,36 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_upstream_reports_whole_minutes() {
+    fn a_stale_upstream_reports_its_cause_and_age() {
         let plan = plan_lcd(
             &ViewSpec::UpstreamStale {
-                disconnected_secs: 185,
+                cause: StaleCause::AnovaLink,
+                secs: 185,
             },
             0,
         );
         assert_eq!(plan.row0, "Anova Link Down");
         assert_eq!(plan.row1_slots, ["Stale 3m - check"]);
+
+        let plan = plan_lcd(
+            &ViewSpec::UpstreamStale {
+                cause: StaleCause::OvenOffline,
+                secs: 86_400,
+            },
+            0,
+        );
+        assert_eq!(plan.row0, "Oven Offline");
+        assert_eq!(plan.row1_slots, ["24h - check its WiFi"]);
+
+        let plan = plan_lcd(
+            &ViewSpec::UpstreamStale {
+                cause: StaleCause::NoOvenState,
+                secs: 90,
+            },
+            0,
+        );
+        assert_eq!(plan.row0, "Waiting for Oven");
+        assert_eq!(plan.row1_slots, ["1m - no data yet"]);
     }
 
     #[test]

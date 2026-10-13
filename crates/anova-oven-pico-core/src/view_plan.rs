@@ -14,7 +14,7 @@ use alloc::{format, string::String, vec::Vec};
 use anova_oven_api::{CurrentCook, OvenStatus, RecipeSource};
 
 use crate::api::celcius_to_fahrenheit;
-use crate::fsm::ViewSpec;
+use crate::fsm::{format_age, StaleCause, ViewSpec};
 
 /// The recipe browser's header, e.g. "My recipe 2/3" or "Bookmark 1/4".
 /// `index` is zero-based within the recipes of `source`. Kept to 16 chars for
@@ -254,20 +254,27 @@ where
             2,
             &measure,
         ),
-        ViewSpec::UpstreamStale { disconnected_secs } => {
+        ViewSpec::UpstreamStale { cause, secs } => {
+            let (title, detail) = match cause {
+                StaleCause::AnovaLink => ("Anova link down", format!("{} ago", format_age(*secs))),
+                StaleCause::OvenOffline => ("Oven offline", format!("for {}", format_age(*secs))),
+                StaleCause::NoOvenState => {
+                    ("Waiting for oven", format!("for {}", format_age(*secs)))
+                }
+            };
             let mut lines = Vec::new();
             push_wrapped(
                 &mut lines,
                 FontRole::Title,
-                "Oven disconnected",
+                title,
                 content_width,
                 2,
                 &measure,
             );
-            lines.push(planline(
-                FontRole::Body,
-                format!("{disconnected_secs}s ago"),
-            ));
+            lines.push(planline(FontRole::Body, detail));
+            if *cause == StaleCause::OvenOffline {
+                lines.push(planline(FontRole::Body, String::from("Check its WiFi")));
+            }
             ScreenPlan {
                 placement: Placement::Centered,
                 lines,

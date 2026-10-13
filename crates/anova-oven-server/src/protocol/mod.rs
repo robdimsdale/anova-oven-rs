@@ -46,6 +46,23 @@ pub struct SystemInfo {
     pub online: Option<bool>,
     pub firmware_version: Option<String>,
     pub hardware_version: Option<String>,
+    /// When the oven last dropped off Anova's cloud, as `YYYY-MM-DDTHH:MM:SSZ`.
+    pub last_disconnected_timestamp: Option<String>,
+}
+
+impl SystemInfo {
+    /// [`Self::last_disconnected_timestamp`] as Unix milliseconds, or `None`
+    /// if absent or not in the expected format.
+    pub fn last_disconnected_unix_ms(&self) -> Option<u64> {
+        parse_utc_timestamp_ms(self.last_disconnected_timestamp.as_deref()?)
+    }
+}
+
+/// Parse the RFC 3339 UTC timestamps Anova uses (`YYYY-MM-DDTHH:MM:SSZ`)
+/// into Unix milliseconds. `None` for anything unparseable or pre-epoch.
+fn parse_utc_timestamp_ms(s: &str) -> Option<u64> {
+    let at = s.parse::<jiff::Timestamp>().ok()?;
+    u64::try_from(at.as_millisecond()).ok()
 }
 
 #[derive(Debug, Deserialize)]
@@ -377,5 +394,39 @@ mod tests {
         assert_eq!(info.online, Some(true));
         assert_eq!(info.firmware_version.as_deref(), Some("2.1.7"));
         assert_eq!(info.hardware_version.as_deref(), Some("120V Universal"));
+        assert_eq!(info.last_disconnected_unix_ms(), None);
+    }
+
+    #[test]
+    fn last_disconnected_timestamp_parses_to_unix_ms() {
+        let payload = parse(&wet_cook_frame(
+            r#","systemInfo":{"online":false,"lastDisconnectedTimestamp":"2024-01-03T21:51:28Z"}"#,
+        ));
+        let info = payload.state.system_info.expect("systemInfo");
+        assert_eq!(info.online, Some(false));
+        // `date -u -d 2024-01-03T21:51:28Z +%s`
+        assert_eq!(info.last_disconnected_unix_ms(), Some(1_704_318_688_000));
+    }
+
+    #[test]
+    fn utc_timestamps_parse_across_calendar_edges() {
+        assert_eq!(parse_utc_timestamp_ms("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(
+            parse_utc_timestamp_ms("2024-02-29T23:59:59Z"),
+            Some(1_709_251_199_000)
+        );
+        assert_eq!(
+            parse_utc_timestamp_ms("2000-03-01T00:00:00.123Z"),
+            Some(951_868_800_123)
+        );
+        for bad in [
+            "",
+            "2024-01-03",
+            "2024-01-03T21:51:28",
+            "2024-13-03T21:51:28Z",
+            "1969-12-31T23:59:59Z",
+        ] {
+            assert_eq!(parse_utc_timestamp_ms(bad), None, "{bad}");
+        }
     }
 }
