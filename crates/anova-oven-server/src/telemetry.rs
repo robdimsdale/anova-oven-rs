@@ -954,6 +954,7 @@ mod tests {
             online: Some(false),
             firmware_version: Some(fw.into()),
             hardware_version: Some("120V Universal".into()),
+            ..SystemInfo::default()
         };
         let out = render_with(|| {
             *LAST_INFO.lock().unwrap() = None;

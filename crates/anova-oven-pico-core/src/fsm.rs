@@ -29,7 +29,31 @@ pub const OFFLINE_THRESHOLD: u64 = 3;
 /// Anova outage lights up within a minute. Distinct from [`OFFLINE_THRESHOLD`],
 /// which is about *our* link to the server; this is about the server's link to
 /// Anova (the server is still reachable and answering — just with stale data).
+/// The same grace applies when it is the oven that dropped off, so a WiFi blip
+/// on the oven doesn't flash a warning.
 pub const UPSTREAM_STALE_GRACE_SECS: u64 = 60;
+
+/// Why the readings the server is serving can't be trusted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StaleCause {
+    /// The server's own link to Anova is down.
+    AnovaLink,
+    /// The oven itself is offline (off WiFi, unplugged), so the server is
+    /// serving its last-known state.
+    OvenOffline,
+    /// The server has had no oven state at all since it started.
+    NoOvenState,
+}
+
+/// Compact age for a stale-data warning: `45s`, `12m`, `5h`, `3d`.
+pub fn format_age(secs: u64) -> String {
+    match secs {
+        0..=59 => alloc::format!("{secs}s"),
+        60..=3_599 => alloc::format!("{}m", secs / 60),
+        3_600..=172_799 => alloc::format!("{}h", secs / 3_600),
+        _ => alloc::format!("{}d", secs / 86_400),
+    }
+}
 
 /// Latest data we've fetched from the server, plus poll health. Cloned on
 /// every render — `recipes` is `Arc` so that clone is cheap; `status` /
@@ -121,25 +145,28 @@ impl ApiSnapshot {
                 .is_some_and(|status| status.mode.as_str() != IDLE)
     }
 
-    /// Seconds the server's upstream link to Anova has been down, but only once
-    /// past [`UPSTREAM_STALE_GRACE_SECS`] — i.e. the data we're showing is
-    /// stale and worth flagging. `None` when the link is healthy, within the
-    /// grace window, or when the server is too old to report link health.
+    /// Why the data we're showing is stale, and for how long, once past
+    /// [`UPSTREAM_STALE_GRACE_SECS`]. `None` when it is fresh, within the
+    /// grace window, or when the server is too old to report.
     ///
     /// Only meaningful while the server itself is reachable ([`is_offline`]
     /// takes precedence). Also flags a server with no oven state at all, once
     /// that has lasted past the same grace window.
-    pub fn upstream_stale_secs(&self, now: Instant) -> Option<u64> {
+    pub fn upstream_stale(&self, now: Instant) -> Option<(StaleCause, u64)> {
         if let Some(since) = self.oven_missing_since {
             let secs = now.saturating_duration_since(since).as_secs();
-            return (secs >= UPSTREAM_STALE_GRACE_SECS).then_some(secs);
+            return (secs >= UPSTREAM_STALE_GRACE_SECS).then_some((StaleCause::NoOvenState, secs));
         }
         let upstream = self.status.as_ref()?.upstream.as_ref()?;
-        if !upstream.connected && upstream.disconnected_secs >= UPSTREAM_STALE_GRACE_SECS {
-            Some(upstream.disconnected_secs)
-        } else {
-            None
+        if upstream.connected || upstream.disconnected_secs < UPSTREAM_STALE_GRACE_SECS {
+            return None;
         }
+        // The grace runs on `disconnected_secs`, when the server noticed; the
+        // oven's own count can start earlier and is the truer age.
+        Some(match upstream.oven_offline_secs {
+            Some(secs) => (StaleCause::OvenOffline, secs),
+            None => (StaleCause::AnovaLink, upstream.disconnected_secs),
+        })
     }
 }
 
@@ -148,10 +175,10 @@ impl ApiSnapshot {
 #[derive(Clone, Default)]
 pub enum AppState {
     Offline,
-    /// Server is reachable but its own link to Anova has been down long enough
-    /// that the data it's serving is stale. Full-screen takeover, like
-    /// [`AppState::Offline`], but a distinct failure (our link to the server is
-    /// fine; the server's link to Anova is not).
+    /// Server is reachable but the data it's serving is stale: its own link to
+    /// Anova is down, or the oven is offline from Anova's cloud. Full-screen
+    /// takeover, like [`AppState::Offline`], but a distinct failure (our link
+    /// to the server is fine; what's behind it is not).
     UpstreamStale,
     #[default]
     Idle,
@@ -265,10 +292,11 @@ pub enum ViewSpec {
     DhcpInit,
     Connecting,
     ServerOffline,
-    /// Server reachable, but its link to Anova has been down `disconnected_secs`
-    /// long enough that the readout is stale. Full-screen warning.
+    /// Server reachable, but the readout has been stale for `secs`, for the
+    /// reason in `cause`. Full-screen warning.
     UpstreamStale {
-        disconnected_secs: u64,
+        cause: StaleCause,
+        secs: u64,
     },
     Status {
         status: Option<anova_oven_api::OvenStatus>,
@@ -462,46 +490,41 @@ mod tests {
     }
 
     #[test]
-    fn upstream_stale_secs_gates_on_connected_and_grace() {
+    fn upstream_stale_gates_on_connected_and_grace() {
         use anova_oven_api::UpstreamHealth;
 
         let mut snap = snapshot();
         // No status at all -> nothing to judge.
-        assert_eq!(snap.upstream_stale_secs(Instant::from_secs(0)), None);
+        assert_eq!(snap.upstream_stale(Instant::from_secs(0)), None);
 
         let mut status = idle_status();
+        let mut with = |upstream: Option<UpstreamHealth>| {
+            status.upstream = upstream;
+            snap.status = Some(status.clone());
+            snap.upstream_stale(Instant::from_secs(0))
+        };
+        let health = |connected, disconnected_secs, oven_offline_secs| {
+            Some(UpstreamHealth {
+                connected,
+                disconnected_secs,
+                oven_offline_secs,
+            })
+        };
 
         // Status present but no upstream field (server predates it) -> None.
-        status.upstream = None;
-        snap.status = Some(status.clone());
-        assert_eq!(snap.upstream_stale_secs(Instant::from_secs(0)), None);
-
+        assert_eq!(with(None), None);
         // Connected -> never stale, whatever the counter says.
-        status.upstream = Some(UpstreamHealth {
-            connected: true,
-            disconnected_secs: 9999,
-        });
-        snap.status = Some(status.clone());
-        assert_eq!(snap.upstream_stale_secs(Instant::from_secs(0)), None);
-
+        assert_eq!(with(health(true, 9999, None)), None);
         // Disconnected but within the grace window -> not yet flagged (ignores
         // the routine ~5s reconnects).
-        status.upstream = Some(UpstreamHealth {
-            connected: false,
-            disconnected_secs: UPSTREAM_STALE_GRACE_SECS - 1,
-        });
-        snap.status = Some(status.clone());
-        assert_eq!(snap.upstream_stale_secs(Instant::from_secs(0)), None);
-
-        // Disconnected past the grace window -> flagged, reporting the duration.
-        status.upstream = Some(UpstreamHealth {
-            connected: false,
-            disconnected_secs: UPSTREAM_STALE_GRACE_SECS,
-        });
-        snap.status = Some(status);
         assert_eq!(
-            snap.upstream_stale_secs(Instant::from_secs(0)),
-            Some(UPSTREAM_STALE_GRACE_SECS)
+            with(health(false, UPSTREAM_STALE_GRACE_SECS - 1, None)),
+            None
+        );
+        // Disconnected past the grace window -> flagged, reporting the duration.
+        assert_eq!(
+            with(health(false, UPSTREAM_STALE_GRACE_SECS, None)),
+            Some((StaleCause::AnovaLink, UPSTREAM_STALE_GRACE_SECS))
         );
     }
 
@@ -515,7 +538,7 @@ mod tests {
         snap.mark_oven_missing(t0);
         assert!(snap.status.is_none());
         assert!(matches!(idle_view(&snap), ViewSpec::Connecting));
-        assert_eq!(snap.upstream_stale_secs(t0), None);
+        assert_eq!(snap.upstream_stale(t0), None);
 
         // Repeated 503s keep the first sighting.
         snap.mark_oven_missing(t0 + Duration::from_secs(5));
@@ -523,14 +546,62 @@ mod tests {
 
         let later = t0 + Duration::from_secs(UPSTREAM_STALE_GRACE_SECS);
         assert_eq!(
-            snap.upstream_stale_secs(later),
-            Some(UPSTREAM_STALE_GRACE_SECS)
+            snap.upstream_stale(later),
+            Some((StaleCause::NoOvenState, UPSTREAM_STALE_GRACE_SECS))
         );
 
         // A status brings it back.
         snap.install_status(idle_status(), later);
         assert_eq!(snap.oven_missing_since, None);
-        assert_eq!(snap.upstream_stale_secs(later), None);
+        assert_eq!(snap.upstream_stale(later), None);
+    }
+
+    #[test]
+    fn an_offline_oven_is_blamed_with_its_own_age() {
+        use anova_oven_api::UpstreamHealth;
+
+        let mut snap = snapshot();
+        let mut status = idle_status();
+        let mut with = |connected, disconnected_secs, oven_offline_secs| {
+            status.upstream = Some(UpstreamHealth {
+                connected,
+                disconnected_secs,
+                oven_offline_secs,
+            });
+            snap.status = Some(status.clone());
+            snap.upstream_stale(Instant::from_secs(0))
+        };
+
+        // The case this exists for: the oven has been off WiFi for a day,
+        // though the server only noticed two minutes ago.
+        assert_eq!(
+            with(false, 120, Some(86_400)),
+            Some((StaleCause::OvenOffline, 86_400))
+        );
+        // A brief blip stays silent, however long Anova says the oven's gone.
+        assert_eq!(
+            with(false, UPSTREAM_STALE_GRACE_SECS - 1, Some(86_400)),
+            None
+        );
+        // Connected wins over a leftover count.
+        assert_eq!(with(true, 0, Some(86_400)), None);
+    }
+
+    #[test]
+    fn ages_are_compact() {
+        for (secs, expected) in [
+            (0, "0s"),
+            (59, "59s"),
+            (60, "1m"),
+            (185, "3m"),
+            (3_599, "59m"),
+            (3_600, "1h"),
+            (86_400, "24h"),
+            (172_799, "47h"),
+            (172_800, "2d"),
+        ] {
+            assert_eq!(format_age(secs), expected, "{secs}");
+        }
     }
 
     /// Base OvenStatus JSON with every required field present. Tests
