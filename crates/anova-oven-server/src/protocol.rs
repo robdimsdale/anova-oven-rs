@@ -83,6 +83,20 @@ pub struct OvenState {
     /// Present when the oven is mid-cook. Carries the authoritative active
     /// stage index/id so the server doesn't need to infer them heuristically.
     pub cook: Option<Cook>,
+    /// The oven's own view of its cloud link and versions. Metrics only; not
+    /// carried into `OvenStatus`, which the panels deserialize every second.
+    #[serde(default)]
+    pub system_info: Option<SystemInfo>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemInfo {
+    /// Whether Anova's cloud currently sees the oven as connected. Our own
+    /// WebSocket to Anova can be healthy while this is `false`.
+    pub online: Option<bool>,
+    pub firmware_version: Option<String>,
+    pub hardware_version: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -175,20 +189,22 @@ pub struct Evaporator {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TemperatureBulbs {
-    pub dry: DryBulb,
+    pub dry: SetpointBulb,
     pub dry_top: SimpleBulb,
     pub dry_bottom: SimpleBulb,
-    pub wet: SimpleBulb,
+    pub wet: SetpointBulb,
     pub mode: String,
 }
 
+/// Used for `dry` and `wet`, the bulbs a stage can target. `setpoint` is
+/// present only on the bulb the current stage cooks by.
 #[derive(Debug, Deserialize)]
-pub struct DryBulb {
+pub struct SetpointBulb {
     pub current: Temperature,
     pub setpoint: Option<Temperature>,
 }
 
-/// Used for `dryTop`, `dryBottom`, and `wet` bulbs which only expose `current`.
+/// Used for `dryTop` and `dryBottom`, which only expose `current`.
 #[derive(Debug, Deserialize)]
 pub struct SimpleBulb {
     pub current: Temperature,
@@ -203,6 +219,7 @@ pub struct Temperature {
 pub struct TemperatureProbe {
     pub connected: bool,
     pub current: Option<Temperature>,
+    pub setpoint: Option<Temperature>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -229,11 +246,12 @@ pub fn to_oven_status(payload: &ApoStatePayload) -> anova_oven_api::OvenStatus {
     let sg = &nodes.steam_generators;
     let he = &nodes.heating_elements;
     let tb = &nodes.temperature_bulbs;
-    let probe_temperature_c = nodes
-        .temperature_probe
-        .as_ref()
-        .filter(|p| p.connected)
+    let probe = nodes.temperature_probe.as_ref().filter(|p| p.connected);
+    let probe_temperature_c = probe
         .and_then(|p| p.current.as_ref())
+        .map(|t| t.celsius as f32);
+    let probe_target_temperature_c = probe
+        .and_then(|p| p.setpoint.as_ref())
         .map(|t| t.celsius as f32);
     let (active_stage_index, active_stage_id) = match &payload.state.cook {
         Some(cook) => (cook.active_stage_index, cook.active_stage_id.clone()),
@@ -244,11 +262,13 @@ pub fn to_oven_status(payload: &ApoStatePayload) -> anova_oven_api::OvenStatus {
         temperature_unit: payload.state.state.temperature_unit.clone(),
         temperature_c: tb.dry.current.celsius as f32,
         target_temperature_c: tb.dry.setpoint.as_ref().map(|s| s.celsius as f32),
+        wet_target_temperature_c: tb.wet.setpoint.as_ref().map(|s| s.celsius as f32),
         temperature_bulbs_mode: tb.mode.clone(),
         dry_top_temperature_c: tb.dry_top.current.celsius as f32,
         dry_bottom_temperature_c: tb.dry_bottom.current.celsius as f32,
         wet_bulb_temperature_c: tb.wet.current.celsius as f32,
         probe_temperature_c,
+        probe_target_temperature_c,
         timer_current_secs: nodes.timer.current,
         timer_total_secs: nodes.timer.initial,
         timer_mode: nodes.timer.mode.clone(),
@@ -285,5 +305,66 @@ pub fn to_oven_status(payload: &ApoStatePayload) -> anova_oven_api::OvenStatus {
         // Populated by the HTTP layer from the live Liveness tracker when this
         // status is served; the protocol layer has no view of link health.
         upstream: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A wet-bulb stage with the probe in, trimmed from a real
+    /// `EVENT_APO_STATE` (see `docs/oven-websocket-api.md`).
+    fn wet_cook_frame(system_info: &str) -> String {
+        format!(
+            r#"{{"command":"EVENT_APO_STATE","payload":{{"cookerId":"x","type":"oven_v1","state":{{
+            "nodes":{{
+              "door":{{"closed":true}},"fan":{{"speed":50}},
+              "heatingElements":{{"bottom":{{"on":false,"watts":0}},"rear":{{"on":true,"watts":1600}},"top":{{"on":false,"watts":0}}}},
+              "lamp":{{"on":true,"preference":"on"}},
+              "steamGenerators":{{"mode":"relative-humidity","relativeHumidity":{{"current":95,"setpoint":100}},
+                "boiler":{{"celsius":99.5,"watts":480,"descaleRequired":false}},"evaporator":{{"celsius":60,"watts":0}}}},
+              "temperatureBulbs":{{"mode":"wet",
+                "dry":{{"current":{{"celsius":62.1}}}},
+                "dryTop":{{"current":{{"celsius":62.3}}}},"dryBottom":{{"current":{{"celsius":61.9}}}},
+                "wet":{{"current":{{"celsius":57.2}},"setpoint":{{"celsius":58.0}}}}}},
+              "temperatureProbe":{{"connected":true,"current":{{"celsius":41.5}},"setpoint":{{"celsius":54.0}}}},
+              "timer":{{"current":0,"initial":0,"mode":"idle"}},
+              "vent":{{"open":false}},"waterTank":{{"empty":false}}
+            }},
+            "state":{{"mode":"cook","temperatureUnit":"C"}}{system_info}
+            }}}}}}"#
+        )
+    }
+
+    fn parse(frame: &str) -> ApoStatePayload {
+        match parse_message(frame.as_bytes()).expect("valid frame") {
+            Event::ApoState(p) => p,
+            other => panic!("expected ApoState, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wet_and_probe_setpoints_are_carried_into_the_status() {
+        let status = to_oven_status(&parse(&wet_cook_frame("")));
+        assert_eq!(
+            status.target_temperature_c, None,
+            "dry has no setpoint in wet mode"
+        );
+        assert_eq!(status.wet_target_temperature_c, Some(58.0));
+        assert_eq!(status.probe_temperature_c, Some(41.5));
+        assert_eq!(status.probe_target_temperature_c, Some(54.0));
+    }
+
+    #[test]
+    fn system_info_is_optional_and_parsed_when_present() {
+        assert!(parse(&wet_cook_frame("")).state.system_info.is_none());
+
+        let payload = parse(&wet_cook_frame(
+            r#","systemInfo":{"online":true,"firmwareVersion":"2.1.7","hardwareVersion":"120V Universal","powerHertz":60}"#,
+        ));
+        let info = payload.state.system_info.expect("systemInfo");
+        assert_eq!(info.online, Some(true));
+        assert_eq!(info.firmware_version.as_deref(), Some("2.1.7"));
+        assert_eq!(info.hardware_version.as_deref(), Some("120V Universal"));
     }
 }

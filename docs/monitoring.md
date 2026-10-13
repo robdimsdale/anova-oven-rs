@@ -96,6 +96,18 @@ Metrics to emit, all from data the server already has:
 | `anova_oven_temp_celsius{bulb}` | gauge | `OvenStatus` |
 | `anova_oven_element_watts{element}` | gauge | `OvenStatus` |
 | `anova_oven_cook_active`, `anova_oven_door_open`, `anova_oven_water_tank_empty` | gauge 0/1 | `OvenStatus` |
+| `anova_oven_target_temp_celsius{bulb}` | gauge, NaN when unset | `OvenStatus` (dry, wet, probe) |
+| `anova_oven_humidity_percent`, `anova_oven_target_humidity_percent` | gauge | `OvenStatus` |
+| `anova_oven_fan_speed_percent` | gauge | `OvenStatus` |
+| `anova_oven_mode{mode}`, `anova_oven_bulb_mode{mode}` | gauge 0/1 per value | `OvenStatus`; unknown values fold into `other` |
+| `anova_oven_timer_remaining_seconds`, `anova_oven_timer_total_seconds`, `anova_oven_timer_running` | gauge | `OvenStatus` |
+| `anova_oven_probe_connected`, `anova_oven_vent_open`, `anova_oven_lamp_on`, `anova_oven_descale_required` | gauge 0/1 | `OvenStatus` |
+| `anova_oven_online` | gauge 0/1 | frame `systemInfo.online` |
+| `anova_oven_info{firmware,hardware}` | gauge 1 (0 once superseded) | frame `systemInfo` |
+| `anova_oven_element_energy_joules_total{element}` | counter | `OvenStatus` watts, integrated per frame |
+| `anova_cook_info{recipe}` | gauge 1, only during a cook | `CookProgress`, rendered by hand |
+| `anova_cook_stage_count`, `anova_cook_current_stage{index,kind}` | gauge, only during a cook | `CookProgress`, rendered by hand |
+| `anova_cook_stage_start_time_seconds{index,kind}` | gauge (Unix time), only during a cook | `CookProgress`, rendered by hand |
 
 Two notes on this table.
 
@@ -222,9 +234,25 @@ reason the interval is 30 s and not 5 s.
 
 Not a scaling concern at a few thousand series, but one rule prevents the only
 way this goes wrong: **never put a recipe title, recipe ID, cook ID or timestamp
-in a label.** Each distinct value creates a permanent new series. Recipe identity
-belongs in the metric's *value* space or in an annotation, not a label. Every
-label in this document is drawn from a closed enum, and that is deliberate.
+in a label of a measurement series.** On `anova_oven_temp_celsius` it would mint
+a fresh copy of every temperature series per cook.
+
+The one exception is `anova_cook_info{recipe}`: a single series that exists only
+while that cook runs. That is one short series per cook, a few hundred a year,
+and it is how a graph knows what was cooking. Join to it at query time rather
+than labelling the measurements:
+
+```promql
+anova_oven_temp_celsius{bulb="dry"} * on() group_left(recipe) anova_cook_info
+```
+
+(There is one oven, so the join needs no matching labels.) With VictoriaMetrics
+retaining five years, these series *are* the cook history; there is no other
+store of which cooks happened when.
+
+Every other label is drawn from a closed set, and that is deliberate. Where the
+set comes from upstream (`state.mode`, the bulb mode, a stage's kind) unknown
+values fold into `other`. `anova_oven_info` is bounded by firmware updates.
 
 ## Alerts these metrics exist for
 
@@ -385,7 +413,45 @@ for"). Choices the tables above left open:
   oven-state frame since startup, rather than `0`.
 - `anova_ws_reconnects_total` counts every time a connection ends and a
   reconnect is scheduled, including failed connects during an outage.
-- `anova_oven_cook_active` is `mode != "idle"`, so it includes preheat.
+- `anova_oven_cook_active` is `mode != "idle"`, so it includes preheat. The
+  oven's `state.mode` does not reliably separate preheat from cook either;
+  `anova_cook_current_stage{kind="preheat"}` is the preheat signal.
+- `anova_oven_timer_remaining_seconds` is the oven's `timer.current`, which
+  counts *down*, and equals the total before the timer starts. Use
+  `anova_oven_timer_running` to tell those apart.
+- `anova_oven_online` is the oven's link to Anova's cloud, as Anova reports it.
+  It is independent of `anova_upstream_connected` (our link to Anova): ours can
+  be up while the oven is offline, which otherwise only shows as silence.
+- `anova_oven_info` keeps superseded version pairs at 0 because the recorder
+  never drops a series; filter on `== 1`.
+- `systemInfo` is recorded straight from the frame in `ws.rs` rather than added
+  to `OvenStatus`, which each panel parses every second; firmware strings
+  there would be heap for nothing.
+- **Short stages and the scrape interval.** A stage can last a minute, so any
+  metric that only shows *what is true at scrape time* misrepresents it: at
+  30 s a one-minute stage is two samples, and a stage shorter than the interval
+  can be missed outright. Two metrics carry what happened between scrapes
+  instead, so they stay exact at any interval:
+  - `anova_cook_stage_start_time_seconds` puts each stage's start in the
+    sample *value*, for every stage of the current cook, and the whole set
+    disappears when the cook ends (the recorder never forgets a series, so
+    `CookTimeline` renders these by hand). A stage lasts from its start to the
+    next stage's start; Grafana's "series value as timestamp" annotation
+    option draws the boundaries at the real second. A stage already running
+    when the server started is timed from the server's start.
+  - `anova_oven_element_energy_joules_total` integrates each frame's watts
+    until the next frame, so `rate(...[1m])` is the true mean power over any
+    minute. The `_watts` gauges are snapshots of elements that cycle faster
+    than anything scrapes them. Gaps over 60 s between frames are skipped
+    rather than filled with a stale reading.
+  Both are bounded by the source: Anova sends a frame every ~10 s while
+  cooking, so stage starts are accurate to about that, and nothing finer than
+  a frame exists anywhere. The homelab scrapes this job every 5 s (the panels
+  stay at 30 s), which is the most that frame rate can use.
+- **No dynamic scrape interval.** Neither Prometheus nor VictoriaMetrics can
+  change a job's interval based on what it returns, and it is not needed:
+  while idle the series are near-constant, which VictoriaMetrics stores at a
+  small fraction of a byte per sample.
 - The subscriber was already a `tracing_subscriber::registry()` with a `fmt`
   layer, so "The cheap thing to do now" needed no change.
 - **Panel** (`crates/anova-oven-pico-core/src/metrics.rs`, served from

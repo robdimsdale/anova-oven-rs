@@ -687,6 +687,8 @@ mod tests {
             dry_bottom_temperature_c: 25.0,
             wet_bulb_temperature_c: 25.0,
             probe_temperature_c: None,
+            probe_target_temperature_c: None,
+            wet_target_temperature_c: None,
             timer_current_secs: 0,
             timer_total_secs,
             timer_mode: if timer_total_secs > 0 {

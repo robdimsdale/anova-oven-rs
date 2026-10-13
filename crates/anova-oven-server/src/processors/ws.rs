@@ -399,6 +399,9 @@ async fn connect_and_run(
                                 // absence means "stale data".
                                 last_state_frame = Instant::now();
                                 liveness.record_state();
+                                if let Some(info) = &payload.state.system_info {
+                                    telemetry::record_system_info(info);
+                                }
                                 let status = protocol::to_oven_status(&payload);
                                 info!(
                                     mode = %status.mode,

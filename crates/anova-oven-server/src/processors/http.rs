@@ -30,6 +30,7 @@ pub struct HttpState {
     pub cook_progress_msg_tx: mpsc::Sender<CookProgressMsg>,
     pub liveness: Arc<Liveness>,
     pub metrics: PrometheusHandle,
+    pub cook_timeline: Arc<telemetry::CookTimeline>,
 }
 
 pub(crate) fn router(state: HttpState) -> Router {
@@ -57,13 +58,13 @@ async fn handle_health(State(state): State<Arc<HttpState>>) -> impl IntoResponse
 
 /// Prometheus scrape target. See `docs/monitoring.md`. Liveness gauges are
 /// refreshed here, at scrape time, so they are never staler than the scrape.
+/// The cook's stage start times are appended by hand after the recorder's
+/// output, because they must disappear when the cook ends.
 async fn handle_metrics(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
     telemetry::record_liveness(&state.liveness);
-    build_response(
-        StatusCode::OK,
-        telemetry::CONTENT_TYPE,
-        state.metrics.render().into_bytes(),
-    )
+    let mut body = state.metrics.render();
+    state.cook_timeline.render(&mut body);
+    build_response(StatusCode::OK, telemetry::CONTENT_TYPE, body.into_bytes())
 }
 
 fn build_response(status: StatusCode, content_type: &'static str, body: Vec<u8>) -> Response {

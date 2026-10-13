@@ -282,7 +282,15 @@ async fn main() {
         }
     });
 
-    tokio::spawn(telemetry::run_oven_status_gauges(status_rx.clone()));
+    tokio::spawn(telemetry::run_oven_status_gauges(
+        status_rx.clone(),
+        liveness.clone(),
+    ));
+    let cook_timeline = std::sync::Arc::new(telemetry::CookTimeline::default());
+    tokio::spawn(telemetry::run_cook_timeline(
+        cook_progress_rx.clone(),
+        cook_timeline.clone(),
+    ));
 
     let cook_progress_task = CookProgressTask::new(cook_progress_tx);
     spawn_critical(
@@ -320,6 +328,7 @@ async fn main() {
         cook_progress_msg_tx,
         liveness,
         metrics,
+        cook_timeline,
     });
 
     let addr = std::env::var("ANOVA_BIND").unwrap_or_else(|_| "0.0.0.0:8080".into());
