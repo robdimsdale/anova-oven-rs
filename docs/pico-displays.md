@@ -340,10 +340,43 @@ that pull-up, 255 drives it fully high.
 
 ## 2.7" Sharp Memory Display
 
-SPI0 with an **active-high** CS on GP17, SCK on GP18, MOSI on GP19, at 2 MHz
-(the panel's maximum). See `src/sharp.rs` for the panel's three protocol
-quirks: LSB-first wire order, active-high CS, and the VCOM signal that must
-alternate at ≥ 1 Hz or the image degrades.
+SPI0 with an **active-high** CS on GP17, SCK on GP18, MOSI on GP19, at 2 MHz —
+the panel's absolute maximum (`fSCLK` MAX 2 MHz, TYP 1 MHz), so there is no
+margin here. See `src/sharp.rs` for the panel's three protocol quirks: LSB-first
+wire order, active-high CS, and the VCOM signal that must alternate at ≥ 1 Hz or
+the image degrades.
+
+### Two static-image requirements, not one
+
+VCOM alternation is necessary but **not sufficient**. The
+[LS027B7DH01 datasheet](https://cdn-learn.adafruit.com/assets/assets/000/094/215/original/LS027B7DH01_Rev_Jun_2010.pdf?1597872422)
+adds a second, independent requirement in its operating precautions:
+
+> **(3)** A still image should be displayed less than two hours, if it is
+> necessary to display still image longer than two hours, display image data
+> must be refreshed in order to avoid sticking image on LCD panel.
+>
+> **(4)** If LCD module takes a static electricity, as the display image which
+> is written into pixel memory might not be displayed, Data update should be
+> executed frequently.
+
+So the *pixel data itself* must be rewritten periodically, on top of keeping
+VCOM alternating. `flush` sends only changed lines, so a screen that is not
+changing is never rewritten at all — which means this requirement is currently
+unmet. See task 0b in `docs/pico-display-refresh.md` for the fix (force a full
+repaint every 30 minutes).
+
+Both failure modes here are **recoverable**, not damage: Sharp reserves *"may be
+damaged"* and *"may not recover its original condition"* for out-of-spec
+electrical operation, disassembly and out-of-range storage temperature, and uses
+neither for these. Losing VCOM or skipping the refresh produces ghosting that
+clears once proper drive and data updates resume.
+
+The panel also breaks out `EXIN` (EXTCOMIN), `EXTMD` (EXTMODE) and `DISP` on the
+Adafruit 4694 breakout, all currently unconnected. Strapping `EXTMD` high moves
+VCOM to a hardware square wave on `EXIN` and removes it from the firmware
+entirely — task 0a in the same document, with the frequency window
+(`fCOM` 0.5–10 Hz) worked out there.
 
 The first two are handled in software (a plain GPIO for CS, `u8::reverse_bits`
 per byte) rather than in hardware. See `docs/pico-sharp-cs.md` for why an

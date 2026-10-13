@@ -124,8 +124,29 @@ chip select becomes one hardware operation, DMA-feedable.
 
 A timing-critical assembly program to own, a second peripheral-init path in
 `main.rs`, and — if the DMA half is taken — the async cancellation hazard
-documented in `pico-display-dma.md`, which doesn't change when the DMA source is
-PIO instead of SPI0.
+documented in `pico-display-dma.md`.
+
+That last point needs a correction, added later than the rest of this section.
+It originally read "which doesn't change when the DMA source is PIO instead of
+SPI0." That holds only for the drop policy this codebase would get by default,
+where a dropped future *aborts* the transfer: the state machine then stalls on
+an empty FIFO mid-frame with CS still asserted, and nothing is gained. It is
+false for the other policy. If a dropped future is allowed to **complete** the
+in-flight frame instead of aborting it, CS deassertion is the last instruction
+of the PIO program and the line is released by construction — whereas with a
+software CS, completing the DMA still leaves CS asserted, because the CPU owns
+the pin and is not coming back to raise it.
+
+So PIO's ownership of CS is exactly what makes complete-on-drop a viable policy,
+and that is a real advantage over SPI0 that this section previously missed. It
+does not change the verdict — a 4-word (16-byte, or 32 with `FJOIN_TX`) TX FIFO
+means the hardware never holds a whole frame on its own, so "atomic" still
+depends on that drop policy rather than on PIO alone — but it is the strongest
+form of the PIO argument and should not be written off.
+
+See "Could PIO own the transaction instead?" in `docs/pico-display-refresh.md`
+for the full working, including why PIO is not a substitute for making the
+blocking flush interruptible.
 
 **Verdict: no, on cost/benefit rather than feasibility.** See the cheap
 alternative below, which captures the LSB-first win with none of this.
