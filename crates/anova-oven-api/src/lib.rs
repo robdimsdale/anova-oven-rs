@@ -150,6 +150,14 @@ pub struct UpstreamHealth {
     /// connected). A client warns once this exceeds its grace period, so the
     /// routine ~5s max-connection-age reconnects stay silent.
     pub disconnected_secs: u64,
+    /// Seconds the oven itself has been offline (off WiFi, unplugged, or in
+    /// local mode not connected to the server); `None` while it is online and
+    /// from servers predating this field. When set, `connected` is false
+    /// because of the oven, not the server's link to Anova, and this can be
+    /// longer than `disconnected_secs`: it counts from when the oven went
+    /// offline, not from when the server noticed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oven_offline_secs: Option<u64>,
 }
 
 /// Server-derived cook progression, included in `GET /status` while a cook is

@@ -235,7 +235,7 @@ async fn connect_and_run(
                 );
                 // Whatever the socket's fault, the oven hasn't been heard from:
                 // the replay the next connection gets must not hide that.
-                liveness.set_oven_online(false);
+                liveness.set_oven_online(false, None);
                 return Err("Anova websocket state timeout".into());
             }
             msg = stream.next() => {
@@ -272,7 +272,7 @@ async fn connect_and_run(
                                     Freshness::Fresh => {
                                         last_state_frame = Instant::now();
                                         liveness.record_state();
-                                        liveness.set_oven_online(true);
+                                        liveness.set_oven_online(true, None);
                                     }
                                     Freshness::Replay => {
                                         debug!(updated = ?payload.state.updated_timestamp, "[ws] cached state replayed");
@@ -283,7 +283,8 @@ async fn connect_and_run(
                                             online = ?payload.state.system_info.as_ref().and_then(|i| i.online),
                                             "[ws] oven is not reaching Anova's cloud"
                                         );
-                                        liveness.set_oven_online(false);
+                                        let since = payload.state.system_info.as_ref().and_then(|i| i.last_disconnected_unix_ms());
+                                        liveness.set_oven_online(false, since);
                                     }
                                 }
                                 if let Some(updated) = &payload.state.updated_timestamp {

@@ -179,6 +179,7 @@ pub async fn run(
                 }
                 info!(device_id = %session.device_id, peer = %session.peer, "[device] oven connected");
                 liveness.set_connected(true);
+                liveness.set_oven_online(true, None);
                 if evt_tx.send(WsEvent::Connected).await.is_err()
                     || evt_tx
                         .send(WsEvent::CookerDiscovered { cooker_id: session.device_id.clone() })
@@ -450,6 +451,8 @@ async fn end_session(
     let mut ws = session.ws;
     let _ = tokio::time::timeout(Duration::from_secs(1), ws.close()).await;
     liveness.set_connected(false);
+    // Here the oven *is* the link: say so, so a panel blames the oven.
+    liveness.set_oven_online(false, None);
     metrics::counter!(telemetry::WS_RECONNECTS).increment(1);
     evt_tx.send(WsEvent::Disconnected).await.is_ok()
 }
