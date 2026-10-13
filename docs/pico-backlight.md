@@ -163,14 +163,46 @@ LED lifetimes at this scale (tens of thousands of hours to any noticeable
 dimming) aren't the bottleneck for a kitchen device. `BacklightPolicy::Dim`
 on these two panels is a UX/power/heat feature, not a burn-in mitigation.
 
-**Sharp Memory LCD** is effectively immune by design — it's a reflective
-memory LCD built for exactly this use case (long-static status content). The
-same DC-bias mechanism applies in principle, but the panel is designed
-around a VCOM signal that must alternate at ≥1 Hz specifically to prevent
-it, and the firmware already does this correctly (`sharp.rs:12-14`,
-`toggle_vcom`) — that code predates this session, it's called out here only
-because it's the reason this panel needs nothing further. No backlight at
-all (reflective, ambient-lit), so no LED-aging story either.
+**Sharp Memory LCD** has no backlight at all (reflective, ambient-lit), so no
+LED-aging story. It also has no emissive material to deplete, so nothing that
+ages the way an OLED does.
+
+> **Corrected.** This paragraph originally read that the Sharp is "effectively
+> immune by design" and "needs nothing further," on the grounds that VCOM
+> alternation handles the DC-bias mechanism and the firmware already does that
+> correctly. The first half is right; the conclusion is wrong, and the
+> [LS027B7DH01 datasheet](https://cdn-learn.adafruit.com/assets/assets/000/094/215/original/LS027B7DH01_Rev_Jun_2010.pdf?1597872422)
+> is explicit about it.
+
+VCOM alternation is necessary but **not sufficient**. The datasheet's operating
+precautions add a second, independent requirement:
+
+> **(3)** A still image should be displayed less than two hours, if it is
+> necessary to display still image longer than two hours, display image data
+> must be refreshed in order to avoid sticking image on LCD panel.
+
+So the *pixel data* has to be rewritten periodically as well, and the firmware
+does **not** do this: `flush` sends only changed lines, so a static screen is
+never rewritten — only the 2-byte `toggle_vcom` no-op goes out. An oven idle
+overnight is exactly the case precaution (3) describes.
+
+So this is the one panel in this document with an *unmitigated* static-image
+problem, which is the opposite of what this section used to claim.
+
+**It is a mild one, though.** Unlike the OLED's story above, nothing here is
+cumulative material loss. Sharp calls the result a "sticking image" and uses
+none of the damage or non-recovery language it applies elsewhere in the same
+document (*"may be damaged"* for out-of-spec electrical operation, *"permanent
+damage"* for disassembly, *"may not recover its original condition"* for
+out-of-range storage temperature). Writing new data clears it. The contrast with
+the OLED is worth holding onto: there, dimming and display-off slow a permanent
+process; here, the fix undoes the effect entirely.
+
+The fix is task 0b in `docs/pico-display-refresh.md`: force a full repaint every
+30 minutes, one extra 50 ms flush per half hour.
+
+VCOM itself is still handled correctly (`sharp.rs:12-14`, `toggle_vcom`), and
+task 0a there covers moving it to the hardware `EXTCOMIN` input.
 
 **Rough OLED numbers**, for scale (estimates for this class of part — small
 white-emitter monochrome PMOLED — not a spec for this exact SKU, which
