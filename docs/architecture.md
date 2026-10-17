@@ -308,12 +308,16 @@ are always sent as Celsius.
   saves as a preheat stage with the same settings followed by the cook
   stage (the pairing the oven expects; see `recipe::rewrite_preheat_stage_ids`).
   Per step: title, mode (oven or sous vide), temperature, steam, heating
-  elements (a radio of the six allowed combinations), whether it starts
-  automatically (and, with a preheat, whether it carries on after
-  preheating), and how it ends (a radio: until you move on, a timer or a
-  probe). A preheat matters because the oven starts a stage's timer the
-  moment the stage starts: without one, a timed stage counts down while the
-  oven is still heating. Fan, vent and rack aren't shown:
+  elements (a radio of the six allowed combinations), preheat (a radio: none;
+  preheat, then wait for you; or preheat, then start cooking) and how it ends
+  (a radio: a timer, a probe, or when you say). A preheat matters because the
+  oven starts a stage's timer the moment the stage starts: without one, a
+  timed stage counts down while the oven is still heating. Between two
+  steps, when the first ends on its own (timer, probe, or a preheat-only
+  step at temperature), a radio picks whether the next goes straight on or
+  waits for you; it's the next step's first stage's `user_action_required`.
+  The first step's flag isn't shown and is kept as saved. Each choice has a
+  one-line hint under it saying what the oven will do. Fan, vent and rack aren't shown:
   new stages get fan 100 and no vent or rack, and existing values are kept on
   save, as is anything else the form doesn't show. The page checks the
   same rules as the API as you type, and Save stays disabled until they pass.

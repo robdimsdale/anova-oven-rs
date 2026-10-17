@@ -160,6 +160,15 @@ input[type="radio"] { width: 18px; height: 18px; accent-color: var(--accent); }
 .problems { margin: 12px 0 0; padding-left: 18px; color: var(--danger); font-size: 0.9rem; }
 .problems:empty { display: none; }
 .hint { color: var(--muted); font-size: 0.8rem; }
+.choice-hint { margin: 8px 0 0; }
+/* What happens between two stages, on a line joining their cards. */
+.between {
+  border-left: 2px solid var(--border);
+  margin: -8px 0 8px 22px;
+  padding: 4px 0 12px 14px;
+}
+.between .ends { margin: 0; }
+.between > .hint { margin: 0; }
 input:invalid, input[aria-invalid="true"] { border-color: var(--danger); }
 .stage-number { font-weight: 650; color: var(--muted); min-width: 1.5em; }
 

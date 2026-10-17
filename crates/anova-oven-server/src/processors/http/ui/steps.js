@@ -105,6 +105,20 @@ function endsOf(cook) {
   return cook.timer_added ? "timer" : cook.probe_added ? "probe" : "none";
 }
 
+// Whether a step has a preheat, and if so whether the cook after it waits
+// for the user (to put the food in) or starts at temperature.
+function preheatOf(step) {
+  return !step.preheat ? "none" : step.cook && step.cook.user_action_required ? "wait" : "go";
+}
+
+// How a step ends, as the start of a sentence about what happens next, or
+// null when it holds until the user moves on. A preheat-only step ends at
+// temperature.
+function endingOf(step) {
+  if (!step.cook) return "reaches temperature";
+  return { timer: "timer ends", probe: "probe reaches its target", none: null }[endsOf(step.cook)];
+}
+
 function stepProblems(step) {
   const s = mainStage(step);
   const out = [];
@@ -137,10 +151,50 @@ function readNumber(input) {
 function createStepEditor(container, { name, onChange = () => {} }) {
   let steps = [];
 
-  function check(step, target, field, label, invert = false) {
-    const stage = target === "first" ? firstStage(step) : target === "cook" ? step.cook : mainStage(step);
-    const on = invert ? !stage[field] : !!stage[field];
-    return `<label class="check"><input type="checkbox" data-field="${field}" data-target="${target}" ${invert ? "data-invert" : ""} ${on ? "checked" : ""}> ${label}</label>`;
+  // A radio group with a hint under the chosen option.
+  function radios(group, attr, current, options) {
+    const chosen = options.find(([value]) => value === current);
+    return `
+        <div class="checks" style="margin-top: 0;">
+          ${options.map(([value, label]) =>
+            `<label class="check"><input type="radio" name="${group}" ${attr} value="${value}" ${current === value ? "checked" : ""}> ${label}</label>`).join("")}
+        </div>
+        ${chosen && chosen[2] ? `<p class="hint choice-hint">${chosen[2]}</p>` : ""}`;
+  }
+
+  function preheatHtml(step, i) {
+    if (!step.cook) {
+      return `<p class="hint" style="margin: 16px 0 0;">Preheat only: this stage ends when the oven reaches temperature.</p>`;
+    }
+    return `
+      <fieldset class="ends">
+        <legend>Preheat</legend>
+        ${radios(`${name}-preheat-${i}`, "data-preheat", preheatOf(step), [
+          ["none", "No preheat", "Cooking starts straight away, while the oven heats up."],
+          ["wait", "Preheat, then wait for me", "The oven heats up, then holds at temperature until you press Next stage, e.g. once the food is in."],
+          ["go", "Preheat, then start cooking", "The oven heats up, then starts cooking on its own."],
+        ])}
+      </fieldset>`;
+  }
+
+  // What happens between step i - 1 and step i: shown between their cards.
+  function betweenHtml(i) {
+    const prev = steps[i - 1];
+    const ending = endingOf(prev);
+    if (!ending) {
+      return `<div class="between"><p class="hint">Stage ${i} keeps going until you press Next stage, then stage ${i + 1} starts.</p></div>`;
+    }
+    const wait = !!firstStage(steps[i]).user_action_required;
+    return `
+      <div class="between">
+        <fieldset class="ends" data-between="${i}">
+          <legend>When stage ${i}'s ${ending}</legend>
+          ${radios(`${name}-between-${i}`, "data-between-choice", wait ? "wait" : "go", [
+            ["go", `Go straight on to stage ${i + 1}`],
+            ["wait", "Wait for me", `The oven keeps holding stage ${i}'s settings until you press Next stage.`],
+          ])}
+        </fieldset>
+      </div>`;
   }
 
   function elementsHtml(stage, i) {
@@ -157,16 +211,17 @@ function createStepEditor(container, { name, onChange = () => {} }) {
 
   function endsHtml(step, i, duration, probe) {
     const current = endsOf(step.cook);
-    const radio = (value, label) =>
-      `<label class="check"><input type="radio" name="${name}-ends-${i}" data-ends value="${value}" ${current === value ? "checked" : ""}> ${label}</label>`;
+    const timerHint = step.preheat
+      ? "The timer starts once the oven is preheated."
+      : "The timer starts as soon as this stage does, while the oven is still heating up. Add a preheat to start it at temperature.";
     return `
       <fieldset class="ends">
         <legend>Ends</legend>
-        <div class="checks" style="margin-top: 0;">
-          ${radio("none", "Until I move on")}
-          ${radio("timer", "Timer")}
-          ${radio("probe", "Probe")}
-        </div>
+        ${radios(`${name}-ends-${i}`, "data-ends", current, [
+          ["timer", "Timer", timerHint],
+          ["probe", "Probe", "Ends when the food reaches the probe target."],
+          ["none", "When I say", "Holds these settings until you press Next stage or Stop."],
+        ])}
         ${current === "timer" ? `
         <div class="fields">
           <label>Minutes
@@ -218,18 +273,16 @@ function createStepEditor(container, { name, onChange = () => {} }) {
           </label>
         </div>
         ${elementsHtml(s, i)}
-        <div class="checks">
-          <label class="check"><input type="checkbox" data-preheat ${step.preheat ? "checked" : ""} ${cook ? "" : "disabled"}> Preheat first</label>
-          ${check(step, "first", "user_action_required", "Start stage automatically", true)}
-          ${step.preheat && cook ? check(step, "cook", "user_action_required", "Continue automatically after preheating", true) : ""}
-        </div>
-        ${cook ? endsHtml(step, i, duration, probe) : `<p class="hint" style="margin: 12px 0 0;">Preheat only: it ends when the oven reaches temperature</p>`}
+        ${preheatHtml(step, i)}
+        ${cook ? endsHtml(step, i, duration, probe) : ""}
         <ul class="problems"></ul>
       </section>`;
   }
 
   function render() {
-    container.innerHTML = steps.map((s, i) => stepHtml(s, i, steps.length)).join("");
+    container.innerHTML = steps
+      .map((s, i) => (i > 0 ? betweenHtml(i) : "") + stepHtml(s, i, steps.length))
+      .join("");
     validate();
   }
 
@@ -249,20 +302,32 @@ function createStepEditor(container, { name, onChange = () => {} }) {
 
   container.addEventListener("input", (event) => {
     const input = event.target;
+
+    // Whether a step waits for the user is a flag on its first stage.
+    if (input.hasAttribute("data-between-choice")) {
+      const step = steps[Number(input.closest("[data-between]").dataset.between)];
+      firstStage(step).user_action_required = input.value === "wait";
+      render();
+      return;
+    }
+
     const card = input.closest("[data-index]");
     if (!card) return;
     const step = steps[Number(card.dataset.index)];
     const s = mainStage(step);
 
     if (input.hasAttribute("data-preheat")) {
-      if (input.checked) {
-        // The step now starts with the preheat: it takes over whether the
-        // step starts on its own, and the cook carries straight on.
-        step.preheat = { kind: "preheat", user_action_required: step.cook.user_action_required };
-        step.cook.user_action_required = false;
-      } else {
-        step.cook.user_action_required = step.preheat.user_action_required;
+      if (input.value === "none") {
+        // The cook takes back whether the step waits to start.
+        if (step.preheat) step.cook.user_action_required = step.preheat.user_action_required;
         step.preheat = null;
+      } else {
+        // The step now starts with the preheat, so it takes over whether
+        // the step waits to start.
+        if (!step.preheat) {
+          step.preheat = { kind: "preheat", user_action_required: step.cook.user_action_required };
+        }
+        step.cook.user_action_required = input.value === "wait";
       }
       render();
       return;
@@ -286,13 +351,6 @@ function createStepEditor(container, { name, onChange = () => {} }) {
 
     const field = input.dataset.field;
     if (!field) return;
-    if (input.type === "checkbox") {
-      const target = input.dataset.target;
-      const stage = target === "first" ? firstStage(step) : target === "cook" ? step.cook : s;
-      stage[field] = input.hasAttribute("data-invert") ? !input.checked : input.checked;
-      validate();
-      return;
-    }
     switch (field) {
       case "title": s.title = input.value.trim() ? input.value : undefined; break;
       case "temperature_bulbs_mode":
