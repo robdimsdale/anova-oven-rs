@@ -20,6 +20,39 @@ None of these resolved the unauthorized error. The oven appears to require some
 additional auth context or session state that the phone app holds but that our
 server does not replicate.
 
+## Where the rejection comes from
+
+Added 2026-10-14, after the oven was connected to a local stand-in for its
+cloud ([oven-cloud-emulation.md](../oven-cloud-emulation.md)).
+
+**Anova's cloud refuses the command; the oven doesn't.**
+
+- **The oven accepts stage commands with no credentials.** Sent straight to the
+  oven through [tools/oven-cloud-probe.py](../../tools/oven-cloud-probe.py),
+  `CMD_APO_START_STAGE {"stageId": "<uuid>"}` jumped to that stage and
+  `CMD_APO_START_NEXT_STAGE` started the next one. Both IDs came back in
+  `processedCommandIds`. The device-side protocol has no per-command auth
+  field; the only credential is the oven's own JWT on connect.
+
+So `devices.anovaculinary.io` checks `CMD_APO_START_STAGE` before relaying it
+and refuses ours. The intercepted phone traffic showed our payload matching
+the app's, so the check is on something outside the command. What it checks
+is unknown. Candidates, all untested:
+
+- **The client's identity.** The server connects with `platform=android` but
+  sends iOS-style `ios-` stage IDs (`normalize_stage_id_for_ws` in
+  [ws.rs](../../crates/anova-oven-server/src/processors/ws.rs)), copied from the
+  iOS traffic. The cloud may tie stage IDs or the cook to a platform.
+- **The credential.** The server authenticates with a PAT or a Firebase ID
+  token. The phone app's session may carry something the cloud requires for
+  this command.
+- **Ownership of the cook.** The cloud may only let the client that started a
+  cook, or one with the app's session, change its stages.
+
+None of this matters with a local stand-in, since there's no cloud to refuse
+the command; [oven-offline-plan.md](../oven-offline-plan.md) brings stage
+advance back in local mode.
+
 ## Decision
 
 Remove all code that sends `CMD_APO_START_STAGE` — both the user-triggered

@@ -20,6 +20,7 @@
     "native-tls",
     "fastrand",
     "openssl",
+    "server",
   ] }
   futures-util = { version = "0.3", features = ["sink"] }
   serde = { version = "1.0", features = ["derive"] }
@@ -29,3 +30,16 @@
   tracing = "0.1"
   tracing-appender = "0.2"
   tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+  # Device-side listener (local mode): TLS for the oven, a per-run
+  # self-signed RSA certificate, and the time zone answered to the oven.
+  tokio-rustls = "0.26"
+  rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs"] }
+  jiff = "0.2"
+  base64 = "0.23"
+  # Home Assistant over MQTT. Plain `mqtt://` only for now, so no second TLS
+  # stack comes in with it.
+  rumqttc = { version = "0.25", default-features = false }
+  metrics = "0.24"
+  # No default features: we render via our own axum route (`/metrics`), so
+  # the bundled hyper listener and push-gateway client are not needed.
+  metrics-exporter-prometheus = { version = "0.18", default-features = false }

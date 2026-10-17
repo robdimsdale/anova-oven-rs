@@ -135,7 +135,7 @@ pub async fn fetch_status(
         rx_buf,
         server,
         Method::GET,
-        "/status",
+        "/api/status",
         "GET /status",
         None,
         |status, body| {
@@ -183,7 +183,7 @@ pub async fn fetch_current_cook(
         rx_buf,
         server,
         Method::GET,
-        "/current-cook",
+        "/api/current-cook",
         "GET /current-cook",
         None,
         |status, body| match status {
@@ -225,7 +225,7 @@ pub async fn send_stop(
         rx_buf,
         server,
         Method::POST,
-        "/stop",
+        "/api/stop",
         "POST /stop",
         None,
         |status, _body| {
@@ -234,6 +234,34 @@ pub async fn send_stop(
                 Ok(())
             } else {
                 warn!("POST /stop: HTTP {}", status);
+                Err(ApiError::Http(status))
+            }
+        },
+    )
+    .await
+}
+
+/// `POST /next-stage`: start the stage the oven is waiting on. The server
+/// only offers it in local mode; under Anova's cloud it answers 501.
+pub async fn send_next_stage(
+    stack: embassy_net::Stack<'static>,
+    rx_buf: &mut [u8],
+    server: &str,
+) -> Result<(), ApiError> {
+    request::<_, _, 1024, 1024>(
+        stack,
+        rx_buf,
+        server,
+        Method::POST,
+        "/api/next-stage",
+        "POST /next-stage",
+        None,
+        |status, _body| {
+            if (200..300).contains(&status) {
+                info!("POST /next-stage: success (HTTP {})", status);
+                Ok(())
+            } else {
+                warn!("POST /next-stage: HTTP {}", status);
                 Err(ApiError::Http(status))
             }
         },
@@ -255,7 +283,7 @@ pub async fn send_start(
         rx_buf,
         server,
         Method::POST,
-        "/start",
+        "/api/start",
         "POST /start",
         Some(body.as_bytes()),
         |status, _body| {
@@ -281,7 +309,7 @@ pub async fn fetch_recipes(
         rx_buf,
         server,
         Method::GET,
-        "/recipes",
+        "/api/recipes",
         "GET /recipes",
         None,
         |status, body| {

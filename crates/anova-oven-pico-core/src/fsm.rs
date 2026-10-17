@@ -48,6 +48,10 @@ pub struct ApiSnapshot {
     /// poll) is what lets the display count the seconds in between. `None`
     /// until the first status arrives.
     pub timer_anchor: Option<Instant>,
+    /// When the server first answered `/status` with 503: it is up but has no
+    /// oven state, because the oven hasn't connected since it started. `None`
+    /// once a status arrives.
+    pub oven_missing_since: Option<Instant>,
 }
 
 impl Default for ApiSnapshot {
@@ -59,6 +63,7 @@ impl Default for ApiSnapshot {
             fail_count: 0,
             last_success_at: None,
             timer_anchor: None,
+            oven_missing_since: None,
         }
     }
 }
@@ -85,6 +90,15 @@ impl ApiSnapshot {
             self.timer_anchor = Some(now);
         }
         self.status = Some(status);
+        self.oven_missing_since = None;
+    }
+
+    /// The server is up but has no oven state. Drop the last reading, which
+    /// came from before the server restarted, so it isn't shown as current.
+    pub fn mark_oven_missing(&mut self, now: Instant) {
+        self.status = None;
+        self.timer_anchor = None;
+        self.oven_missing_since.get_or_insert(now);
     }
 
     pub fn is_offline(&self) -> bool {
@@ -113,8 +127,13 @@ impl ApiSnapshot {
     /// grace window, or when the server is too old to report link health.
     ///
     /// Only meaningful while the server itself is reachable ([`is_offline`]
-    /// takes precedence); a stale reading requires a status to have been served.
-    pub fn upstream_stale_secs(&self) -> Option<u64> {
+    /// takes precedence). Also flags a server with no oven state at all, once
+    /// that has lasted past the same grace window.
+    pub fn upstream_stale_secs(&self, now: Instant) -> Option<u64> {
+        if let Some(since) = self.oven_missing_since {
+            let secs = now.saturating_duration_since(since).as_secs();
+            return (secs >= UPSTREAM_STALE_GRACE_SECS).then_some(secs);
+        }
         let upstream = self.status.as_ref()?.upstream.as_ref()?;
         if !upstream.connected && upstream.disconnected_secs >= UPSTREAM_STALE_GRACE_SECS {
             Some(upstream.disconnected_secs)
@@ -319,11 +338,11 @@ pub fn baseline_state_for(snap: &ApiSnapshot) -> AppState {
     }
 }
 
-/// What the idle screen should show. Until we have first data, render the
-/// `Connecting` placeholder; afterwards show whatever the latest status /
-/// (lack of) cook says.
+/// What the idle screen should show. Until we have first data, or while the
+/// server waits for the oven, render the `Connecting` placeholder; afterwards
+/// show whatever the latest status / (lack of) cook says.
 pub fn idle_view(snap: &ApiSnapshot) -> ViewSpec {
-    if !snap.has_first_data() {
+    if !snap.has_first_data() || snap.oven_missing_since.is_some() {
         ViewSpec::Connecting
     } else {
         ViewSpec::Status {
@@ -448,14 +467,14 @@ mod tests {
 
         let mut snap = snapshot();
         // No status at all -> nothing to judge.
-        assert_eq!(snap.upstream_stale_secs(), None);
+        assert_eq!(snap.upstream_stale_secs(Instant::from_secs(0)), None);
 
         let mut status = idle_status();
 
         // Status present but no upstream field (server predates it) -> None.
         status.upstream = None;
         snap.status = Some(status.clone());
-        assert_eq!(snap.upstream_stale_secs(), None);
+        assert_eq!(snap.upstream_stale_secs(Instant::from_secs(0)), None);
 
         // Connected -> never stale, whatever the counter says.
         status.upstream = Some(UpstreamHealth {
@@ -463,7 +482,7 @@ mod tests {
             disconnected_secs: 9999,
         });
         snap.status = Some(status.clone());
-        assert_eq!(snap.upstream_stale_secs(), None);
+        assert_eq!(snap.upstream_stale_secs(Instant::from_secs(0)), None);
 
         // Disconnected but within the grace window -> not yet flagged (ignores
         // the routine ~5s reconnects).
@@ -472,7 +491,7 @@ mod tests {
             disconnected_secs: UPSTREAM_STALE_GRACE_SECS - 1,
         });
         snap.status = Some(status.clone());
-        assert_eq!(snap.upstream_stale_secs(), None);
+        assert_eq!(snap.upstream_stale_secs(Instant::from_secs(0)), None);
 
         // Disconnected past the grace window -> flagged, reporting the duration.
         status.upstream = Some(UpstreamHealth {
@@ -480,7 +499,38 @@ mod tests {
             disconnected_secs: UPSTREAM_STALE_GRACE_SECS,
         });
         snap.status = Some(status);
-        assert_eq!(snap.upstream_stale_secs(), Some(UPSTREAM_STALE_GRACE_SECS));
+        assert_eq!(
+            snap.upstream_stale_secs(Instant::from_secs(0)),
+            Some(UPSTREAM_STALE_GRACE_SECS)
+        );
+    }
+
+    #[test]
+    fn a_missing_oven_drops_the_reading_and_goes_stale_after_the_grace() {
+        let t0 = Instant::from_secs(100);
+        let mut snap = snapshot();
+        snap.install_status(idle_status(), t0);
+        snap.last_success_at = Some(t0);
+
+        snap.mark_oven_missing(t0);
+        assert!(snap.status.is_none());
+        assert!(matches!(idle_view(&snap), ViewSpec::Connecting));
+        assert_eq!(snap.upstream_stale_secs(t0), None);
+
+        // Repeated 503s keep the first sighting.
+        snap.mark_oven_missing(t0 + Duration::from_secs(5));
+        assert_eq!(snap.oven_missing_since, Some(t0));
+
+        let later = t0 + Duration::from_secs(UPSTREAM_STALE_GRACE_SECS);
+        assert_eq!(
+            snap.upstream_stale_secs(later),
+            Some(UPSTREAM_STALE_GRACE_SECS)
+        );
+
+        // A status brings it back.
+        snap.install_status(idle_status(), later);
+        assert_eq!(snap.oven_missing_since, None);
+        assert_eq!(snap.upstream_stale_secs(later), None);
     }
 
     /// Base OvenStatus JSON with every required field present. Tests

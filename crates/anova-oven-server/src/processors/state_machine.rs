@@ -1,6 +1,6 @@
 //! State machine processor.
 //!
-//! Owns canonical oven/app state and orchestrates WebSocket + Firestore
+//! Owns canonical oven/app state and orchestrates WebSocket + store
 //! effects via pure reducers. Phase 4 builds out the transition logic, pending
 //! command tracker, and read-model snapshot. The processor is *built* here
 //! but not yet wired into `main.rs` — Phase 5 will swap HTTP handlers onto it.
@@ -11,15 +11,16 @@
 
 #![allow(dead_code)]
 
-use anova_oven_api::{CookProgress, CurrentCook, HistoryEntry, OvenStatus, Recipe};
-use tokio::sync::{mpsc, oneshot, watch};
+use anova_oven_api::{CookProgress, CurrentCook, HistoryEntry, OvenStatus, Recipe, Stage};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::read_model::ReadModel;
 use crate::runtime::types::{
-    CurrentCookReason, FirestoreCommand, FirestoreEvent, HistoryReason, SmError,
-    StateMachineCommand, StateMachineEvent, TransitionOrigin, WsCommand, WsEvent,
+    CommandFailure, ControlRequest, CurrentCookReason, HistoryReason, OvenControl, OvenCook,
+    SmError, StartedFrom, StateMachineCommand, StateMachineEvent, StoreCommand, StoreError,
+    StoreEvent, TransitionOrigin, WsCommand, WsEvent,
 };
 
 // ─── Canonical state ─────────────────────────────────────────────────────────
@@ -31,10 +32,16 @@ pub struct SmState {
     pub last_origin: Option<TransitionOrigin>,
     pub pending: PendingTracker,
     pub status: Option<OvenStatus>,
+    /// The oven's own view of the running cook, from the latest state.
+    pub oven_cook: Option<OvenCook>,
     pub current_cook: Option<CurrentCook>,
     pub cook_progress: Option<CookProgress>,
     pub recipes: Vec<Recipe>,
     pub history: Vec<HistoryEntry>,
+    /// Local mode: the server is the oven's cloud. Command acks come from the
+    /// oven's own state, sent just before the ack, and the controls Anova's
+    /// cloud refused are available.
+    pub local: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -70,7 +77,14 @@ pub enum Lifecycle {
 pub struct PendingTracker {
     pub start: Option<PendingStart>,
     pub stop: Option<PendingStop>,
+    /// Controls sent and not yet acked, as (request id, name). Bounded: an
+    /// ack, a failure or [`MAX_PENDING_CONTROLS`] newer ones clear an entry.
+    pub controls: Vec<(String, &'static str)>,
 }
+
+/// Every control is acked or timed out within seconds, so this only bounds
+/// a run of controls whose acks went missing.
+const MAX_PENDING_CONTROLS: usize = 16;
 
 #[derive(Clone, Debug)]
 pub struct PendingStart {
@@ -121,8 +135,10 @@ impl SmState {
 #[derive(Debug)]
 pub enum SmEffect {
     Ws(WsCommand),
-    Firestore(FirestoreCommand),
+    Store(StoreCommand),
     PublishReadModel,
+    /// Announce a command the oven didn't carry out.
+    CommandFailed(CommandFailure),
 }
 
 // ─── Reducers ────────────────────────────────────────────────────────────────
@@ -145,50 +161,89 @@ pub fn reduce_command(state: &mut SmState, cmd: StateMachineCommand) -> CommandO
             CommandOutcome::reply_history(reply, Ok(state.history.clone()))
         }
         StateMachineCommand::RefreshRecipes { reply } => {
-            let effects = vec![SmEffect::Firestore(FirestoreCommand::RefreshRecipes)];
+            let effects = vec![SmEffect::Store(StoreCommand::RefreshRecipes)];
             CommandOutcome::reply_recipes(reply, Ok(state.recipes.clone()), effects)
         }
         StateMachineCommand::StartCook { recipe_id, reply } => {
             let (result, effects) = start_cook(state, &recipe_id);
             CommandOutcome::reply_unit_with_effects(reply, result, effects)
         }
+        StateMachineCommand::StartManualCook {
+            title,
+            stages,
+            reply,
+        } => {
+            let (result, effects) = start_manual_cook(state, title, stages);
+            CommandOutcome::reply_unit_with_effects(reply, result, effects)
+        }
         StateMachineCommand::StopCook { reply } => {
             let (result, effects) = stop_cook(state);
+            CommandOutcome::reply_unit_with_effects(reply, result, effects)
+        }
+        StateMachineCommand::Control { request, reply } => {
+            let (result, effects) = match control(state, &request) {
+                Ok(control) => {
+                    let request_id = Uuid::new_v4().to_string();
+                    info!(target: "sm", request = ?request, request_id = %request_id, "sending control");
+                    let controls = &mut state.pending.controls;
+                    controls.push((request_id.clone(), request.name()));
+                    if controls.len() > MAX_PENDING_CONTROLS {
+                        controls.remove(0);
+                    }
+                    (
+                        Ok(()),
+                        vec![SmEffect::Ws(WsCommand::Control {
+                            request_id,
+                            control,
+                        })],
+                    )
+                }
+                Err(e) => (Err(e), Vec::new()),
+            };
             CommandOutcome::reply_unit_with_effects(reply, result, effects)
         }
     }
 }
 
 /// Reduce an external event into state mutation + effects. No replies here —
-/// events originate from the WS / Firestore processors, not client calls.
+/// events originate from the WS / store processors, not client calls.
 pub fn reduce_event(state: &mut SmState, evt: StateMachineEvent) -> Vec<SmEffect> {
     match evt {
         StateMachineEvent::Ws(event) => reduce_ws_event(state, event),
-        StateMachineEvent::Firestore(event) => reduce_firestore_event(state, event),
+        StateMachineEvent::Store(event) => reduce_store_event(state, event),
         StateMachineEvent::Tick(kind) => match kind {
             crate::runtime::types::TickKind::CurrentCookRefresh => {
                 if matches!(
                     state.lifecycle,
                     Lifecycle::Cooking | Lifecycle::StartPending
                 ) {
-                    vec![SmEffect::Firestore(FirestoreCommand::FetchCurrentCook {
-                        reason: CurrentCookReason::Periodic,
-                    })]
+                    vec![fetch_current_cook(state, CurrentCookReason::Periodic)]
                 } else {
                     Vec::new()
                 }
             }
             crate::runtime::types::TickKind::RecipesRefresh => {
-                vec![SmEffect::Firestore(FirestoreCommand::RefreshRecipes)]
+                vec![SmEffect::Store(StoreCommand::RefreshRecipes)]
             }
             crate::runtime::types::TickKind::HistoryRefresh => {
-                vec![SmEffect::Firestore(FirestoreCommand::RefreshHistory {
+                vec![SmEffect::Store(StoreCommand::RefreshHistory {
                     reason: HistoryReason::Periodic,
                 })]
             }
             crate::runtime::types::TickKind::PendingTimeout => Vec::new(),
         },
     }
+}
+
+fn fetch_current_cook(state: &SmState, reason: CurrentCookReason) -> SmEffect {
+    // While a start is pending, the oven's cook is the one being replaced:
+    // passing it would have the local store record that cook in place of
+    // the one just started.
+    let oven_cook = match state.lifecycle {
+        Lifecycle::StartPending => None,
+        _ => state.oven_cook.clone(),
+    };
+    SmEffect::Store(StoreCommand::FetchCurrentCook { reason, oven_cook })
 }
 
 // ─── Client-command transitions ──────────────────────────────────────────────
@@ -199,10 +254,44 @@ fn start_cook(state: &mut SmState, recipe_id: &str) -> (Result<(), SmError>, Vec
         return (Err(SmError::Disconnected), Vec::new());
     }
 
-    let mut recipe = match state.recipes.iter().find(|r| r.id == recipe_id).cloned() {
+    let recipe = match state.recipes.iter().find(|r| r.id == recipe_id).cloned() {
         Some(r) => r,
         None => return (Err(SmError::RecipeNotFound(recipe_id.into())), Vec::new()),
     };
+    let from = StartedFrom::Recipe(recipe.id.clone());
+    start(state, recipe, from)
+}
+
+/// Start a cook from stages given with the request. The caller has checked
+/// them (`local_store::normalize`).
+fn start_manual_cook(
+    state: &mut SmState,
+    title: String,
+    stages: Vec<Stage>,
+) -> (Result<(), SmError>, Vec<SmEffect>) {
+    if state.connectivity.cooker_id().is_none() {
+        return (Err(SmError::Disconnected), Vec::new());
+    }
+    let cook_stage_count = stages.iter().filter(|s| s.kind != "preheat").count();
+    let recipe = Recipe {
+        id: format!("manual-{}", Uuid::new_v4().simple()),
+        title: title.clone(),
+        stage_count: cook_stage_count,
+        stages,
+        source: Default::default(),
+    };
+    let from = StartedFrom::Manual {
+        title,
+        cook_stage_count,
+    };
+    start(state, recipe, from)
+}
+
+fn start(
+    state: &mut SmState,
+    mut recipe: Recipe,
+    from: StartedFrom,
+) -> (Result<(), SmError>, Vec<SmEffect>) {
     crate::recipe::rewrite_preheat_stage_ids(&mut recipe.stages);
 
     // Placeholder request-id tracking: the real WS processor will allocate the
@@ -221,7 +310,7 @@ fn start_cook(state: &mut SmState, recipe_id: &str) -> (Result<(), SmError>, Vec
     let total_stage_count = recipe.stages.len();
     state.current_cook = Some(CurrentCook {
         recipe_title: recipe.title.clone(),
-        recipe_id: Some(recipe.id.clone()),
+        recipe_id: from.recipe_id().map(String::from),
         started_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| format!("local-{}", d.as_secs()))
@@ -239,13 +328,93 @@ fn start_cook(state: &mut SmState, recipe_id: &str) -> (Result<(), SmError>, Vec
             recipe_id: recipe.id.clone(),
             stages: recipe.stages.clone(),
         }),
-        SmEffect::Firestore(FirestoreCommand::PatchCookRecipeRef {
-            cook_id,
-            recipe_id: recipe.id.clone(),
-        }),
+        SmEffect::Store(StoreCommand::PatchCookRecipeRef { cook_id, from }),
     ];
 
     (Ok(()), effects)
+}
+
+/// Turn a client's control request into a command for the oven.
+///
+/// While a preheat runs, the oven copies the first `SET_*` onto the paired
+/// cook stage, so changes to the stages go out as `UPDATE_COOK_STAGES`
+/// instead: a temperature edits the preheat itself, and a timer the cook
+/// stage after it (a preheat has no timer of its own; the oven shows the
+/// next stage's).
+fn control(state: &SmState, request: &ControlRequest) -> Result<OvenControl, SmError> {
+    if !state.local {
+        return Err(SmError::Unsupported(
+            "only available in local mode; Anova's cloud refuses or doesn't relay it".into(),
+        ));
+    }
+    if state.connectivity.cooker_id().is_none() {
+        return Err(SmError::Disconnected);
+    }
+    match request {
+        ControlRequest::Lamp { on } => return Ok(OvenControl::SetLamp { on: *on }),
+        ControlRequest::TemperatureUnit { unit } => {
+            return Ok(OvenControl::SetTemperatureUnit { unit: unit.clone() })
+        }
+        _ => {}
+    }
+
+    let status = state
+        .status
+        .as_ref()
+        .filter(|s| s.is_cooking())
+        .ok_or(SmError::NotCooking)?;
+    let cook = state.oven_cook.as_ref().ok_or(SmError::NotCooking)?;
+    let active = status
+        .active_stage_index
+        .filter(|i| *i < cook.raw_stages.len())
+        .ok_or_else(|| SmError::Conflict("the oven hasn't reported its active stage".into()))?;
+    let in_preheat = cook.stages.get(active).is_some_and(|s| s.kind == "preheat");
+
+    match request {
+        ControlRequest::NextStage => {
+            let next = cook
+                .stages
+                .get(active + 1)
+                .ok_or_else(|| SmError::Conflict("the active stage is the last one".into()))?;
+            let stage_id = next
+                .id
+                .clone()
+                .ok_or_else(|| SmError::Conflict("the next stage has no id".into()))?;
+            Ok(OvenControl::StartStage { stage_id })
+        }
+        ControlRequest::Temperature { celsius } if in_preheat => {
+            let mut stages = cook.raw_stages.clone();
+            stages[active] = crate::protocol::stages::with_temperature(&stages[active], *celsius);
+            Ok(update_cook_stages(&stages))
+        }
+        ControlRequest::Temperature { celsius } => Ok(OvenControl::SetTemperatureBulbs {
+            mode: status.temperature_bulbs_mode.clone(),
+            celsius: *celsius,
+        }),
+        ControlRequest::Timer { secs } if in_preheat => {
+            if active + 1 >= cook.raw_stages.len() {
+                return Err(SmError::Conflict(
+                    "a preheat with no stage after it has no timer to set".into(),
+                ));
+            }
+            let mut stages = cook.raw_stages.clone();
+            stages[active + 1] = crate::protocol::stages::with_timer(&stages[active + 1], *secs);
+            Ok(update_cook_stages(&stages))
+        }
+        ControlRequest::Timer { secs } => Ok(OvenControl::SetTimer { secs: *secs }),
+        ControlRequest::Lamp { .. } | ControlRequest::TemperatureUnit { .. } => {
+            unreachable!("handled above")
+        }
+    }
+}
+
+fn update_cook_stages(raw: &[serde_json::Value]) -> OvenControl {
+    OvenControl::UpdateCookStages {
+        stages: raw
+            .iter()
+            .map(crate::protocol::stages::for_update)
+            .collect(),
+    }
 }
 
 fn stop_cook(state: &mut SmState) -> (Result<(), SmError>, Vec<SmEffect>) {
@@ -299,7 +468,23 @@ fn reduce_ws_event(state: &mut SmState, event: WsEvent) -> Vec<SmEffect> {
             };
             Vec::new()
         }
-        WsEvent::ApoState(status) => apply_apo_state(state, status),
+        WsEvent::ApoState { status, cook } => {
+            // First, so a store that keeps history itself has recorded an
+            // ended cook before any history refresh below. Not while a start
+            // is pending: the oven's cook (or its idleness) is about to be
+            // replaced, and would end the cook just started.
+            let report = (state.lifecycle != Lifecycle::StartPending).then(|| {
+                SmEffect::Store(StoreCommand::OvenReported {
+                    oven_cook: cook.clone(),
+                })
+            });
+            state.oven_cook = cook;
+            let mut effects = apply_apo_state(state, status);
+            if let Some(report) = report {
+                effects.insert(0, report);
+            }
+            effects
+        }
         WsEvent::CommandAck { request_id, status } => {
             apply_command_ack(state, &request_id, &status)
         }
@@ -330,13 +515,6 @@ fn apply_apo_state(state: &mut SmState, status: OvenStatus) -> Vec<SmEffect> {
         } else {
             CurrentCookReason::WsConnectedCookingState
         };
-        effects.push(SmEffect::Firestore(FirestoreCommand::FetchCurrentCook {
-            reason,
-        }));
-        effects.push(SmEffect::Firestore(FirestoreCommand::RefreshHistory {
-            reason: HistoryReason::WsIdleToCooking,
-        }));
-
         let origin = match state.lifecycle {
             Lifecycle::StartPending => TransitionOrigin::AckConfirmed,
             _ => {
@@ -349,11 +527,18 @@ fn apply_apo_state(state: &mut SmState, status: OvenStatus) -> Vec<SmEffect> {
         };
         state.pending.start = None;
         state.set_lifecycle(Lifecycle::Cooking, origin);
+
+        // After leaving StartPending: the oven was idle, so its cook is the
+        // new one, not one being replaced.
+        effects.push(fetch_current_cook(state, reason));
+        effects.push(SmEffect::Store(StoreCommand::RefreshHistory {
+            reason: HistoryReason::WsIdleToCooking,
+        }));
     }
 
     // Cooking -> idle (local stop confirmed, external stop, or completion).
     if !is_cooking && prev_cooking {
-        effects.push(SmEffect::Firestore(FirestoreCommand::RefreshHistory {
+        effects.push(SmEffect::Store(StoreCommand::RefreshHistory {
             reason: HistoryReason::WsCookToIdle,
         }));
         let origin = match state.lifecycle {
@@ -369,9 +554,10 @@ fn apply_apo_state(state: &mut SmState, status: OvenStatus) -> Vec<SmEffect> {
     if is_cooking && prev_cooking {
         if let Some(prev) = prev_timer {
             if prev != timer {
-                effects.push(SmEffect::Firestore(FirestoreCommand::FetchCurrentCook {
-                    reason: CurrentCookReason::WsStageTransition,
-                }));
+                effects.push(fetch_current_cook(
+                    state,
+                    CurrentCookReason::WsStageTransition,
+                ));
             }
         }
     }
@@ -409,16 +595,24 @@ fn apply_command_ack(state: &mut SmState, request_id: &str, status: &str) -> Vec
     if let Some(pending) = state.pending.start.as_ref() {
         if pending.request_id == request_id {
             if ok {
-                let out = vec![SmEffect::Firestore(FirestoreCommand::FetchCurrentCook {
-                    reason: CurrentCookReason::StartCommandAccepted,
-                })];
                 state.last_origin = Some(TransitionOrigin::AckConfirmed);
-                // StartPending remains until ApoState confirms cooking.
-                return out;
+                // In local mode the ack comes from the oven's own state, sent
+                // just before it, so a start that replaced a running cook (no
+                // idle -> cooking edge to resolve it) is confirmed here.
+                let cooking = state.status.as_ref().is_some_and(|s| s.is_cooking());
+                if state.local && cooking {
+                    state.pending.start = None;
+                    state.set_lifecycle(Lifecycle::Cooking, TransitionOrigin::AckConfirmed);
+                }
+                // Otherwise StartPending remains until ApoState confirms cooking.
+                return vec![fetch_current_cook(
+                    state,
+                    CurrentCookReason::StartCommandAccepted,
+                )];
             } else {
                 state.pending.start = None;
                 state.set_lifecycle(Lifecycle::Idle, TransitionOrigin::TimeoutRecovery);
-                return Vec::new();
+                return vec![command_failed("start", status)];
             }
         }
     }
@@ -429,59 +623,83 @@ fn apply_command_ack(state: &mut SmState, request_id: &str, status: &str) -> Vec
             // On negative stop ack, fall back to Cooking and let ApoState
             // reconcile if the oven actually stopped.
             state.set_lifecycle(Lifecycle::Cooking, TransitionOrigin::TimeoutRecovery);
-            return Vec::new();
+            return vec![command_failed("stop", status)];
         }
     }
 
+    let controls = &mut state.pending.controls;
+    if let Some(i) = controls.iter().position(|(id, _)| id == request_id) {
+        let (_, name) = controls.remove(i);
+        if !ok {
+            // Nothing to roll back: the next state shows what the oven did.
+            warn!(target: "sm", request_id, status, control = name, "oven control failed");
+            return vec![command_failed(name, status)];
+        }
+    }
     Vec::new()
 }
 
-fn reduce_firestore_event(state: &mut SmState, event: FirestoreEvent) -> Vec<SmEffect> {
+fn command_failed(command: &str, reason: &str) -> SmEffect {
+    SmEffect::CommandFailed(CommandFailure {
+        command: command.to_string(),
+        reason: reason.to_string(),
+    })
+}
+
+fn reduce_store_event(state: &mut SmState, event: StoreEvent) -> Vec<SmEffect> {
     match event {
-        FirestoreEvent::RecipesRefreshed(Ok(recipes)) => {
+        StoreEvent::RecipesRefreshed(Ok(recipes)) => {
             state.recipes = recipes;
             vec![SmEffect::PublishReadModel]
         }
-        FirestoreEvent::RecipesRefreshed(Err(e)) => {
+        StoreEvent::RecipesRefreshed(Err(e)) => {
             warn!(target: "sm", error = %e, "recipes refresh failed");
             Vec::new()
         }
-        FirestoreEvent::HistoryRefreshed(Ok(history)) => {
+        StoreEvent::HistoryRefreshed(Ok(history)) => {
             state.history = history;
             vec![SmEffect::PublishReadModel]
         }
-        FirestoreEvent::HistoryRefreshed(Err(e)) => {
+        StoreEvent::HistoryRefreshed(Err(e)) => {
             warn!(target: "sm", error = %e, "history refresh failed");
             Vec::new()
         }
-        FirestoreEvent::CurrentCookFetched {
+        StoreEvent::CurrentCookFetched {
             result: Ok(cook), ..
         } => {
             state.current_cook = cook;
             vec![SmEffect::PublishReadModel]
         }
-        FirestoreEvent::CurrentCookFetched {
+        StoreEvent::CurrentCookFetched {
+            result: Err(StoreError::Unsupported),
+            reason,
+        } => {
+            debug!(target: "sm", reason = ?reason, "store doesn't track the current cook; keeping ours");
+            Vec::new()
+        }
+        StoreEvent::CurrentCookFetched {
             result: Err(e),
             reason,
         } => {
             warn!(target: "sm", reason = ?reason, error = %e, "current-cook fetch failed");
             Vec::new()
         }
-        FirestoreEvent::RecipeRefPatched {
+        StoreEvent::RecipeRefPatched {
             result: Ok(()),
             cook_id,
             recipe_id,
         } => {
-            info!(target: "sm", cook_id = %cook_id, recipe_id = %recipe_id, "recipe ref patched");
-            vec![SmEffect::Firestore(FirestoreCommand::FetchCurrentCook {
-                reason: CurrentCookReason::StartCommandAccepted,
-            })]
+            info!(target: "sm", cook_id = %cook_id, recipe_id = ?recipe_id, "recipe ref patched");
+            vec![fetch_current_cook(
+                state,
+                CurrentCookReason::StartCommandAccepted,
+            )]
         }
-        FirestoreEvent::RecipeRefPatched { result: Err(e), .. } => {
+        StoreEvent::RecipeRefPatched { result: Err(e), .. } => {
             warn!(target: "sm", error = %e, "recipe ref patch failed");
             Vec::new()
         }
-        FirestoreEvent::ManualCookTitleResolved {
+        StoreEvent::ManualCookTitleResolved {
             result: Ok(Some((title, id))),
             cook_key,
         } => {
@@ -496,7 +714,7 @@ fn reduce_firestore_event(state: &mut SmState, event: FirestoreEvent) -> Vec<SmE
             }
             vec![SmEffect::PublishReadModel]
         }
-        FirestoreEvent::ManualCookTitleResolved { .. } => Vec::new(),
+        StoreEvent::ManualCookTitleResolved { .. } => Vec::new(),
     }
 }
 
@@ -607,8 +825,11 @@ pub struct StateMachineProcessor {
     pub cmd_rx: mpsc::Receiver<StateMachineCommand>,
     pub evt_rx: mpsc::Receiver<StateMachineEvent>,
     pub ws_tx: mpsc::Sender<WsCommand>,
-    pub fs_tx: mpsc::Sender<FirestoreCommand>,
+    pub store_tx: mpsc::Sender<StoreCommand>,
     pub read_model_tx: watch::Sender<ReadModel>,
+    /// Failed commands, for whoever listens (the MQTT processor). Sending
+    /// with no listener is fine.
+    pub failures_tx: broadcast::Sender<CommandFailure>,
     state: SmState,
 }
 
@@ -617,16 +838,22 @@ impl StateMachineProcessor {
         cmd_rx: mpsc::Receiver<StateMachineCommand>,
         evt_rx: mpsc::Receiver<StateMachineEvent>,
         ws_tx: mpsc::Sender<WsCommand>,
-        fs_tx: mpsc::Sender<FirestoreCommand>,
+        store_tx: mpsc::Sender<StoreCommand>,
         read_model_tx: watch::Sender<ReadModel>,
+        failures_tx: broadcast::Sender<CommandFailure>,
+        local: bool,
     ) -> Self {
         Self {
             cmd_rx,
             evt_rx,
             ws_tx,
-            fs_tx,
+            store_tx,
             read_model_tx,
-            state: SmState::new(),
+            failures_tx,
+            state: SmState {
+                local,
+                ..SmState::new()
+            },
         }
     }
 
@@ -656,13 +883,16 @@ impl StateMachineProcessor {
                         warn!(target: "sm", error = %e, "ws channel closed");
                     }
                 }
-                SmEffect::Firestore(cmd) => {
-                    if let Err(e) = self.fs_tx.send(cmd).await {
-                        warn!(target: "sm", error = %e, "firestore channel closed");
+                SmEffect::Store(cmd) => {
+                    if let Err(e) = self.store_tx.send(cmd).await {
+                        warn!(target: "sm", error = %e, "store channel closed");
                     }
                 }
                 SmEffect::PublishReadModel => {
                     let _ = self.read_model_tx.send(self.state.to_read_model());
+                }
+                SmEffect::CommandFailed(failure) => {
+                    let _ = self.failures_tx.send(failure);
                 }
             }
         }
@@ -687,6 +917,8 @@ mod tests {
             dry_bottom_temperature_c: 25.0,
             wet_bulb_temperature_c: 25.0,
             probe_temperature_c: None,
+            probe_target_temperature_c: None,
+            wet_target_temperature_c: None,
             timer_current_secs: 0,
             timer_total_secs,
             timer_mode: if timer_total_secs > 0 {
@@ -716,6 +948,9 @@ mod tests {
             water_tank_empty: false,
             active_stage_index: None,
             active_stage_id: None,
+            cook_done: false,
+            cook_id: None,
+            stage_transition_pending_user_action: false,
             cook_progress: None,
             upstream: None,
         }
@@ -767,11 +1002,11 @@ mod tests {
         })
     }
 
-    fn firestore_cmds(effects: &[SmEffect]) -> Vec<&FirestoreCommand> {
+    fn store_cmds(effects: &[SmEffect]) -> Vec<&StoreCommand> {
         effects
             .iter()
             .filter_map(|e| match e {
-                SmEffect::Firestore(c) => Some(c),
+                SmEffect::Store(c) => Some(c),
                 _ => None,
             })
             .collect()
@@ -785,16 +1020,17 @@ mod tests {
         let _ = apply_apo_state(&mut state, oven_status("idle", 0));
         let effects = apply_apo_state(&mut state, oven_status("cook", 1200));
 
-        let fs = firestore_cmds(&effects);
+        let fs = store_cmds(&effects);
         assert!(fs.iter().any(|c| matches!(
             c,
-            FirestoreCommand::FetchCurrentCook {
-                reason: CurrentCookReason::WsIdleToCooking
+            StoreCommand::FetchCurrentCook {
+                reason: CurrentCookReason::WsIdleToCooking,
+                ..
             }
         )));
         assert!(fs.iter().any(|c| matches!(
             c,
-            FirestoreCommand::RefreshHistory {
+            StoreCommand::RefreshHistory {
                 reason: HistoryReason::WsIdleToCooking
             }
         )));
@@ -809,10 +1045,10 @@ mod tests {
         let _ = apply_apo_state(&mut state, oven_status("cook", 1200));
         let effects = apply_apo_state(&mut state, oven_status("idle", 0));
 
-        let fs = firestore_cmds(&effects);
+        let fs = store_cmds(&effects);
         assert!(fs.iter().any(|c| matches!(
             c,
-            FirestoreCommand::RefreshHistory {
+            StoreCommand::RefreshHistory {
                 reason: HistoryReason::WsCookToIdle
             }
         )));
@@ -876,8 +1112,9 @@ mod tests {
         let effects = apply_command_ack(&mut state, "r1", "ok");
         assert!(effects.iter().any(|effect| matches!(
             effect,
-            SmEffect::Firestore(FirestoreCommand::FetchCurrentCook {
+            SmEffect::Store(StoreCommand::FetchCurrentCook {
                 reason: CurrentCookReason::StartCommandAccepted,
+                ..
             })
         )));
         // Lifecycle remains StartPending until ApoState says cooking.
@@ -913,13 +1150,389 @@ mod tests {
         });
 
         let effects = apply_command_ack(&mut state, "r1", "error");
-        assert!(effects.is_empty());
+        assert_eq!(
+            failures(&effects),
+            [("start".to_string(), "error".to_string())]
+        );
         assert_eq!(state.lifecycle, Lifecycle::Idle);
         assert!(state.pending.start.is_none());
         assert!(matches!(
             state.last_origin,
             Some(TransitionOrigin::TimeoutRecovery)
         ));
+    }
+
+    fn recipe(stages: Vec<Stage>) -> Recipe {
+        Recipe {
+            id: "r".into(),
+            title: "Recipe".into(),
+            stage_count: stages.len(),
+            stages,
+            source: Default::default(),
+        }
+    }
+
+    fn local_state() -> SmState {
+        SmState {
+            local: true,
+            connectivity: Connectivity::Connected {
+                cooker_id: Some("oven".into()),
+            },
+            ..SmState::new()
+        }
+    }
+
+    #[test]
+    fn local_start_ack_confirms_a_start_over_a_running_cook() {
+        let mut state = local_state();
+        let _ = apply_apo_state(&mut state, oven_status("cook", 600));
+        state.recipes = vec![recipe(vec![stage(Some("s1"), "cook", false, Some(600))])];
+        let (_, effects) = start_cook(&mut state, "r");
+        let Some(WsCommand::SendStart { request_id, .. }) = effect_ws(&effects) else {
+            panic!("expected a start");
+        };
+        let request_id = request_id.clone();
+        assert_eq!(state.lifecycle, Lifecycle::StartPending);
+
+        let _ = apply_command_ack(&mut state, &request_id, "ok");
+        assert_eq!(state.lifecycle, Lifecycle::Cooking);
+        assert!(state.pending.start.is_none());
+    }
+
+    #[test]
+    fn a_manual_cook_starts_without_a_recipe_and_journals_its_title() {
+        let mut state = local_state();
+        let _ = apply_apo_state(&mut state, oven_status("idle", 0));
+        let stages = vec![
+            stage(Some("s1-preheat"), "preheat", false, None),
+            stage(Some("s1"), "cook", false, Some(600)),
+        ];
+        let (result, effects) = start_manual_cook(&mut state, "Quick roast".into(), stages);
+        assert!(result.is_ok());
+        let Some(WsCommand::SendStart { stages, .. }) = effect_ws(&effects) else {
+            panic!("expected a start");
+        };
+        assert_eq!(stages.len(), 2);
+        let from = effects.iter().find_map(|e| match e {
+            SmEffect::Store(StoreCommand::PatchCookRecipeRef { from, .. }) => Some(from.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            from,
+            Some(StartedFrom::Manual {
+                title: "Quick roast".into(),
+                cook_stage_count: 1
+            })
+        );
+        let cook = state.current_cook.as_ref().unwrap();
+        assert_eq!(cook.recipe_title, "Quick roast");
+        assert_eq!(cook.recipe_id, None);
+        assert_eq!(state.lifecycle, Lifecycle::StartPending);
+    }
+
+    fn oven_cook(cook_id: &str) -> OvenCook {
+        OvenCook {
+            cook_id: cook_id.into(),
+            stages: vec![stage(Some("s1"), "cook", false, Some(600))],
+            raw_stages: Vec::new(),
+            seconds_elapsed: 0,
+        }
+    }
+
+    /// A local-mode state cooking `stages` (kinds) on `active`, with the
+    /// oven's raw stage JSON to match.
+    fn cooking_on(kinds: &[&str], active: usize) -> SmState {
+        let raw: Vec<serde_json::Value> = kinds
+            .iter()
+            .enumerate()
+            .map(|(i, kind)| {
+                serde_json::json!({
+                    "id": format!("stage-{i}"),
+                    "type": kind,
+                    "title": format!("{kind} {i}"),
+                    "userActionRequired": false,
+                    "temperatureBulbs": { "mode": "dry", "dry": { "setpoint": { "celsius": 200, "fahrenheit": 392 } } },
+                    "timer": { "initial": 600 },
+                    "rackPosition": 2,
+                })
+            })
+            .collect();
+        let mut state = local_state();
+        let mut status = oven_status("cook", 600);
+        status.active_stage_index = Some(active);
+        let _ = reduce_ws_event(
+            &mut state,
+            WsEvent::ApoState {
+                status,
+                cook: Some(OvenCook {
+                    cook_id: "c".into(),
+                    stages: raw
+                        .iter()
+                        .map(crate::protocol::stages::stage_from_json)
+                        .collect(),
+                    raw_stages: raw,
+                    seconds_elapsed: 0,
+                }),
+            },
+        );
+        state
+    }
+
+    fn failures(effects: &[SmEffect]) -> Vec<(String, String)> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                SmEffect::CommandFailed(f) => Some((f.command.clone(), f.reason.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn failed_acks_are_announced_by_command() {
+        let mut state = cooking_on(&["cook", "cook"], 0);
+        let outcome = reduce_command(
+            &mut state,
+            StateMachineCommand::Control {
+                request: ControlRequest::NextStage,
+                reply: oneshot::channel().0,
+            },
+        );
+        let effects = outcome.deliver();
+        let Some(WsCommand::Control { request_id, .. }) = effect_ws(&effects) else {
+            panic!("expected a control");
+        };
+        let request_id = request_id.clone();
+        assert_eq!(
+            failures(&apply_command_ack(&mut state, &request_id, "timeout")),
+            [("next_stage".to_string(), "timeout".to_string())]
+        );
+        // Once only.
+        assert!(failures(&apply_command_ack(&mut state, &request_id, "timeout")).is_empty());
+
+        let (_, effects) = stop_cook(&mut state);
+        let Some(WsCommand::SendStop { request_id }) = effect_ws(&effects) else {
+            panic!("expected a stop");
+        };
+        let request_id = request_id.clone();
+        assert_eq!(
+            failures(&apply_command_ack(&mut state, &request_id, "disconnected")),
+            [("stop".to_string(), "disconnected".to_string())]
+        );
+    }
+
+    #[test]
+    fn controls_are_refused_in_cloud_mode() {
+        let mut state = cooking_on(&["cook"], 0);
+        state.local = false;
+        assert!(matches!(
+            control(&state, &ControlRequest::Lamp { on: true }),
+            Err(SmError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn next_stage_starts_the_following_stage_by_id() {
+        let state = cooking_on(&["preheat", "cook"], 0);
+        assert!(matches!(
+            control(&state, &ControlRequest::NextStage),
+            Ok(OvenControl::StartStage { stage_id }) if stage_id == "stage-1"
+        ));
+        let last = cooking_on(&["preheat", "cook"], 1);
+        assert!(matches!(
+            control(&last, &ControlRequest::NextStage),
+            Err(SmError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn stage_controls_need_a_cook() {
+        let mut state = local_state();
+        let _ = apply_apo_state(&mut state, oven_status("idle", 0));
+        assert!(matches!(
+            control(&state, &ControlRequest::Timer { secs: 60 }),
+            Err(SmError::NotCooking)
+        ));
+        // The lamp and unit don't.
+        assert!(control(&state, &ControlRequest::Lamp { on: true }).is_ok());
+    }
+
+    #[test]
+    fn cook_stage_edits_use_set_commands() {
+        let state = cooking_on(&["preheat", "cook"], 1);
+        assert!(matches!(
+            control(&state, &ControlRequest::Timer { secs: 60 }),
+            Ok(OvenControl::SetTimer { secs: 60 })
+        ));
+        assert!(matches!(
+            control(&state, &ControlRequest::Temperature { celsius: 180.0 }),
+            Ok(OvenControl::SetTemperatureBulbs { mode, celsius }) if mode == "dry" && celsius == 180.0
+        ));
+    }
+
+    #[test]
+    fn preheat_edits_go_out_as_a_stage_update() {
+        let state = cooking_on(&["preheat", "cook"], 0);
+
+        let Ok(OvenControl::UpdateCookStages { stages }) =
+            control(&state, &ControlRequest::Temperature { celsius: 180.0 })
+        else {
+            panic!("expected an update");
+        };
+        // The preheat's own setpoint; the cook stage keeps its own.
+        assert_eq!(
+            stages[0]["temperatureBulbs"]["dry"]["setpoint"]["celsius"],
+            180
+        );
+        assert_eq!(
+            stages[1]["temperatureBulbs"]["dry"]["setpoint"]["celsius"],
+            200
+        );
+        // Sent back as the oven had them, plus what the update format needs.
+        assert_eq!(stages[0]["id"], "stage-0");
+        assert_eq!(stages[0]["rackPosition"], 2);
+        assert_eq!(stages[0]["stepType"], "stage");
+        assert_eq!(stages[0]["stageTransitionType"], "automatic");
+
+        let Ok(OvenControl::UpdateCookStages { stages }) =
+            control(&state, &ControlRequest::Timer { secs: 90 })
+        else {
+            panic!("expected an update");
+        };
+        // The timer the oven shows during a preheat is the next stage's.
+        assert_eq!(stages[1]["timer"]["initial"], 90);
+        assert_eq!(stages[0]["timer"]["initial"], 600);
+    }
+
+    fn fetched_oven_cook_ids(effects: &[SmEffect]) -> Vec<Option<String>> {
+        store_cmds(effects)
+            .into_iter()
+            .filter_map(|c| match c {
+                StoreCommand::FetchCurrentCook { oven_cook, .. } => {
+                    Some(oven_cook.as_ref().map(|c| c.cook_id.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn cooking(state: &mut SmState, cook_id: &str) -> Vec<SmEffect> {
+        reduce_ws_event(
+            state,
+            WsEvent::ApoState {
+                status: oven_status("cook", 600),
+                cook: Some(oven_cook(cook_id)),
+            },
+        )
+    }
+
+    #[test]
+    fn idle_to_cooking_fetches_with_the_new_oven_cook() {
+        let mut state = local_state();
+        let _ = apply_apo_state(&mut state, oven_status("idle", 0));
+        state.recipes = vec![recipe(vec![stage(Some("s1"), "cook", false, Some(600))])];
+        let _ = start_cook(&mut state, "r");
+        let effects = cooking(&mut state, "ios-new");
+        assert_eq!(
+            fetched_oven_cook_ids(&effects),
+            [Some("ios-new".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_start_over_a_running_cook_never_fetches_with_the_old_one() {
+        let mut state = local_state();
+        let _ = cooking(&mut state, "old");
+        state.recipes = vec![recipe(vec![stage(Some("s1"), "cook", false, Some(600))])];
+        let (_, effects) = start_cook(&mut state, "r");
+        let Some(WsCommand::SendStart { request_id, .. }) = effect_ws(&effects) else {
+            panic!("expected a start");
+        };
+        let request_id = request_id.clone();
+
+        // The periodic refresh while the start is pending.
+        let tick = reduce_event(
+            &mut state,
+            StateMachineEvent::Tick(crate::runtime::types::TickKind::CurrentCookRefresh),
+        );
+        assert_eq!(fetched_oven_cook_ids(&tick), [None]);
+
+        // The oven reports the new cook, then the ack.
+        let _ = cooking(&mut state, "ios-new");
+        let effects = apply_command_ack(&mut state, &request_id, "ok");
+        assert_eq!(
+            fetched_oven_cook_ids(&effects),
+            [Some("ios-new".to_string())]
+        );
+    }
+
+    fn reports(effects: &[SmEffect]) -> Vec<Option<String>> {
+        store_cmds(effects)
+            .into_iter()
+            .filter_map(|c| match c {
+                StoreCommand::OvenReported { oven_cook } => {
+                    Some(oven_cook.as_ref().map(|c| c.cook_id.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn oven_report_goes_to_the_store_before_the_history_refresh() {
+        let mut state = SmState::new();
+        let _ = cooking(&mut state, "c1");
+        let effects = reduce_ws_event(
+            &mut state,
+            WsEvent::ApoState {
+                status: oven_status("idle", 0),
+                cook: None,
+            },
+        );
+        let cmds = store_cmds(&effects);
+        assert!(matches!(
+            cmds.first(),
+            Some(StoreCommand::OvenReported { oven_cook: None })
+        ));
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, StoreCommand::RefreshHistory { .. })));
+    }
+
+    #[test]
+    fn oven_reports_are_held_back_while_a_start_is_pending() {
+        let mut state = local_state();
+        let _ = apply_apo_state(&mut state, oven_status("idle", 0));
+        state.recipes = vec![recipe(vec![stage(Some("s1"), "cook", false, Some(600))])];
+        let _ = start_cook(&mut state, "r");
+        // An idle report that crossed the start on its way.
+        let idle = reduce_ws_event(
+            &mut state,
+            WsEvent::ApoState {
+                status: oven_status("idle", 0),
+                cook: None,
+            },
+        );
+        assert!(reports(&idle).is_empty());
+        // Once the oven reports the new cook, reports resume.
+        assert_eq!(
+            reports(&cooking(&mut state, "ios-new")),
+            [Some("ios-new".to_string())]
+        );
+    }
+
+    #[test]
+    fn unsupported_current_cook_keeps_ours() {
+        let mut state = SmState::new();
+        state.current_cook = Some(cook(vec![stage(Some("s1"), "cook", false, Some(600))]));
+        let _ = reduce_store_event(
+            &mut state,
+            StoreEvent::CurrentCookFetched {
+                reason: CurrentCookReason::Periodic,
+                result: Err(StoreError::Unsupported),
+            },
+        );
+        assert!(state.current_cook.is_some());
     }
 
     // External cooking transition (no matching StartPending) uses WsExternal origin.

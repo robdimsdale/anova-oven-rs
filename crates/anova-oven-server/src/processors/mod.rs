@@ -5,7 +5,10 @@
 //! are intentionally empty in Phase 1 — legacy `main.rs` behavior still
 //! handles all work until later phases swap the implementations in.
 
+pub mod device;
 pub mod firestore;
 pub mod http;
+pub mod local_store;
+pub mod mqtt;
 pub mod state_machine;
 pub mod ws;

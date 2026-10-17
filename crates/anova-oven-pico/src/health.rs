@@ -1,7 +1,9 @@
-//! Read-only `/health` endpoint served over plain HTTP on the local
-//! network. Returns the live persist-region snapshot as JSON so the
-//! same data exposed by the bin's `dump-persist` debug-port tool is
-//! accessible from any device on the LAN with `curl`.
+//! Read-only `/health` and `/metrics` endpoints served over plain HTTP
+//! on the local network. `/health` returns the live persist-region
+//! snapshot as JSON so the same data exposed by the bin's
+//! `dump-persist` debug-port tool is accessible from any device on the
+//! LAN with `curl`. `/metrics` renders the same snapshot in the
+//! Prometheus text format for a scraper (see `docs/monitoring.md`).
 //!
 //! Architecture notes:
 //!
@@ -23,15 +25,19 @@
 //! * No alloc on this path. picoserve's `json` feature serializes the
 //!   struct via `serde-json-core` directly to the socket, so `/health`
 //!   keeps working under heap pressure (which is exactly when it's
-//!   most useful for debugging).
+//!   most useful for debugging). `/metrics` holds the same property:
+//!   `pico_core::metrics::render` writes into a fixed-capacity
+//!   `heapless::String` whose worst-case size is asserted by host
+//!   tests, and never emits sample timestamps (there is no wall clock).
 
 #![allow(clippy::needless_pass_by_value)]
 
 use embassy_executor::Spawner;
 use embassy_net::Stack;
 use picoserve::{
+    io::Write,
     make_static,
-    response::{IntoResponse, Json},
+    response::{Content, IntoResponse, Json},
     routing::get,
     AppBuilder, AppRouter,
 };
@@ -40,9 +46,10 @@ use crate::persist;
 
 const PORT: u16 = 80;
 
-/// One connection at a time. The endpoint is for interactive debug use
-/// (one `curl` from a laptop), not a fan-out API; serializing keeps
-/// memory predictable.
+/// One connection at a time. The endpoints are for interactive debug
+/// use (one `curl` from a laptop) plus one scraper every ~30 s, not a
+/// fan-out API; serializing keeps memory predictable. A scrape that
+/// overlaps a `curl` queues at the TCP accept layer.
 const WEB_TASK_POOL_SIZE: usize = 1;
 
 const TCP_RX_BUF_LEN: usize = 1024;
@@ -57,7 +64,9 @@ impl AppBuilder for AppProps {
     type PathRouter = impl picoserve::routing::PathRouter;
 
     fn build_app(self) -> picoserve::Router<Self::PathRouter> {
-        picoserve::Router::new().route("/health", get(health_handler))
+        picoserve::Router::new()
+            .route("/health", get(health_handler))
+            .route("/metrics", get(metrics_handler))
     }
 }
 
@@ -71,6 +80,30 @@ static CONFIG: picoserve::Config =
 
 async fn health_handler() -> impl IntoResponse {
     Json(persist::read_live())
+}
+
+async fn metrics_handler() -> impl IntoResponse {
+    Metrics(anova_oven_pico_core::metrics::render(&persist::read_live()))
+}
+
+/// The rendered `/metrics` body. A newtype rather than returning the
+/// `heapless::String` directly because picoserve implements `Content`
+/// for its own (older) `heapless`, and because the exposition format
+/// wants its own versioned content type.
+struct Metrics(anova_oven_pico_core::metrics::MetricsBuf);
+
+impl Content for Metrics {
+    fn content_type(&self) -> &'static str {
+        anova_oven_pico_core::metrics::CONTENT_TYPE
+    }
+
+    fn content_length(&self) -> usize {
+        self.0.len()
+    }
+
+    async fn write_content<W: Write>(self, writer: W) -> Result<(), W::Error> {
+        self.0.as_bytes().write_content(writer).await
+    }
 }
 
 #[embassy_executor::task(pool_size = WEB_TASK_POOL_SIZE)]

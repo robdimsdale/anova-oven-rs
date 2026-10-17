@@ -13,12 +13,13 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio_websockets::{ClientBuilder, Message};
 use tracing::{debug, info, trace, warn};
-use uuid::Uuid;
 
 use crate::firestore::{self, FirebaseSession};
 use crate::liveness::Liveness;
-use crate::protocol;
+use crate::oven_log::OvenLog;
+use crate::protocol::{self, app, stages};
 use crate::runtime::types::{WsCommand, WsEvent};
+use crate::telemetry;
 
 /// Firebase ID tokens are valid for ~60 minutes. Refresh a little early so a
 /// reconnect never presents an about-to-expire token to Anova's gateway.
@@ -75,17 +76,6 @@ fn celcius_to_fahrenheit(c: f32) -> f32 {
     c * 9.0 / 5.0 + 32.0
 }
 
-fn normalize_stage_id_for_ws(id: Option<&str>) -> String {
-    match id {
-        Some(raw) if raw.starts_with("ios-") => raw.to_string(),
-        Some(raw) if raw.starts_with("android-") => {
-            format!("ios-{}", raw.trim_start_matches("android-"))
-        }
-        Some(raw) if !raw.is_empty() => format!("ios-{raw}"),
-        _ => format!("ios-{}", Uuid::new_v4()),
-    }
-}
-
 fn stop_command_json(cooker_id: &str, request_id: &str) -> String {
     serde_json::json!({
         "command": "CMD_APO_STOP",
@@ -104,89 +94,6 @@ fn start_command_json(
     stages: &[anova_oven_api::Stage],
     request_id: &str,
 ) -> String {
-    let ws_stages: Vec<serde_json::Value> = stages
-        .iter()
-        .map(|stage| {
-            let stage_id = normalize_stage_id_for_ws(stage.id.as_deref());
-
-            let fan_speed = stage.fan_speed;
-
-            let temperature_bulbs_mode = stage.temperature_bulbs_mode.as_deref().unwrap_or("dry");
-            let setpoint = serde_json::json!({
-                "fahrenheit": (stage.temperature_c * 1.8 + 32.0).round() as i32,
-                "celsius": stage.temperature_c.round() as i32,
-            });
-
-            let temperature_bulbs = if temperature_bulbs_mode == "wet" {
-                serde_json::json!({
-                    "mode": "wet",
-                    "wet": { "setpoint": setpoint }
-                })
-            } else {
-                serde_json::json!({
-                    "mode": "dry",
-                    "dry": { "setpoint": setpoint }
-                })
-            };
-
-            // All stages start as "automatic"; the iOS app flips the
-            // newly-active stage to "manual" via a follow-up
-            // CMD_APO_UPDATE_COOK_STAGES after CMD_APO_START_STAGE. Marking a
-            // stage as "manual" upfront makes the oven jump to that stage
-            // immediately on start, after which CMD_APO_START_STAGE returns
-            // "unauthorized".
-            let mut stage_obj = serde_json::json!({
-                "stepType": "stage",
-                "id": stage_id,
-                "title": stage.title.as_deref().unwrap_or(""),
-                "description": "",
-                "type": stage.kind.as_str(),
-                "userActionRequired": stage.user_action_required.unwrap_or(false),
-                "stageTransitionType": "automatic",
-                "temperatureBulbs": temperature_bulbs,
-                "heatingElements": {
-                    "top": { "on": stage.heating_element_top.unwrap_or(true) },
-                    "rear": { "on": stage.heating_element_rear.unwrap_or(true) },
-                    "bottom": { "on": stage.heating_element_bottom.unwrap_or(true) }
-                },
-                "fan": { "speed": fan_speed },
-                "vent": { "open": stage.vent_open.unwrap_or(false) },
-                "rackPosition": stage.rack_position.unwrap_or(3),
-            });
-
-            // Only emit `steamGenerators` when the stage actually uses steam.
-            // The iOS app omits it for 0%-steam stages; including it forces a
-            // steam-mode reconfiguration that the oven does not expect on e.g.
-            // a dry preheat.
-            if stage.steam_pct > 0.0 {
-                stage_obj["steamGenerators"] = serde_json::json!({
-                    "mode": "steam-percentage",
-                    "steamPercentage": { "setpoint": stage.steam_pct }
-                });
-            }
-
-            if let Some(duration) = stage.duration_secs {
-                stage_obj["timerAdded"] = serde_json::json!(true);
-                stage_obj["probeAdded"] = serde_json::json!(false);
-                stage_obj["timerStartOnDetect"] = serde_json::json!(false);
-                stage_obj["timer"] = serde_json::json!({ "initial": duration });
-            } else if let Some(probe_target_c) = stage.probe_target_c {
-                stage_obj["timerAdded"] = serde_json::json!(false);
-                stage_obj["probeAdded"] = serde_json::json!(true);
-                stage_obj["temperatureProbe"] = serde_json::json!({
-                    "setpoint": {
-                        "fahrenheit": (probe_target_c * 1.8 + 32.0).round() as i32,
-                        "celsius": probe_target_c.round() as i32,
-                    }
-                });
-            }
-            // Preheat (and other stages without timer/probe) omit both
-            // `timerAdded` and `probeAdded` entirely — iOS does the same.
-
-            stage_obj
-        })
-        .collect();
-
     serde_json::json!({
         "command": "CMD_APO_START",
         "payload": {
@@ -194,7 +101,7 @@ fn start_command_json(
             "id": cooker_id,
             "payload": {
                 "cookId": cook_id,
-                "stages": ws_stages
+                "stages": stages::start_stages_json(stages)
             }
         },
         "requestId": request_id
@@ -209,65 +116,12 @@ fn update_cook_stages_command_json(
     active_stage_id: &str,
     request_id: &str,
 ) -> String {
-    let ws_stages: Vec<serde_json::Value> = stages
-        .iter()
-        .map(|stage| {
-            let stage_id = normalize_stage_id_for_ws(stage.id.as_deref());
-            let transition_type = if stage_id == active_stage_id {
-                "manual"
-            } else {
-                "automatic"
-            };
-
-            let temperature_bulbs_mode = stage.temperature_bulbs_mode.as_deref().unwrap_or("dry");
-            let setpoint = serde_json::json!({
-                "fahrenheit": (stage.temperature_c * 1.8 + 32.0).round() as i32,
-                "celsius": stage.temperature_c.round() as i32,
-            });
-            let temperature_bulbs = if temperature_bulbs_mode == "wet" {
-                serde_json::json!({
-                    "mode": "wet",
-                    "wet": { "setpoint": setpoint }
-                })
-            } else {
-                serde_json::json!({
-                    "mode": "dry",
-                    "dry": { "setpoint": setpoint }
-                })
-            };
-
-            let mut stage_obj = serde_json::json!({
-                "stepType": "stage",
-                "id": stage_id,
-                "title": stage.title.as_deref().unwrap_or(""),
-                "type": stage.kind.as_str(),
-                "userActionRequired": stage.user_action_required.unwrap_or(false),
-                "temperatureBulbs": temperature_bulbs,
-                "heatingElements": {
-                    "top": { "on": stage.heating_element_top.unwrap_or(true) },
-                    "rear": { "on": stage.heating_element_rear.unwrap_or(true) },
-                    "bottom": { "on": stage.heating_element_bottom.unwrap_or(true) }
-                },
-                "fan": { "speed": stage.fan_speed },
-                "vent": { "open": stage.vent_open.unwrap_or(false) },
-                "stageTransitionType": transition_type,
-            });
-
-            if let Some(duration) = stage.duration_secs {
-                stage_obj["timerAdded"] = serde_json::json!(true);
-                stage_obj["timer"] = serde_json::json!({ "initial": duration });
-            }
-
-            stage_obj
-        })
-        .collect();
-
     serde_json::json!({
         "command": "CMD_APO_UPDATE_COOK_STAGES",
         "payload": {
             "type": "CMD_APO_UPDATE_COOK_STAGES",
             "id": cooker_id,
-            "payload": { "stages": ws_stages }
+            "payload": { "stages": stages::update_cook_stages_json(stages, active_stage_id) }
         },
         "requestId": request_id
     })
@@ -281,6 +135,9 @@ pub async fn run(
     state_timeout: Duration,
     liveness: Arc<Liveness>,
 ) {
+    // Outlives each connection: the replay a reconnect gets is recognised by
+    // carrying the `updatedTimestamp` already seen on the last one.
+    let mut last_updated: Option<String> = None;
     loop {
         // Obtain (and, for Firebase auth, refresh-if-stale) the token before
         // every connect so a long-lived process never dials in with an expired
@@ -294,11 +151,21 @@ pub async fn run(
             }
         };
         info!("[ws] connecting to Anova WebSocket");
-        match connect_and_run(&token, &mut cmd_rx, &evt_tx, state_timeout, &liveness).await {
+        match connect_and_run(
+            &token,
+            &mut cmd_rx,
+            &evt_tx,
+            state_timeout,
+            &liveness,
+            &mut last_updated,
+        )
+        .await
+        {
             Ok(()) => info!("[ws] connection closed cleanly"),
             Err(e) => warn!(error = %e, "[ws] connection error"),
         }
         liveness.set_connected(false);
+        metrics::counter!(telemetry::WS_RECONNECTS).increment(1);
         let _ = evt_tx.send(WsEvent::Disconnected).await;
         info!("[ws] reconnecting in 5s");
         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -311,6 +178,7 @@ async fn connect_and_run(
     evt_tx: &mpsc::Sender<WsEvent>,
     state_timeout: Duration,
     liveness: &Liveness,
+    last_updated: &mut Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let uri = Uri::builder()
         .scheme("wss")
@@ -335,6 +203,7 @@ async fn connect_and_run(
     }
 
     let mut cooker_id: Option<String> = None;
+    let mut oven_log = OvenLog::default();
     let (mut sink, mut stream) = ws.split();
     // Anova's cloud has been observed to leave the TCP connection half-open
     // (no FIN/RST, no further frames) without tokio-websockets or the OS
@@ -350,6 +219,11 @@ async fn connect_and_run(
     // is covered too (no frames -> no states -> we trip). `state_timeout`
     // defaults to ~2x the idle heartbeat, so a single dropped idle frame
     // won't false-trip a reconnect.
+    //
+    // Not every state frame is fresh, though. When the oven drops off Anova's
+    // cloud, the cloud keeps answering a new connection with its cached
+    // snapshot, so only frames that `classify_state` calls fresh reset the
+    // deadline or count for `/health`.
     let mut last_state_frame = Instant::now();
 
     loop {
@@ -359,6 +233,9 @@ async fn connect_and_run(
                     timeout_secs = state_timeout.as_secs(),
                     "[ws] no oven-state frame from Anova within timeout; reconnecting"
                 );
+                // Whatever the socket's fault, the oven hasn't been heard from:
+                // the replay the next connection gets must not hide that.
+                liveness.set_oven_online(false);
                 return Err("Anova websocket state timeout".into());
             }
             msg = stream.next() => {
@@ -372,9 +249,11 @@ async fn connect_and_run(
                     // freshness signal — only EVENT_APO_STATE resets the
                     // deadline below.
                     Some(Ok(msg)) if msg.is_ping() || msg.is_pong() => {
+                        telemetry::count_ws_frame(if msg.is_ping() { "ping" } else { "pong" });
                         trace!(kind = if msg.is_ping() { "ping" } else { "pong" }, "[ws] control frame");
                     }
                     Some(Ok(msg)) if msg.is_close() => {
+                        telemetry::count_ws_frame("close");
                         let reason = msg
                             .as_close()
                             .map(|(code, text)| format!("{code:?}: {text}"))
@@ -383,14 +262,37 @@ async fn connect_and_run(
                     }
                     Some(Ok(msg)) => {
                         let raw_bytes = msg.as_payload();
-                        match protocol::parse_message(raw_bytes) {
-                            Ok(protocol::Event::ApoState(payload)) => {
+                        match app::parse_message(raw_bytes) {
+                            Ok(app::Event::ApoState(payload)) => {
+                                telemetry::count_ws_frame("state");
                                 // The freshness signal for both the reconnect
-                                // watchdog and `/health`: this is the frame whose
-                                // absence means "stale data".
-                                last_state_frame = Instant::now();
-                                liveness.record_state();
-                                let status = protocol::to_oven_status(&payload);
+                                // watchdog and `/health`: a fresh frame is the one
+                                // whose absence means "stale data".
+                                match classify_state(&payload.state, last_updated.as_deref(), jiff::Timestamp::now(), state_timeout) {
+                                    Freshness::Fresh => {
+                                        last_state_frame = Instant::now();
+                                        liveness.record_state();
+                                        liveness.set_oven_online(true);
+                                    }
+                                    Freshness::Replay => {
+                                        debug!(updated = ?payload.state.updated_timestamp, "[ws] cached state replayed");
+                                    }
+                                    Freshness::Offline => {
+                                        warn!(
+                                            updated = ?payload.state.updated_timestamp,
+                                            online = ?payload.state.system_info.as_ref().and_then(|i| i.online),
+                                            "[ws] oven is not reaching Anova's cloud"
+                                        );
+                                        liveness.set_oven_online(false);
+                                    }
+                                }
+                                if let Some(updated) = &payload.state.updated_timestamp {
+                                    *last_updated = Some(updated.clone());
+                                }
+                                if let Some(info) = &payload.state.system_info {
+                                    telemetry::record_system_info(info);
+                                }
+                                let status = protocol::to_oven_status(&payload.state);
                                 info!(
                                     mode = %status.mode,
                                     temp_f = format!("{:.1}", celcius_to_fahrenheit(status.temperature_c)),
@@ -406,11 +308,14 @@ async fn connect_and_run(
                                         debug!(cook = %cook, "[ws] state.cook");
                                     }
                                 }
-                                if evt_tx.send(WsEvent::ApoState(status)).await.is_err() {
+                                let cook = protocol::to_oven_cook(&payload.state);
+                                oven_log.observe(&status, cook.as_ref().map_or(&[][..], |c| c.stages.as_slice()));
+                                if evt_tx.send(WsEvent::ApoState { status, cook }).await.is_err() {
                                     return Ok(());
                                 }
                             }
-                            Ok(protocol::Event::ApoWifiList { cooker_id: id }) => {
+                            Ok(app::Event::ApoWifiList { cooker_id: id }) => {
+                                telemetry::count_ws_frame("wifi_list");
                                 if let Some(id) = id {
                                     info!(cooker_id = %id, "[ws] cooker id received");
                                     cooker_id = Some(id.clone());
@@ -419,7 +324,8 @@ async fn connect_and_run(
                                     }
                                 }
                             }
-                            Ok(protocol::Event::Response { request_id, status }) => {
+                            Ok(app::Event::Response { request_id, status }) => {
+                                telemetry::count_ws_frame("response");
                                 let response_payload = serde_json::from_slice::<serde_json::Value>(raw_bytes)
                                     .ok()
                                     .and_then(|v| v.get("payload").cloned());
@@ -434,9 +340,11 @@ async fn connect_and_run(
                                 }
                             }
                             Ok(event) => {
+                                telemetry::count_ws_frame("other");
                                 trace!(event = ?event, "[ws] event");
                             }
                             Err(e) => {
+                                telemetry::count_ws_frame("parse_error");
                                 warn!(error = %e, "[ws] parse error");
                                 let _ = evt_tx.send(WsEvent::ParseError { detail: e.to_string() }).await;
                             }
@@ -468,6 +376,10 @@ async fn connect_and_run(
                             None => warn!("[ws] start requested before cooker id known"),
                         }
                     }
+                    // The state machine only sends these in local mode.
+                    Some(WsCommand::Control { control, .. }) => {
+                        warn!(control = ?control, "[ws] oven controls aren't supported through Anova's cloud");
+                    }
                     None => return Ok(()),
                 }
             }
@@ -475,8 +387,47 @@ async fn connect_and_run(
     }
 }
 
+/// What a state frame says about the oven's link to Anova's cloud.
+#[derive(Debug, PartialEq)]
+enum Freshness {
+    /// A new report from the oven.
+    Fresh,
+    /// The snapshot last seen, sent again by the cloud (on every connect).
+    /// Says nothing either way.
+    Replay,
+    /// The cloud says the oven is offline, or its snapshot is older than
+    /// `max_age`.
+    Offline,
+}
+
+fn classify_state(
+    state: &protocol::OvenState,
+    last_updated: Option<&str>,
+    now: jiff::Timestamp,
+    max_age: Duration,
+) -> Freshness {
+    if state.system_info.as_ref().and_then(|i| i.online) == Some(false) {
+        return Freshness::Offline;
+    }
+    let Some(updated) = state.updated_timestamp.as_deref() else {
+        return Freshness::Fresh;
+    };
+    if last_updated == Some(updated) {
+        return Freshness::Replay;
+    }
+    let too_old = updated
+        .parse::<jiff::Timestamp>()
+        .is_ok_and(|at| now.duration_since(at).unsigned_abs() > max_age && at < now);
+    if too_old {
+        Freshness::Offline
+    } else {
+        Freshness::Fresh
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::{classify_state, Freshness};
     use super::{start_command_json, stop_command_json, update_cook_stages_command_json};
     use anova_oven_api::Stage;
 
@@ -500,6 +451,66 @@ mod tests {
             vent_open: Some(false),
             title: Some("Preheat".into()),
         }
+    }
+
+    fn idle_state(online: bool, updated: &str) -> crate::protocol::OvenState {
+        let mut v: serde_json::Value =
+            serde_json::from_str(include_str!("../../testdata/device-state-idle.json")).unwrap();
+        v["data"]["systemInfo"]["online"] = online.into();
+        v["data"]["updatedTimestamp"] = updated.into();
+        serde_json::from_value(v["data"].take()).unwrap()
+    }
+
+    fn at(ts: &str) -> jiff::Timestamp {
+        ts.parse().unwrap()
+    }
+
+    const MAX_AGE: std::time::Duration = std::time::Duration::from_secs(1200);
+
+    #[test]
+    fn a_new_report_is_fresh() {
+        let state = idle_state(true, "2026-10-16T20:33:24Z");
+        let got = classify_state(
+            &state,
+            Some("2026-10-16T20:23:24Z"),
+            at("2026-10-16T20:33:25Z"),
+            MAX_AGE,
+        );
+        assert_eq!(got, Freshness::Fresh);
+    }
+
+    #[test]
+    fn the_snapshot_seen_last_is_a_replay() {
+        let state = idle_state(true, "2026-10-16T20:23:24Z");
+        let got = classify_state(
+            &state,
+            Some("2026-10-16T20:23:24Z"),
+            at("2026-10-16T20:25:00Z"),
+            MAX_AGE,
+        );
+        assert_eq!(got, Freshness::Replay);
+    }
+
+    #[test]
+    fn a_snapshot_older_than_max_age_means_offline() {
+        // A restarted server sees the cached snapshot with nothing to compare.
+        let state = idle_state(true, "2026-10-16T19:00:00Z");
+        let got = classify_state(&state, None, at("2026-10-16T20:43:29Z"), MAX_AGE);
+        assert_eq!(got, Freshness::Offline);
+    }
+
+    #[test]
+    fn the_cloud_saying_offline_wins() {
+        let state = idle_state(false, "2026-10-16T20:43:29Z");
+        let got = classify_state(&state, None, at("2026-10-16T20:43:29Z"), MAX_AGE);
+        assert_eq!(got, Freshness::Offline);
+    }
+
+    #[test]
+    fn a_clock_ahead_of_ours_is_not_stale() {
+        let state = idle_state(true, "2026-10-16T21:00:00Z");
+        let got = classify_state(&state, None, at("2026-10-16T20:00:00Z"), MAX_AGE);
+        assert_eq!(got, Freshness::Fresh);
     }
 
     #[test]

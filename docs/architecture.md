@@ -18,14 +18,17 @@ Target capabilities:
 ┌──────────────────────────────────────────────────────────┐
 │  anova-oven-server  (Linux/macOS, full std)              │
 │                                                          │
-│  axum HTTP API  (plain HTTP, local network)              │
-│  ├── GET  /status         → oven state JSON              │
-│  ├── GET  /recipes        → recipe list JSON             │
-│  ├── POST /update-recipes → force-refresh + return list  │
-│  ├── GET  /history        → cook history JSON            │
-│  ├── GET  /current-cook   → in-progress cook JSON or 204 │
-│  ├── POST /start          → start cook from recipe       │
-│  └── POST /stop           → CMD_APO_STOP                 │
+│  axum HTTP API under /api  (plain HTTP, local network)   │
+│  ├── GET  /api/status         → oven state JSON          │
+│  ├── GET  /api/recipes        → recipe list JSON         │
+│  ├── POST/PATCH/DELETE /api/recipes[/{id}] → recipe CRUD │
+│  ├── POST /api/update-recipes → refresh + return list    │
+│  ├── GET  /api/history        → cook history JSON        │
+│  ├── GET  /api/current-cook   → in-progress cook or 204  │
+│  ├── POST /api/start          → start cook from recipe   │
+│  ├── POST /api/stop           → CMD_APO_STOP             │
+│  └── …controls (local mode)                              │
+│  Web UI: /  (status, light)   /recipes  (recipe editor)  │
 │                                                          │
 │  Processor-based runtime (typed mpsc/watch channels):    │
 │  ├── state_machine processor — central decision logic    │
@@ -217,7 +220,15 @@ is a **processor model**: each processor owns one external surface, holds
 its own state, and exchanges typed commands/events with the other
 processors over `tokio::sync::mpsc` channels.
 
-**Credentials (env vars):**
+**Mode:** `ANOVA_MODE=cloud` (the default) follows the oven through Anova's
+cloud, as described below. `ANOVA_MODE=local` stands in for the oven's own
+cloud instead (see [oven-offline-plan.md](oven-offline-plan.md)): it listens
+for the oven on 443, and needs no credentials and no internet. Recipes,
+history and the current cook are files under `ANOVA_DATA_DIR`; fill the
+recipes once with `anova-oven-server export-recipes` while the internet is
+still available.
+
+**Credentials (env vars, cloud mode):**
 - `ANOVA_EMAIL`    — Firebase email (required)
 - `ANOVA_PASSWORD` — Firebase password (required)
 - `ANOVA_TOKEN`    — optional static PAT for the Anova WebSocket API. When
@@ -236,6 +247,8 @@ processors over `tokio::sync::mpsc` channels.
   arrives within this window, catching half-open sockets and quiet-but-stale
   connections. Anova emits state ~every 10 min idle / ~10s cooking, so the
   default `1200` is ~2x the idle heartbeat. Keepalive pings do not reset it.
+  In local mode it drops the oven's connection instead, and defaults to `90`,
+  since the server sets the oven's idle report rate to 30s.
 - `ANOVA_HTTP_TIMEOUT_SECS` — outbound HTTP timeout (default `10`)
 - `ANOVA_HTTP_CONNECT_TIMEOUT_SECS` — outbound connect timeout (default `5`)
 - `ANOVA_CURRENT_COOK_TIMEOUT_SECS` — current-cook query timeout (default `4`)
@@ -248,12 +261,86 @@ processors over `tokio::sync::mpsc` channels.
 - `ANOVA_HISTORY_REFRESH_INTERVAL_SECS` — periodic history refresh
   (default `3600`)
 
+**Local mode env vars (defaults shown):**
+- `ANOVA_DEVICE_BIND` — where the oven connects (default `0.0.0.0:443`).
+  Point `iot-prod.anovaculinary.io` at this host in the LAN's DNS (see
+  [oven-cloud-emulation.md](oven-cloud-emulation.md#redirecting-the-oven)).
+- `ANOVA_TIMEZONE` — IANA zone answered to the oven's `timezone` requests,
+  e.g. `America/Los_Angeles`. Defaults to the system's zone; if neither is
+  usable the requests go unanswered, which the oven tolerates.
+- `ANOVA_HEALTHCHECK_INTERVAL_SECS` — `CMD_APO_HEALTHCHECK` cadence
+  (default `10`, as the real cloud does)
+- `ANOVA_DATA_DIR` — where the local store keeps its files (default
+  `anova-oven-data`, relative to the working directory):
+  - `recipes/*.json` — one `Recipe` per file, as `GET /recipes` serves
+    them. Written by `export-recipes` and the recipe endpoints (the web UI's
+    editor), found by the `id` inside rather than the file name, so a file
+    added by hand works too. Re-read on every refresh and
+    `POST /update-recipes`.
+  - `active-cook.json` — a journal of the cook in flight, keyed by the
+    oven's `cookId`: title, recipe ID, start time, and when the oven last
+    reported it. Written on `/start` (or on first sight of a cook started
+    from the oven's panel, as `[manual]`), rewritten in place on each report
+    of that cook (every 5s while cooking), and removed when the cook goes
+    to history. A restart mid-cook keeps the title. The stages come from the
+    oven's own `cook` block.
+  - `history.jsonl` — one `HistoryEntry` per line, one line per cook.
+    `GET /history` returns the last 50, newest first. A cook goes to history
+    when an oven report shows the journalled cook is no longer running: on
+    the cooking-to-idle edge, on a start over a running cook, or on the
+    first report after a restart if it ended while the server was down
+    (dated by its last report).
+
+**Web UI.** Static pages compiled into the binary
+(`processors/http/ui/`), plain HTML and a little JavaScript with no build
+step; they call `/api` from the browser. Temperatures show in °F or °C, picked
+with the switch in the header (°F until changed, remembered per browser), and
+are always sent as Celsius.
+
+- `/` — status (temperatures, timer, steam, probe, door, water, light, link),
+  the running cook's stage with stop and next-stage, and the light. While
+  nothing is cooking, a manual cook: a title and stages in the same editor as
+  recipes, started with `POST /start`.
+- `/recipes` — the recipe list, own first then bookmarked, each by title,
+  with a start button per recipe.
+- `/recipes/new`, `/recipes/{id}` — the recipe editor. It works in *steps*,
+  as Anova's app does: a cook stage, optionally with "Preheat first", which
+  saves as a preheat stage with the same settings followed by the cook
+  stage (the pairing the oven expects; see `recipe::rewrite_preheat_stage_ids`).
+  Per step: title, mode (oven or sous vide), temperature, steam, heating
+  elements (a radio of the six allowed combinations), whether it starts
+  automatically (and, with a preheat, whether it carries on after
+  preheating), and how it ends (a radio: until you move on, a timer or a
+  probe). A preheat matters because the oven starts a stage's timer the
+  moment the stage starts: without one, a timed stage counts down while the
+  oven is still heating. Fan, vent and rack aren't shown:
+  new stages get fan 100 and no vent or rack, and existing values are kept on
+  save, as is anything else the form doesn't show. The page checks the
+  same rules as the API as you type, and Save stays disabled until they pass.
+  An existing recipe's page also has Start, which starts the saved recipe;
+  it reads "Save first" and stays disabled while there are unsaved edits.
+
+**Home Assistant over MQTT (off unless `ANOVA_MQTT_URL` is set):**
+- `ANOVA_MQTT_URL` — e.g. `mqtt://broker.lan:1883` (port defaults to 1883;
+  `mqtts://` isn't supported yet)
+- `ANOVA_MQTT_USERNAME`, `ANOVA_MQTT_PASSWORD`
+- `ANOVA_MQTT_TOPIC_PREFIX` — default `anova/oven`
+- `ANOVA_MQTT_DISCOVERY_PREFIX` — default `homeassistant`
+
 **Running:**
 ```sh
 ANOVA_EMAIL=you@example.com \
 ANOVA_PASSWORD=secret \
 cargo run -p anova-oven-server
 # optionally pin a WebSocket PAT with ANOVA_TOKEN=anova-eyJ...
+
+# or, with no Anova account or internet. First, while online, copy the
+# account's own and bookmarked recipes into ANOVA_DATA_DIR/recipes:
+ANOVA_EMAIL=you@example.com ANOVA_PASSWORD=secret \
+cargo run -p anova-oven-server -- export-recipes
+# then:
+ANOVA_MODE=local ANOVA_TIMEZONE=America/Los_Angeles \
+cargo run -p anova-oven-server
 ```
 
 **Internal architecture:**
@@ -265,19 +352,56 @@ cargo run -p anova-oven-server
   are dispatched in the same loop, so command latency is bounded only
   by the current `stream.next()` poll. On disconnect it sleeps 5 s and
   reconnects indefinitely.
+- `processors::device` (local mode) replaces `processors::ws`. It accepts
+  the oven's TLS connection with a self-signed RSA certificate generated at
+  startup, reads `deviceId` from the upgrade's `Authorization` JWT (without
+  verifying it) and emits it as `CookerDiscovered`, then forwards each
+  `state` as `ApoState`. It sends `CMD_APO_SET_REPORT_STATE_RATE` on every
+  connect (`{"idle": 30, "cooking": 5}`), `CMD_APO_HEALTHCHECK` every 10s, and answers `timezone`. One
+  oven at a time: a new connection replaces the current one. Start and stop
+  go out as `{id, type, payload}` with the request ID as `id`; when that ID
+  shows up in a `state`'s `processedCommandIds` it emits
+  `CommandAck { status: "ok" }`, and after 10s without it, `"timeout"`.
 - `processors::firestore` owns the `reqwest` client, the cached Firebase
   session (ID token + refresh token), and all Firestore queries. It
-  responds to typed `FirestoreCommand`s (fetch recipes, fetch history,
+  responds to typed `StoreCommand`s (fetch recipes, fetch history,
   fetch current cook, fetch single recipe). On `401` it automatically
   calls `refresh_session()` and retries — token expiry is no longer a
-  manual restart job.
+  manual restart job. In local mode `processors::local_store` answers the
+  same commands from files under `ANOVA_DATA_DIR`. Two commands matter
+  only to it: `FetchCurrentCook` carries the oven's own cook, which the
+  local store builds the current cook from, and `OvenReported` (sent on
+  every oven report except while a start is pending) drives its journal
+  and history. Firestore ignores both.
 - `processors::state_machine` is the single source of truth. Inputs:
   `StateMachineCommand` from HTTP, `WsEvent` from the WebSocket,
-  `FirestoreEvent` from Firestore, `Tick` from periodic refresh loops.
-  Outputs: `WsCommand`, `FirestoreCommand`, and a `watch::Sender<ReadModel>`
+  `StoreEvent` from Firestore, `Tick` from periodic refresh loops.
+  Outputs: `WsCommand`, `StoreCommand`, and a `watch::Sender<ReadModel>`
   the HTTP layer reads through.
 - `processors::http` runs the axum router and translates each request
   into a `StateMachineCommand`, awaiting the reply over a `oneshot`.
+- `processors::mqtt` (only with `ANOVA_MQTT_URL`) publishes the oven to
+  Home Assistant through MQTT discovery and takes commands from it. It
+  reads the same read model, cook progress and liveness the HTTP API
+  serves, and sends the same `StateMachineCommand`s, so the two can't drift
+  apart. Spawned outside `spawn_critical`: a broker outage only stops
+  updates, and the client reconnects with backoff, republishing discovery
+  and the retained topics on every connect. Topics under the prefix:
+  `availability` (last-will), `state` (the `/status` JSON plus `connected`,
+  `phase`, `recipe_title`, `timer_remaining_secs`, `stage_ends_at`),
+  `next_stage/availability`, `recipes`, `recipe/selected` and its
+  `/attributes`, `event` (milestones, not retained) and `cmd/<name>`
+  (`start`, `stop`, `select_recipe`, and in local mode `next_stage`,
+  `lamp`, `timer`, `temperature`). Milestones (`cook_started`,
+  `preheat_done`, `stage_started`, `stage_waiting`, `cook_done`,
+  `cook_stopped`, `oven_lost`) are a pure function of successive snapshots
+  in `mqtt::milestones`, keyed by the oven's `cookId`; the first snapshot
+  is a baseline, so a restart announces nothing. `command_failed` comes from
+  refusals and from the state machine's failed acks (a `broadcast` of
+  `CommandFailure`). The discovery set is pinned by
+  `testdata/mqtt-discovery.json`; regenerate it with
+  `UPDATE_SNAPSHOTS=1 cargo test -p anova-oven-server discovery` after
+  checking no `unique_id` changed.
 - `cook_progress::CookProgressTask` watches `(status, current_cook)`
   and derives `CookProgress` (current stage index, next-stage-ready
   flag, descriptions). `GET /status` stitches the latest `CookProgress`
@@ -292,7 +416,30 @@ leaving a zombie where some processors serve stale data while a
 load-bearing one is gone. Run under `systemd` with `Restart=always` (or an
 equivalent container restart policy) to make this self-healing.
 
-**Endpoints:**
+**Logging what the oven does.** Some of what the oven does isn't in any
+recipe: the lamp has no per-stage setting (only a preference and
+`CMD_APO_SET_LAMP`), and the firmware sets the fan and vent itself at the end
+of a cook. To explain such changes, `oven_log::OvenLog` (in both modes) logs,
+at `info`:
+
+- `[oven] outputs` on the first oven report, then `[oven] outputs changed`
+  whenever the lamp, lamp preference, fan speed or vent changes, with the
+  previous values and the active stage. Heating elements are left out, since
+  the oven cycles them constantly to hold a temperature.
+- `[oven] stage started` as each stage becomes active, with the oven's own
+  copy of its settings: title, kind, mode, temperature, elements, fan, vent,
+  steam, timer and probe.
+
+So `journalctl -u anova-oven-server | grep '\[oven\]'` gives the timeline of a
+cook. For anything the server can't see (e.g. why the firmware switched
+something), the ESP32 console log from the Pi bridge
+([oven-uart.md](oven-uart.md)) has the firmware's own account.
+
+**Endpoints.** All JSON endpoints live under `/api`, leaving the other
+paths to the web UI. The list below and the rest of this document give them
+without the prefix: `GET /status` is `GET /api/status`. (The pico's own
+`/health` server, further down, is a different server and has no prefix.)
+
 - `GET /status`         — current `OvenStatus` (with derived
                           `cook_progress` inlined when cooking).
                           Returns 503 while the WebSocket is still
@@ -306,15 +453,74 @@ equivalent container restart policy) to make this self-healing.
                           deduplicated by ID, own takes precedence).
 - `POST /update-recipes`— force-refresh recipes from Firestore and
                           return the new list.
+- `GET /recipes/{id}`   — local mode: one recipe from the files.
+- `POST /recipes`       — local mode, body `{ "title", "stages": [Stage] }`:
+                          create a recipe of your own under a new ID.
+                          `201` with the saved recipe.
+- `PATCH /recipes/{id}` — local mode, body with `title` and/or `stages`:
+                          replace those fields. `200` with the saved recipe.
+- `DELETE /recipes/{id}`— local mode: remove the recipe's file. `204`.
+
+                          Writes check that the oven could run the recipe
+                          and answer `422` with the reason if not: stage
+                          kinds; 25–250 °C, or 25–100 °C in sous vide (wet
+                          bulb); steam and fan 0–100; rack 1–5; one or two
+                          heating elements, never all three; a timer or a
+                          probe, not both, a timer with
+                          a duration and a probe with a 1–100 °C target; no
+                          timer or probe on a preheat. The temperature,
+                          element and probe limits are from Anova's
+                          [oven-commands docs](https://developer.anovaculinary.com/docs/devices/wifi/oven-commands). Stages without an
+                          `id` get one, the fan goes to 100 on a stage with
+                          the rear element or steam
+                          (`Stage::normalize_fan_speed`; the firmware logs
+                          `Fan speed of 0% is not valid (rear element is
+                          on)` otherwise), and `stage_count` is recomputed.
+                          They go straight to the recipe files, then ask the
+                          state machine to re-read them so `/start`, the
+                          panels and Home Assistant pick the change up. In
+                          local mode `GET /recipes` also reads the files
+                          directly. All four answer `501` in cloud mode,
+                          where recipes are Anova's.
 - `GET /history`        — cached cook history with resolved titles.
 - `GET /current-cook`   — `CurrentCook` JSON, or 204 if none in progress.
-- `POST /start`         — body `{ "recipe_id": "..." }`. Looks up the
+- `POST /start`         — body `{ "recipe_id": "..." }`, or a manual cook
+                          `{ "title": "...", "stages": [Stage] }` (title
+                          optional, "Manual cook" by default; the stages
+                          are checked like a saved recipe's, `422` if the
+                          oven couldn't run them, and the cook is journalled
+                          and goes to history under its title). Looks up the
                           recipe from the cache, sends `CMD_APO_START`
                           over the WebSocket, and seeds the cook-progress
                           tracker with the recipe stages so the next
                           `/status` already carries `cook_progress`.
                           Fire-and-forget `204` once queued.
 - `POST /stop`          — sends `CMD_APO_STOP`; fire-and-forget `204`.
+                          In both modes the oven keeps holding the last
+                          stage when its timer ends; nothing stops it but
+                          `/stop` or the oven's panel. In local mode
+                          `/status` then has `cook_done: true`.
+- `POST /next-stage`    — local mode: `CMD_APO_START_STAGE` with the next
+                          stage's id, whether or not the oven is waiting.
+                          `/status` has `stage_transition_pending_user_action`
+                          (and `cook_progress.next_stage_ready`) when it is.
+- `POST /timer`         — local mode, body `{ "seconds": 90 }`: restart the
+                          current stage's countdown.
+- `POST /temperature`   — local mode, body `{ "celsius": 180 }` (25–250):
+                          the current stage's setpoint, in its own bulb mode.
+- `POST /lamp`          — local mode, body `{ "on": true }`. The oven only
+                          acts on it mid-cook.
+- `POST /temperature-unit` — local mode, body `{ "unit": "C" }` or `"F"`:
+                          the oven's display unit.
+
+                          All five answer `204` once sent (the ack is
+                          tracked, not awaited), `409` if the oven's state
+                          doesn't allow it (not cooking, no next stage) and
+                          `501` in cloud mode. During a preheat, `/timer`
+                          and `/temperature` go out as
+                          `CMD_APO_UPDATE_COOK_STAGES`, since the oven
+                          copies a preheat's `SET_*` onto the cook stage
+                          after it.
 - `GET /health`         — liveness probe. Always `200`; body is
                           `{ connected, seconds_since_last_state,
                           read_timeout_secs }`. `connected` is the upstream
@@ -345,15 +551,28 @@ a staleness signal.
 - `src/main.rs`              — entry point, channel wiring, tick loops
 - `src/processors/ws.rs`     — WebSocket processor (connect, dispatch,
                                reconnect)
+- `src/processors/device.rs` — device-side processor for local mode (TLS,
+                               session duties, oven state)
 - `src/processors/firestore.rs` — Firestore processor (auth refresh, query
                                dispatch)
+- `src/processors/local_store.rs` — file-based store for local mode
+                               (recipes, history, current cook)
+- `src/processors/mqtt.rs`   — Home Assistant over MQTT (connection,
+                               retained state, commands); `mqtt/discovery.rs`,
+                               `mqtt/milestones.rs`, `mqtt/recipes.rs` are
+                               pure and unit-tested
 - `src/processors/state_machine.rs` — central decision logic
 - `src/processors/http.rs`   — axum router + handlers
 - `src/runtime/types.rs`     — `StateMachineCommand`/`Event`, `WsCommand`/
-                               `Event`, `FirestoreCommand`/`Event`,
+                               `Event`, `StoreCommand`/`Event`,
                                `TickKind`, `SmError`
-- `src/protocol.rs`          — `EVENT_APO_STATE` → `OvenStatus`,
+- `src/protocol/mod.rs`      — `OvenState` (shared by both sides) →
+                               `OvenStatus`
+- `src/protocol/app.rs`      — app-side frames: `EVENT_APO_STATE`,
                                `EVENT_APO_WIFI_LIST` → cooker ID
+- `src/protocol/device.rs`   — device-side frames (`{action, data}`)
+- `src/protocol/stages.rs`   — stage JSON for start/update commands,
+                               without the envelope
 - `src/firestore.rs`         — Firebase sign-in/refresh, runQuery, doc
                                GETs, mapping to `anova-oven-api` types
 - `src/cook_progress.rs`     — `CookProgressTask` (derives `CookProgress`)
@@ -361,7 +580,9 @@ a staleness signal.
 - `src/recipe.rs`            — recipe helpers (preheat stage id rewrite)
 
 **Dependencies:** axum 0.8, tokio 1 (full), reqwest 0.13 (json, rustls),
-tokio-websockets 0.13 (client, native-tls, fastrand, openssl),
+tokio-websockets 0.13 (client, server, native-tls, fastrand, openssl),
+tokio-rustls 0.26, rcgen 0.14 (aws_lc_rs, for RSA key generation),
+jiff 0.2 (time zones), base64,
 futures-util 0.3 (with `sink` feature for `SinkExt`/`split()`),
 serde, serde_json 1.0, http 1, uuid 1 (v4 + serde),
 tracing/tracing-subscriber/tracing-appender, `anova-oven-api`.
@@ -378,6 +599,15 @@ deserialization.
 - `current-cook`  — `GET /current-cook`
 - `start --recipe-id <id>` — `POST /start`
 - `stop`          — `POST /stop`
+- `update-recipes` — `POST /update-recipes`; in local mode, re-reads the
+  recipes directory after an edit
+- Local mode only:
+  - `next-stage`  — `POST /next-stage`
+  - `timer <duration>` — `POST /timer`; `90s`, `45m`, `1h30m`, `1:30:00`
+  - `temperature <temp>` — `POST /temperature`; with its unit, `180c` or
+    `356f`, since the CLI otherwise shows °F
+  - `lamp on|off` — `POST /lamp`
+  - `temperature-unit c|f` — `POST /temperature-unit`
 
 **Server address:** `--server <addr>` flag (default `http://localhost:8080`),
 also `ANOVA_SERVER` env var. A bare `host:port` without `http://` is accepted
@@ -563,7 +793,9 @@ error-handling policy).
   as the command is queued; they do not wait for the oven's
   `RESPONSE { status: "ok" }` frame. The matching infrastructure
   (`HashMap<Uuid, oneshot::Sender<_>>` of pending requests) is not yet
-  built. Clients should poll `/status` to confirm the new mode.
+  built. Clients should poll `/status` to confirm the new mode. In local
+  mode the state machine does get a real ack or a timeout from the oven,
+  and rolls back on failure, but the HTTP reply still doesn't wait for it.
 
 - **Cooker ID availability:** the cooker ID only arrives in
   `EVENT_APO_WIFI_LIST`, the first message the server receives after

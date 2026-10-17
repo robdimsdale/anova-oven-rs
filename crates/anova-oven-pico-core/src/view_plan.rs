@@ -527,6 +527,8 @@ mod tests {
             dry_bottom_temperature_c: 100.0,
             wet_bulb_temperature_c: 100.0,
             probe_temperature_c: None,
+            probe_target_temperature_c: None,
+            wet_target_temperature_c: None,
             timer_current_secs: 0,
             timer_total_secs: 0,
             timer_mode: String::from("idle"),
@@ -552,6 +554,9 @@ mod tests {
             water_tank_empty: false,
             active_stage_index: None,
             active_stage_id: None,
+            cook_done: false,
+            cook_id: None,
+            stage_transition_pending_user_action: false,
             cook_progress: None,
             upstream: None,
         }

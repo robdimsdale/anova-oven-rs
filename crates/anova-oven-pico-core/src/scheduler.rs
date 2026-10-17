@@ -23,14 +23,16 @@ pub enum EventKind {
     PollRecipes,
     ApiStart,
     ApiStop,
+    ApiNextStage,
 }
 
 impl EventKind {
     /// Lower numbers sort first when tie-breaking equal `execution_time`s.
-    /// Commands (`ApiStart`/`ApiStop`) outrank polls at the same instant.
+    /// Commands (`ApiStart`/`ApiStop`/`ApiNextStage`) outrank polls at the
+    /// same instant.
     pub fn priority(self) -> u8 {
         match self {
-            EventKind::ApiStart | EventKind::ApiStop => 0,
+            EventKind::ApiStart | EventKind::ApiStop | EventKind::ApiNextStage => 0,
             _ => 1,
         }
     }

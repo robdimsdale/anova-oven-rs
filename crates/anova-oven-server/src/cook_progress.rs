@@ -8,6 +8,11 @@
 //!   preheat stability).
 //! - Flagging `next_stage_ready` when a stage completes so clients can
 //!   prompt the user to advance via the phone app.
+//!
+//! In local mode the oven's own state is complete, so none of that is
+//! inferred: the stage is `activeStageIndex`, and `next_stage_ready` is
+//! `stageTransitionPendingUserAction` with a stage still to come (see
+//! [`follow_oven`]).
 
 use std::time::{Duration, Instant};
 
@@ -76,13 +81,17 @@ impl Tracker {
 pub struct CookProgressTask {
     tracker: Option<Tracker>,
     progress_tx: watch::Sender<Option<CookProgress>>,
+    /// Local mode: take the stage and the waiting-for-you flag from the oven
+    /// instead of inferring them.
+    follow_oven: bool,
 }
 
 impl CookProgressTask {
-    pub fn new(progress_tx: watch::Sender<Option<CookProgress>>) -> Self {
+    pub fn new(progress_tx: watch::Sender<Option<CookProgress>>, follow_oven: bool) -> Self {
         Self {
             tracker: None,
             progress_tx,
+            follow_oven,
         }
     }
 
@@ -193,6 +202,11 @@ impl CookProgressTask {
             if tracker.current_stage_index >= tracker.stages.len() && !tracker.stages.is_empty() {
                 tracker.current_stage_index = tracker.stages.len() - 1;
             }
+            if self.follow_oven {
+                if let Some(status) = status {
+                    follow_oven(tracker, status);
+                }
+            }
             debug!(
                 stage = tracker.current_stage_index,
                 stage_count = tracker.stages.len(),
@@ -225,7 +239,7 @@ impl CookProgressTask {
             "[cook-progress] tracker rebuilt"
         );
 
-        self.tracker = Some(Tracker {
+        let mut tracker = Tracker {
             cook_key: cook.started_at,
             recipe_title: cook.recipe_title,
             stages: cook.stages,
@@ -234,7 +248,13 @@ impl CookProgressTask {
             next_stage_ready: false,
             warned_no_criterion: false,
             timer_has_run: false,
-        });
+        };
+        if self.follow_oven {
+            if let Some(status) = status {
+                follow_oven(&mut tracker, status);
+            }
+        }
+        self.tracker = Some(tracker);
         self.publish();
     }
 
@@ -253,6 +273,18 @@ impl CookProgressTask {
         let Some(tracker) = self.tracker.as_mut() else {
             return;
         };
+
+        if self.follow_oven {
+            if follow_oven(tracker, status) {
+                info!(
+                    stage_index = tracker.current_stage_index,
+                    next_stage_ready = tracker.next_stage_ready,
+                    "[cook-progress] oven moved on"
+                );
+                self.publish();
+            }
+            return;
+        }
 
         if tracker.next_stage_ready {
             let next_idx = tracker.current_stage_index + 1;
@@ -324,6 +356,26 @@ impl CookProgressTask {
         let progress = self.tracker.as_ref().map(build_cook_progress);
         let _ = self.progress_tx.send(progress);
     }
+}
+
+/// Take the stage and `next_stage_ready` from the oven's own state. A set
+/// `stageTransitionPendingUserAction` on the last stage means the cook is
+/// done (or `START_NEXT_STAGE` was sent on it), not that a stage waits, so
+/// it only counts with a stage still to come. Returns whether anything
+/// changed.
+fn follow_oven(tracker: &mut Tracker, status: &OvenStatus) -> bool {
+    let before = (tracker.current_stage_index, tracker.next_stage_ready);
+    if let Some(index) = status
+        .active_stage_index
+        .filter(|i| *i < tracker.stages.len())
+    {
+        if index != tracker.current_stage_index {
+            tracker.advance_to(index);
+        }
+    }
+    tracker.next_stage_ready =
+        status.stage_transition_pending_user_action && tracker.next_stage().is_some();
+    before != (tracker.current_stage_index, tracker.next_stage_ready)
 }
 
 fn build_cook_progress(tracker: &Tracker) -> CookProgress {
@@ -494,7 +546,50 @@ mod tests {
 
     fn task_with_rx() -> (CookProgressTask, watch::Receiver<Option<CookProgress>>) {
         let (tx, rx) = watch::channel(None);
-        (CookProgressTask::new(tx), rx)
+        (CookProgressTask::new(tx, false), rx)
+    }
+
+    fn local_task_with_rx() -> (CookProgressTask, watch::Receiver<Option<CookProgress>>) {
+        let (tx, rx) = watch::channel(None);
+        (CookProgressTask::new(tx, true), rx)
+    }
+
+    fn oven_status(active: usize, pending: bool) -> OvenStatus {
+        OvenStatus {
+            active_stage_index: Some(active),
+            stage_transition_pending_user_action: pending,
+            ..base_status()
+        }
+    }
+
+    fn progress(rx: &watch::Receiver<Option<CookProgress>>) -> (usize, bool) {
+        let p = rx.borrow().clone().expect("progress");
+        (p.current_stage_index, p.next_stage_ready)
+    }
+
+    #[test]
+    fn local_mode_follows_the_ovens_stage_and_waiting_flag() {
+        let (mut task, rx) = local_task_with_rx();
+        let status = oven_status(0, false);
+        task.on_current_cook(Some(stale_cook()), Some(&status));
+        task.on_status(Some(&status));
+        assert_eq!(progress(&rx), (0, false));
+
+        // Stage 0 done; stage 1 waits for the user.
+        task.on_status(Some(&oven_status(0, true)));
+        assert_eq!(progress(&rx), (0, true));
+
+        // The user started it.
+        task.on_status(Some(&oven_status(1, false)));
+        assert_eq!(progress(&rx), (1, false));
+    }
+
+    #[test]
+    fn local_mode_waiting_flag_on_the_last_stage_is_not_a_next_stage() {
+        let (mut task, rx) = local_task_with_rx();
+        task.on_current_cook(Some(stale_cook()), Some(&oven_status(2, false)));
+        task.on_status(Some(&oven_status(2, true)));
+        assert_eq!(progress(&rx), (2, false));
     }
 
     fn idle_status() -> OvenStatus {
@@ -551,6 +646,8 @@ mod tests {
             dry_bottom_temperature_c: 25.0,
             wet_bulb_temperature_c: 25.0,
             probe_temperature_c: Some(0.0),
+            probe_target_temperature_c: None,
+            wet_target_temperature_c: None,
             timer_current_secs: 0,
             timer_total_secs: 0,
             timer_mode: "idle".into(),
@@ -576,6 +673,9 @@ mod tests {
             water_tank_empty: false,
             active_stage_index: None,
             active_stage_id: None,
+            cook_done: false,
+            cook_id: None,
+            stage_transition_pending_user_action: false,
             cook_progress: None,
             upstream: None,
         }
