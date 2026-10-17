@@ -21,7 +21,10 @@
     </div>
   </header>
   <main>
-    <h1 id="heading">Recipe</h1>
+    <div class="row spread" style="margin-bottom: 16px;">
+      <h1 id="heading" style="margin: 0;">Recipe</h1>
+      <button type="button" id="start" class="primary" hidden>Start</button>
+    </div>
     <div id="message" class="message"></div>
 
     <form id="form" hidden novalidate>
@@ -42,7 +45,6 @@
       <div class="row spread">
         <div class="row">
           <button type="submit" id="save" class="primary">Save</button>
-          <button type="button" id="start" hidden>Start</button>
           <a class="button" href="/recipes">Cancel</a>
         </div>
         <button type="button" id="delete" class="danger" hidden>Delete recipe</button>
