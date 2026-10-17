@@ -121,8 +121,12 @@ A new `processors::device` doing items 1–8 of
   reconnect looks like.
 
 **Session duties**
-- On connect, send `CMD_APO_SET_REPORT_STATE_RATE {"idle": 30, "cooking": 5}`
-  (10 until 2026-10-16; 5 keeps the status page and panels closer to live).
+- On connect, send `CMD_APO_SET_REPORT_STATE_RATE {"idle": 5, "cooking": 5}`
+  (cooking 10 until 2026-10-16; 5 keeps the status page and panels closer to
+  live). Idle was 30 until 2026-10-17: a command is confirmed only by the next
+  report, and the lamp, fan, vent and probe commands don't always prompt one,
+  so a lamp toggled from Home Assistant showed as off for ~30s and its ack
+  timed out.
   Whether the oven honours 5 is to be seen; see the open question below.
   The doc says to send it on every connect, since the setting may not survive
   a reconnect.
@@ -482,7 +486,7 @@ Things that weren't practical before:
   within some time. It lives in Home Assistant, not in the recipe.
 - **Pre-flight checks before an unattended start.** Check that the oven is
   connected, the door is closed and the water tank isn't empty, and ask for
-  confirmation on the phone if anything is off. With a 30s idle report rate,
+  confirmation on the phone if anything is off. With a 5s idle report rate,
   these values are recent enough to rely on. In cloud mode they could be up
   to 10 minutes old.
 - **Mid-cook adjustments from the phone.** Lamp on to look in, add ten

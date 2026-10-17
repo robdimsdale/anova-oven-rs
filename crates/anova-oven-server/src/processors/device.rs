@@ -48,12 +48,18 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 /// it reports every 10s while cooking unless told otherwise; 5s keeps the
 /// status page and panels close to live. (Anova's cloud asks for 2s but the
 /// oven was seen reporting every 10s anyway, so check the log cadence.)
-const REPORT_RATE_IDLE_SECS: u64 = 30;
+///
+/// Idle too, because a command is only confirmed by the next report, and
+/// the lamp, fan, vent and probe commands don't always prompt one: at 30s
+/// idle, turning the lamp on from Home Assistant showed as off for ~30s.
+const REPORT_RATE_IDLE_SECS: u64 = 5;
 const REPORT_RATE_COOKING_SECS: u64 = 5;
 
-/// How long a start or stop may take to show up in `processedCommandIds`.
-/// The oven reports within about 1.5s of a command that changes the cook.
-pub const DEFAULT_ACK_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a command may take to show up in `processedCommandIds`. The
+/// oven reports within about 1.5s of a command that changes the cook, but
+/// the others wait for the next periodic report, seen 5 to 10s later, so
+/// this has to stay well above the report rates.
+pub const DEFAULT_ACK_TIMEOUT: Duration = Duration::from_secs(15);
 
 type DeviceStream = WebSocketStream<TlsStream<TcpStream>>;
 

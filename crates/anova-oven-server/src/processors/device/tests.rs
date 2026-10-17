@@ -216,7 +216,7 @@ async fn oven_session_reports_state_and_answers_timezone() {
     assert_eq!(rate["type"], "CMD_APO_SET_REPORT_STATE_RATE");
     assert_eq!(
         rate["payload"],
-        serde_json::json!({ "idle": 30, "cooking": 5 })
+        serde_json::json!({ "idle": 5, "cooking": 5 })
     );
     assert!(rate["id"].as_str().is_some());
 
