@@ -248,7 +248,7 @@ still available.
   connections. Anova emits state ~every 10 min idle / ~10s cooking, so the
   default `1200` is ~2x the idle heartbeat. Keepalive pings do not reset it.
   In local mode it drops the oven's connection instead, and defaults to `90`,
-  since the server sets the oven's idle report rate to 30s.
+  since the server sets the oven's idle report rate to 5s.
 - `ANOVA_HTTP_TIMEOUT_SECS` — outbound HTTP timeout (default `10`)
 - `ANOVA_HTTP_CONNECT_TIMEOUT_SECS` — outbound connect timeout (default `5`)
 - `ANOVA_CURRENT_COOK_TIMEOUT_SECS` — current-cook query timeout (default `4`)
