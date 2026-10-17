@@ -93,7 +93,7 @@ async fn execute_upstream_stale(ctx: &mut Ctx<'_>) -> AppState {
         if snap.is_offline() {
             return AppState::Offline;
         }
-        let disconnected_secs = match snap.upstream_stale_secs() {
+        let disconnected_secs = match snap.upstream_stale_secs(Instant::now()) {
             Some(secs) => secs,
             // Link recovered (or server too old to report) — return to whatever
             // the oven is actually doing.
@@ -121,7 +121,7 @@ async fn execute_idle(ctx: &mut Ctx<'_>) -> AppState {
         if snap.is_offline() {
             return AppState::Offline;
         }
-        if snap.upstream_stale_secs().is_some() {
+        if snap.upstream_stale_secs(Instant::now()).is_some() {
             return AppState::UpstreamStale;
         }
         if snap.is_cooking() {
@@ -180,7 +180,7 @@ async fn execute_cooking(
         if snap.is_offline() {
             return AppState::Offline;
         }
-        if snap.upstream_stale_secs().is_some() {
+        if snap.upstream_stale_secs(Instant::now()).is_some() {
             return AppState::UpstreamStale;
         }
         if !snap.is_cooking() {
@@ -214,7 +214,7 @@ async fn execute_await_next_stage(_next_description: String, ctx: &mut Ctx<'_>) 
         if snap.is_offline() {
             return AppState::Offline;
         }
-        if snap.upstream_stale_secs().is_some() {
+        if snap.upstream_stale_secs(Instant::now()).is_some() {
             return AppState::UpstreamStale;
         }
         if !snap.is_cooking() {
@@ -234,6 +234,9 @@ async fn execute_await_next_stage(_next_description: String, ctx: &mut Ctx<'_>) 
 
         match select(ctx.input.recv(), ctx.api_changed()).await {
             Either::First(InputEvent::EncoderCCW) => return AppState::ConfirmStop,
+            // Pressing answers the prompt. The screen stays until the server
+            // reports the oven has moved on and clears next_stage_ready.
+            Either::First(InputEvent::EncoderButton) => ctx.api.next_stage(),
             Either::First(_) => {}
             Either::Second(()) => {}
         }

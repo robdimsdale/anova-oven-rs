@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Recipes · Anova Oven</title>
+  <link rel="stylesheet" href="/ui/style.css">
+  <script src="/ui/common.js"></script>
+</head>
+<body>
+  <header>
+    <span class="brand">Anova Oven</span>
+    <nav>
+      <a href="/">Status</a>
+      <a href="/recipes" aria-current="page">Recipes</a>
+    </nav>
+    <div class="unit-switch" role="group" aria-label="Temperature unit">
+      <button type="button" data-unit="F">°F</button>
+      <button type="button" data-unit="C">°C</button>
+    </div>
+  </header>
+  <main>
+    <div class="row spread" style="margin-bottom: 16px;">
+      <h1 style="margin: 0;">Recipes</h1>
+      <a class="button primary" href="/recipes/new">New recipe</a>
+    </div>
+    <div id="message" class="message"></div>
+    <section class="card" style="padding: 4px 8px;">
+      <table>
+        <thead>
+          <tr><th>Title</th><th class="hide-narrow">Stages</th><th class="hide-narrow">Source</th><th></th></tr>
+        </thead>
+        <tbody id="list"><tr><td colspan="4" class="muted">Loading…</td></tr></tbody>
+      </table>
+    </section>
+  </main>
+
+  <script>
+    const message = document.getElementById("message");
+    const list = document.getElementById("list");
+
+    async function load() {
+      let recipes;
+      try {
+        recipes = await api("GET", "/recipes");
+      } catch (e) {
+        showMessage(message, e.message);
+        list.innerHTML = "";
+        return;
+      }
+      if (recipes.length === 0) {
+        list.innerHTML = '<tr><td colspan="4" class="muted">No recipes yet.</td></tr>';
+        return;
+      }
+      list.innerHTML = recipes.map((r) => `
+        <tr>
+          <td><a href="/recipes/${encodeURIComponent(r.id)}">${escapeHtml(r.title)}</a></td>
+          <td class="hide-narrow">${r.stages.length}</td>
+          <td class="hide-narrow"><span class="badge">${r.source === "bookmarked" ? "Bookmarked" : "Own"}</span></td>
+          <td class="actions"><button data-start="${escapeHtml(r.id)}" data-title="${escapeHtml(r.title)}">Start</button></td>
+        </tr>`).join("");
+    }
+
+    list.addEventListener("click", async (event) => {
+      const button = event.target.closest("button[data-start]");
+      if (!button) return;
+      if (!confirm(`Start “${button.dataset.title}” now?`)) return;
+      clearMessage(message);
+      try {
+        await api("POST", "/start", { recipe_id: button.dataset.start });
+        showMessage(message, `Started ${button.dataset.title}`, "ok");
+      } catch (e) {
+        showMessage(message, e.message);
+      }
+    });
+
+    initUnitSwitch(() => {});
+    load();
+  </script>
+</body>
+</html>

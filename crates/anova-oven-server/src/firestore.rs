@@ -7,6 +7,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value as JsonValue};
+
+use crate::protocol::stages::stage_from_json;
 use tracing::{debug, warn};
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -1199,123 +1201,4 @@ pub async fn patch_cook_recipe_ref(
         ));
     }
     Ok(())
-}
-
-/// Convert a raw Firestore stage JSON object into [`anova_oven_api::Stage`].
-fn stage_from_json(s: &JsonValue) -> anova_oven_api::Stage {
-    let id = s
-        .get("id")
-        .and_then(|v| v.as_str())
-        .filter(|t| !t.is_empty())
-        .map(String::from);
-
-    let kind = s
-        .get("type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("cook")
-        .to_string();
-
-    let temperature_bulbs_mode = s
-        .get("temperatureBulbs")
-        .and_then(|tb| tb.get("mode"))
-        .and_then(|v| v.as_str())
-        .map(String::from);
-
-    let temperature_c = s
-        .get("temperatureBulbs")
-        .and_then(|tb| {
-            let mode = tb.get("mode")?.as_str()?;
-            tb.get(mode)?.get("setpoint")?.get("celsius")?.as_f64()
-        })
-        .unwrap_or(0.0) as f32;
-
-    let duration_secs = s
-        .get("timer")
-        .and_then(|t| t.get("initial"))
-        .and_then(|t| t.as_u64());
-
-    let timer_added = s.get("timerAdded").and_then(|v| v.as_bool());
-
-    let probe_added = s.get("probeAdded").and_then(|v| v.as_bool());
-
-    let probe_target_c = s
-        .get("temperatureProbe")
-        .and_then(|tp| tp.get("setpoint"))
-        .and_then(|sp| sp.get("celsius"))
-        .and_then(|v| v.as_f64())
-        .map(|v| v as f32);
-
-    let steam_pct = s
-        .get("steamGenerators")
-        .and_then(|sg| {
-            let mode = sg.get("mode")?.as_str()?;
-            match mode {
-                "steam-percentage" => sg.get("steamPercentage")?.get("setpoint")?.as_f64(),
-                "relative-humidity" => sg.get("relativeHumidity")?.get("setpoint")?.as_f64(),
-                _ => None,
-            }
-        })
-        .unwrap_or(0.0) as f32;
-
-    let fan_speed = s
-        .get("fan")
-        .and_then(|f| f.get("speed"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u8;
-
-    let user_action_required = s.get("userActionRequired").and_then(|v| v.as_bool());
-
-    let rack_position = s
-        .get("rackPosition")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u8);
-
-    let heating_element_top = s
-        .get("heatingElements")
-        .and_then(|he| he.get("top"))
-        .and_then(|t| t.get("on"))
-        .and_then(|v| v.as_bool());
-
-    let heating_element_rear = s
-        .get("heatingElements")
-        .and_then(|he| he.get("rear"))
-        .and_then(|r| r.get("on"))
-        .and_then(|v| v.as_bool());
-
-    let heating_element_bottom = s
-        .get("heatingElements")
-        .and_then(|he| he.get("bottom"))
-        .and_then(|b| b.get("on"))
-        .and_then(|v| v.as_bool());
-
-    let vent_open = s
-        .get("vent")
-        .and_then(|v| v.get("open"))
-        .and_then(|v| v.as_bool());
-
-    let title = s
-        .get("title")
-        .and_then(|v| v.as_str())
-        .filter(|t| !t.is_empty())
-        .map(String::from);
-
-    anova_oven_api::Stage {
-        id,
-        kind,
-        temperature_c,
-        temperature_bulbs_mode,
-        duration_secs,
-        timer_added,
-        probe_added,
-        probe_target_c,
-        steam_pct,
-        fan_speed,
-        user_action_required,
-        rack_position,
-        heating_element_top,
-        heating_element_rear,
-        heating_element_bottom,
-        vent_open,
-        title,
-    }
 }

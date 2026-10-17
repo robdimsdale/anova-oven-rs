@@ -19,6 +19,9 @@ pub struct OvenStatus {
     /// Target temperature in Celsius, if a cook is active.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_temperature_c: Option<f32>,
+    /// Wet-bulb target in Celsius, if a wet-bulb (sous vide) cook is active.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wet_target_temperature_c: Option<f32>,
     /// Temperature bulb mode: `"dry"` or `"wet"` (sous vide).
     pub temperature_bulbs_mode: String,
     /// Current top dry-bulb temperature in Celsius.
@@ -30,6 +33,10 @@ pub struct OvenStatus {
     /// Current probe temperature in Celsius, if probe is connected.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub probe_temperature_c: Option<f32>,
+    /// Probe target in Celsius, if the current stage cooks to a probe
+    /// temperature.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probe_target_temperature_c: Option<f32>,
 
     /// Seconds left on the timer — the oven's `timer.current` counts *down*
     /// from [`Self::timer_total_secs`] towards zero, and reads as the full
@@ -98,6 +105,26 @@ pub struct OvenStatus {
     /// `state.cook.activeStageId`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_stage_id: Option<String>,
+
+    /// `true` once the last stage's timer has run out. The oven keeps holding
+    /// the last stage's settings until someone stops it, as it does under
+    /// Anova's cloud. Only reported in local mode, where the server sees the
+    /// oven's own state.
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    pub cook_done: bool,
+
+    /// The oven's `cookId` for the running cook: the one sent with
+    /// `CMD_APO_START`, or the oven's own for a cook started from its panel.
+    /// Identifies the cook across restarts and reconnects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cook_id: Option<String>,
+
+    /// The oven's own `stageTransitionPendingUserAction`: a stage is done and
+    /// the oven is waiting to be told to go on (`POST /next-stage`). Also set,
+    /// with [`cook_done`](Self::cook_done), once the last stage's timer ends.
+    /// Only reported in local mode.
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    pub stage_transition_pending_user_action: bool,
 
     /// Server-derived cook progression (present only while cooking).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -483,6 +510,8 @@ mod tests {
             dry_bottom_temperature_c: 199.0,
             wet_bulb_temperature_c: 180.0,
             probe_temperature_c: Some(65.0),
+            probe_target_temperature_c: None,
+            wet_target_temperature_c: None,
             timer_current_secs: 300,
             timer_total_secs: 3600,
             timer_mode: "running".into(),
@@ -508,6 +537,9 @@ mod tests {
             water_tank_empty: false,
             active_stage_index: None,
             active_stage_id: None,
+            cook_done: false,
+            cook_id: None,
+            stage_transition_pending_user_action: false,
             cook_progress: None,
             upstream: None,
         }

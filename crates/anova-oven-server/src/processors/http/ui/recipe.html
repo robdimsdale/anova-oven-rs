@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Recipe · Anova Oven</title>
+  <link rel="stylesheet" href="/ui/style.css">
+  <script src="/ui/common.js"></script>
+  <script src="/ui/steps.js"></script>
+</head>
+<body>
+  <header>
+    <span class="brand">Anova Oven</span>
+    <nav>
+      <a href="/">Status</a>
+      <a href="/recipes" aria-current="page">Recipes</a>
+    </nav>
+    <div class="unit-switch" role="group" aria-label="Temperature unit">
+      <button type="button" data-unit="F">°F</button>
+      <button type="button" data-unit="C">°C</button>
+    </div>
+  </header>
+  <main>
+    <h1 id="heading">Recipe</h1>
+    <div id="message" class="message"></div>
+
+    <form id="form" hidden novalidate>
+      <section class="card">
+        <label>Title
+          <input id="title" maxlength="200">
+        </label>
+        <p id="source" class="muted small" style="margin: 10px 0 0;"></p>
+        <ul id="title-problems" class="problems"></ul>
+      </section>
+
+      <div id="steps"></div>
+
+      <div class="row" style="margin-bottom: 24px;">
+        <button type="button" id="add-step">Add stage</button>
+      </div>
+
+      <div class="row spread">
+        <div class="row">
+          <button type="submit" id="save" class="primary">Save</button>
+          <button type="button" id="start" hidden>Start</button>
+          <a class="button" href="/recipes">Cancel</a>
+        </div>
+        <button type="button" id="delete" class="danger" hidden>Delete recipe</button>
+      </div>
+    </form>
+  </main>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const message = $("message");
+    const segment = decodeURIComponent(location.pathname.split("/").filter(Boolean)[1] || "new");
+    const isNew = segment === "new";
+    let recipe = null;
+
+    // Save waits for a title and stages the oven could run.
+    let stagesOk = false;
+    const editor = createStepEditor($("steps"), {
+      name: "recipe",
+      onChange: (ok) => { stagesOk = ok; validate(); },
+    });
+
+    // What was last loaded or saved, to tell unsaved edits apart. Start
+    // runs the saved recipe, so it waits for them to be saved.
+    let saved = null;
+    const snapshot = () => JSON.stringify({ title: $("title").value, stages: editor.stages() });
+
+    function validate() {
+      const titled = $("title").value.trim() !== "";
+      $("title-problems").innerHTML = titled ? "" : "<li>Give the recipe a title</li>";
+      $("save").disabled = !(titled && stagesOk);
+      const dirty = saved !== null && snapshot() !== saved;
+      $("start").disabled = dirty;
+      $("start").textContent = dirty ? "Save first" : "Start";
+    }
+
+    function markSaved() {
+      saved = snapshot();
+      validate();
+    }
+
+    $("title").addEventListener("input", validate);
+    $("add-step").onclick = () => editor.addStep();
+
+    $("form").onsubmit = async (event) => {
+      event.preventDefault();
+      if ($("save").disabled) return;
+      clearMessage(message);
+      const body = { title: $("title").value, stages: editor.stages() };
+      try {
+        if (isNew) {
+          const created = await api("POST", "/recipes", body);
+          location.href = `/recipes/${encodeURIComponent(created.id)}?saved=1`;
+        } else {
+          recipe = await api("PATCH", `/recipes/${encodeURIComponent(recipe.id)}`, body);
+          editor.setStages(recipe.stages);
+          markSaved();
+          showMessage(message, "Saved", "ok");
+        }
+      } catch (e) {
+        showMessage(message, e.message);
+      }
+    };
+
+    $("start").onclick = async () => {
+      if (!confirm(`Start “${recipe.title}” now?`)) return;
+      clearMessage(message);
+      try {
+        await api("POST", "/start", { recipe_id: recipe.id });
+        location.href = "/";
+      } catch (e) {
+        showMessage(message, e.message);
+      }
+    };
+
+    $("delete").onclick = async () => {
+      if (!confirm(`Delete “${recipe.title}”? This can't be undone.`)) return;
+      try {
+        await api("DELETE", `/recipes/${encodeURIComponent(recipe.id)}`);
+        location.href = "/recipes";
+      } catch (e) {
+        showMessage(message, e.message);
+      }
+    };
+
+    async function load() {
+      try {
+        recipe = isNew
+          ? { title: "", stages: [], source: "own" }
+          : await api("GET", `/recipes/${encodeURIComponent(segment)}`);
+      } catch (e) {
+        showMessage(message, e.message);
+        return;
+      }
+      $("heading").textContent = isNew ? "New recipe" : recipe.title;
+      document.title = `${isNew ? "New recipe" : recipe.title} · Anova Oven`;
+      $("title").value = recipe.title;
+      $("source").textContent = recipe.source === "bookmarked"
+        ? "Bookmarked from Anova. Changes here only affect this copy" : "";
+      $("delete").hidden = isNew;
+      $("start").hidden = isNew;
+      $("form").hidden = false;
+      if (new URLSearchParams(location.search).has("saved")) showMessage(message, "Saved", "ok");
+      if (isNew) editor.reset();
+      else {
+        editor.setStages(recipe.stages);
+        markSaved();
+      }
+    }
+
+    initUnitSwitch(() => { if (recipe) editor.render(); });
+    load();
+  </script>
+</body>
+</html>

@@ -3,3 +3,5 @@ crates/**/target
 CLAUDE.md
 .vscode
 .DS_Store
+# Local captures, keys and firmware dumps; never commit
+scratchpad/

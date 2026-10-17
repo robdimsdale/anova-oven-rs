@@ -1,0 +1,16 @@
+[Unit]
+Description=Log the oven's ESP32 console to the journal
+After=ser2net.service
+Requires=ser2net.service
+
+[Service]
+# journald timestamps each line; tr strips the CR from the ESP32's CRLF line
+# endings. socat exits if ser2net drops the connection, and systemd restarts it.
+ExecStart=/bin/sh -c 'socat -u TCP:127.0.0.1:2323 STDOUT | stdbuf -oL tr -d "\\r"'
+Restart=always
+RestartSec=5
+DynamicUser=yes
+SyslogIdentifier=oven-uart
+
+[Install]
+WantedBy=multi-user.target

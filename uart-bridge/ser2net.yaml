@@ -1,0 +1,15 @@
+%YAML 1.1
+---
+# The oven's ESP32 console (UART0 on the service header), exposed as a raw TCP
+# port on every interface: `nc anova-direct 2323` from anywhere on the LAN.
+# There is no authentication; see docs/oven-uart.md.
+#
+# Two connections: oven-uart-log.service holds one permanently, leaving one
+# for an interactive session. Serial output goes to both; input from either
+# goes to the oven.
+
+connection: &oven
+  accepter: tcp,2323
+  connector: serialdev,/dev/serial0,230400n81,local
+  options:
+    max-connections: 4
