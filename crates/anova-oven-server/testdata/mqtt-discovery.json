@@ -1,0 +1,819 @@
+{
+  "homeassistant/binary_sensor/anova_oven/connected/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      }
+    ],
+    "availability_mode": "all",
+    "default_entity_id": "binary_sensor.anova_oven_connected",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "device_class": "connectivity",
+    "has_entity_name": true,
+    "name": "Connected",
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "state_topic": "anova/oven/state",
+    "unique_id": "anova_oven_connected",
+    "value_template": "{{ 'ON' if value_json.connected else 'OFF' }}"
+  },
+  "homeassistant/binary_sensor/anova_oven/cooking/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      },
+      {
+        "topic": "anova/oven/state",
+        "value_template": "{{ 'online' if value_json.connected else 'offline' }}"
+      }
+    ],
+    "availability_mode": "all",
+    "default_entity_id": "binary_sensor.anova_oven_cooking",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "device_class": "running",
+    "has_entity_name": true,
+    "name": "Cooking",
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "state_topic": "anova/oven/state",
+    "unique_id": "anova_oven_cooking",
+    "value_template": "{{ 'ON' if value_json.mode != 'idle' else 'OFF' }}"
+  },
+  "homeassistant/binary_sensor/anova_oven/descale_required/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      },
+      {
+        "topic": "anova/oven/state",
+        "value_template": "{{ 'online' if value_json.connected else 'offline' }}"
+      }
+    ],
+    "availability_mode": "all",
+    "default_entity_id": "binary_sensor.anova_oven_descale_required",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "device_class": "problem",
+    "has_entity_name": true,
+    "name": "Descale required",
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "state_topic": "anova/oven/state",
+    "unique_id": "anova_oven_descale_required",
+    "value_template": "{{ 'ON' if value_json.boiler_descale_required else 'OFF' }}"
+  },
+  "homeassistant/binary_sensor/anova_oven/door/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      },
+      {
+        "topic": "anova/oven/state",
+        "value_template": "{{ 'online' if value_json.connected else 'offline' }}"
+      }
+    ],
+    "availability_mode": "all",
+    "default_entity_id": "binary_sensor.anova_oven_door",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "device_class": "door",
+    "has_entity_name": true,
+    "name": "Door",
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "state_topic": "anova/oven/state",
+    "unique_id": "anova_oven_door",
+    "value_template": "{{ 'ON' if value_json.door_open else 'OFF' }}"
+  },
+  "homeassistant/binary_sensor/anova_oven/next_stage_ready/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      },
+      {
+        "topic": "anova/oven/state",
+        "value_template": "{{ 'online' if value_json.connected else 'offline' }}"
+      }
+    ],
+    "availability_mode": "all",
+    "default_entity_id": "binary_sensor.anova_oven_next_stage_ready",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "has_entity_name": true,
+    "name": "Next stage ready",
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "state_topic": "anova/oven/state",
+    "unique_id": "anova_oven_next_stage_ready",
+    "value_template": "{{ 'ON' if value_json.get('cook_progress') and value_json.get('cook_progress').next_stage_ready else 'OFF' }}"
+  },
+  "homeassistant/binary_sensor/anova_oven/water_tank_empty/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      },
+      {
+        "topic": "anova/oven/state",
+        "value_template": "{{ 'online' if value_json.connected else 'offline' }}"
+      }
+    ],
+    "availability_mode": "all",
+    "default_entity_id": "binary_sensor.anova_oven_water_tank_empty",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "device_class": "problem",
+    "has_entity_name": true,
+    "name": "Water tank empty",
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "state_topic": "anova/oven/state",
+    "unique_id": "anova_oven_water_tank_empty",
+    "value_template": "{{ 'ON' if value_json.water_tank_empty else 'OFF' }}"
+  },
+  "homeassistant/button/anova_oven/next_stage/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      },
+      {
+        "topic": "anova/oven/state",
+        "value_template": "{{ 'online' if value_json.connected else 'offline' }}"
+      },
+      {
+        "topic": "anova/oven/next_stage/availability"
+      }
+    ],
+    "availability_mode": "all",
+    "command_topic": "anova/oven/cmd/next_stage",
+    "default_entity_id": "button.anova_oven_next_stage",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "has_entity_name": true,
+    "name": "Next stage",
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "unique_id": "anova_oven_next_stage"
+  },
+  "homeassistant/button/anova_oven/start/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      },
+      {
+        "topic": "anova/oven/state",
+        "value_template": "{{ 'online' if value_json.connected else 'offline' }}"
+      }
+    ],
+    "availability_mode": "all",
+    "command_topic": "anova/oven/cmd/start",
+    "default_entity_id": "button.anova_oven_start",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "has_entity_name": true,
+    "name": "Start",
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "unique_id": "anova_oven_start"
+  },
+  "homeassistant/button/anova_oven/stop/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      },
+      {
+        "topic": "anova/oven/state",
+        "value_template": "{{ 'online' if value_json.connected else 'offline' }}"
+      }
+    ],
+    "availability_mode": "all",
+    "command_topic": "anova/oven/cmd/stop",
+    "default_entity_id": "button.anova_oven_stop",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "has_entity_name": true,
+    "name": "Stop",
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "unique_id": "anova_oven_stop"
+  },
+  "homeassistant/event/anova_oven/cook/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      }
+    ],
+    "availability_mode": "all",
+    "default_entity_id": "event.anova_oven_cook",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "event_types": [
+      "cook_started",
+      "preheat_done",
+      "stage_started",
+      "stage_waiting",
+      "cook_done",
+      "cook_stopped",
+      "command_failed",
+      "oven_lost"
+    ],
+    "has_entity_name": true,
+    "name": "Cook",
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "state_topic": "anova/oven/event",
+    "unique_id": "anova_oven_cook"
+  },
+  "homeassistant/light/anova_oven/lamp/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      },
+      {
+        "topic": "anova/oven/state",
+        "value_template": "{{ 'online' if value_json.connected else 'offline' }}"
+      }
+    ],
+    "availability_mode": "all",
+    "command_topic": "anova/oven/cmd/lamp",
+    "default_entity_id": "light.anova_oven_lamp",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "has_entity_name": true,
+    "name": "Lamp",
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "payload_off": "OFF",
+    "payload_on": "ON",
+    "state_topic": "anova/oven/state",
+    "state_value_template": "{{ 'ON' if value_json.lamp_on else 'OFF' }}",
+    "unique_id": "anova_oven_lamp"
+  },
+  "homeassistant/number/anova_oven/set_temperature/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      },
+      {
+        "topic": "anova/oven/state",
+        "value_template": "{{ 'online' if value_json.connected else 'offline' }}"
+      }
+    ],
+    "availability_mode": "all",
+    "command_topic": "anova/oven/cmd/temperature",
+    "default_entity_id": "number.anova_oven_set_temperature",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "device_class": "temperature",
+    "has_entity_name": true,
+    "max": 250,
+    "min": 25,
+    "mode": "box",
+    "name": "Set temperature",
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "state_topic": "anova/oven/state",
+    "step": 1,
+    "unique_id": "anova_oven_set_temperature",
+    "unit_of_measurement": "°C",
+    "value_template": "{{ value_json.get('target_temperature_c') }}"
+  },
+  "homeassistant/number/anova_oven/set_timer/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      },
+      {
+        "topic": "anova/oven/state",
+        "value_template": "{{ 'online' if value_json.connected else 'offline' }}"
+      }
+    ],
+    "availability_mode": "all",
+    "command_template": "{{ (value * 60) | int }}",
+    "command_topic": "anova/oven/cmd/timer",
+    "default_entity_id": "number.anova_oven_set_timer",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "has_entity_name": true,
+    "max": 1440,
+    "min": 1,
+    "mode": "box",
+    "name": "Set timer",
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "state_topic": "anova/oven/state",
+    "step": 1,
+    "unique_id": "anova_oven_set_timer",
+    "unit_of_measurement": "min",
+    "value_template": "{{ (value_json.timer_total_secs / 60) | round(0) | int }}"
+  },
+  "homeassistant/select/anova_oven/recipe/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      }
+    ],
+    "availability_mode": "all",
+    "command_topic": "anova/oven/cmd/select_recipe",
+    "default_entity_id": "select.anova_oven_recipe",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "has_entity_name": true,
+    "name": "Recipe",
+    "options": [
+      "Bread",
+      "Toast"
+    ],
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "state_topic": "anova/oven/recipe/selected",
+    "unique_id": "anova_oven_recipe"
+  },
+  "homeassistant/sensor/anova_oven/current_recipe/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      },
+      {
+        "topic": "anova/oven/state",
+        "value_template": "{{ 'online' if value_json.connected else 'offline' }}"
+      }
+    ],
+    "availability_mode": "all",
+    "default_entity_id": "sensor.anova_oven_current_recipe",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "has_entity_name": true,
+    "name": "Current recipe",
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "state_topic": "anova/oven/state",
+    "unique_id": "anova_oven_current_recipe",
+    "value_template": "{{ value_json.get('recipe_title') }}"
+  },
+  "homeassistant/sensor/anova_oven/mode/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      },
+      {
+        "topic": "anova/oven/state",
+        "value_template": "{{ 'online' if value_json.connected else 'offline' }}"
+      }
+    ],
+    "availability_mode": "all",
+    "default_entity_id": "sensor.anova_oven_mode",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "has_entity_name": true,
+    "name": "Mode",
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "state_topic": "anova/oven/state",
+    "unique_id": "anova_oven_mode",
+    "value_template": "{{ value_json.get('phase') }}"
+  },
+  "homeassistant/sensor/anova_oven/probe_temperature/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      },
+      {
+        "topic": "anova/oven/state",
+        "value_template": "{{ 'online' if value_json.connected else 'offline' }}"
+      }
+    ],
+    "availability_mode": "all",
+    "default_entity_id": "sensor.anova_oven_probe_temperature",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "device_class": "temperature",
+    "has_entity_name": true,
+    "name": "Probe temperature",
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "state_class": "measurement",
+    "state_topic": "anova/oven/state",
+    "unique_id": "anova_oven_probe_temperature",
+    "unit_of_measurement": "°C",
+    "value_template": "{{ value_json.get('probe_temperature_c') }}"
+  },
+  "homeassistant/sensor/anova_oven/selected_recipe/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      }
+    ],
+    "availability_mode": "all",
+    "default_entity_id": "sensor.anova_oven_selected_recipe",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "has_entity_name": true,
+    "json_attributes_topic": "anova/oven/recipe/selected/attributes",
+    "name": "Selected recipe",
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "state_topic": "anova/oven/recipe/selected",
+    "unique_id": "anova_oven_selected_recipe"
+  },
+  "homeassistant/sensor/anova_oven/stage/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      },
+      {
+        "topic": "anova/oven/state",
+        "value_template": "{{ 'online' if value_json.connected else 'offline' }}"
+      }
+    ],
+    "availability_mode": "all",
+    "default_entity_id": "sensor.anova_oven_stage",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "has_entity_name": true,
+    "name": "Stage",
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "state_topic": "anova/oven/state",
+    "unique_id": "anova_oven_stage",
+    "value_template": "{% set p = value_json.get('cook_progress') %}{{ (p.current_stage_index + 1) ~ ' of ' ~ p.total_stage_count if p else none }}"
+  },
+  "homeassistant/sensor/anova_oven/stage_description/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      },
+      {
+        "topic": "anova/oven/state",
+        "value_template": "{{ 'online' if value_json.connected else 'offline' }}"
+      }
+    ],
+    "availability_mode": "all",
+    "default_entity_id": "sensor.anova_oven_stage_description",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "has_entity_name": true,
+    "name": "Stage description",
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "state_topic": "anova/oven/state",
+    "unique_id": "anova_oven_stage_description",
+    "value_template": "{% set p = value_json.get('cook_progress') %}{{ p.current_stage_description if p else none }}"
+  },
+  "homeassistant/sensor/anova_oven/stage_ends_at/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      },
+      {
+        "topic": "anova/oven/state",
+        "value_template": "{{ 'online' if value_json.connected else 'offline' }}"
+      }
+    ],
+    "availability_mode": "all",
+    "default_entity_id": "sensor.anova_oven_stage_ends_at",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "device_class": "timestamp",
+    "has_entity_name": true,
+    "name": "Stage ends at",
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "state_topic": "anova/oven/state",
+    "unique_id": "anova_oven_stage_ends_at",
+    "value_template": "{{ value_json.get('stage_ends_at') }}"
+  },
+  "homeassistant/sensor/anova_oven/steam/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      },
+      {
+        "topic": "anova/oven/state",
+        "value_template": "{{ 'online' if value_json.connected else 'offline' }}"
+      }
+    ],
+    "availability_mode": "all",
+    "default_entity_id": "sensor.anova_oven_steam",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "device_class": "humidity",
+    "has_entity_name": true,
+    "name": "Steam",
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "state_class": "measurement",
+    "state_topic": "anova/oven/state",
+    "unique_id": "anova_oven_steam",
+    "unit_of_measurement": "%",
+    "value_template": "{{ value_json.get('steam_pct') }}"
+  },
+  "homeassistant/sensor/anova_oven/target_temperature/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      },
+      {
+        "topic": "anova/oven/state",
+        "value_template": "{{ 'online' if value_json.connected else 'offline' }}"
+      }
+    ],
+    "availability_mode": "all",
+    "default_entity_id": "sensor.anova_oven_target_temperature",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "device_class": "temperature",
+    "has_entity_name": true,
+    "name": "Target temperature",
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "state_class": "measurement",
+    "state_topic": "anova/oven/state",
+    "unique_id": "anova_oven_target_temperature",
+    "unit_of_measurement": "°C",
+    "value_template": "{{ value_json.get('target_temperature_c') }}"
+  },
+  "homeassistant/sensor/anova_oven/temperature/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      },
+      {
+        "topic": "anova/oven/state",
+        "value_template": "{{ 'online' if value_json.connected else 'offline' }}"
+      }
+    ],
+    "availability_mode": "all",
+    "default_entity_id": "sensor.anova_oven_temperature",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "device_class": "temperature",
+    "has_entity_name": true,
+    "name": "Temperature",
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "state_class": "measurement",
+    "state_topic": "anova/oven/state",
+    "unique_id": "anova_oven_temperature",
+    "unit_of_measurement": "°C",
+    "value_template": "{{ value_json.get('temperature_c') }}"
+  },
+  "homeassistant/sensor/anova_oven/timer_remaining/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      },
+      {
+        "topic": "anova/oven/state",
+        "value_template": "{{ 'online' if value_json.connected else 'offline' }}"
+      }
+    ],
+    "availability_mode": "all",
+    "default_entity_id": "sensor.anova_oven_timer_remaining",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "device_class": "duration",
+    "has_entity_name": true,
+    "name": "Timer remaining",
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "state_topic": "anova/oven/state",
+    "unique_id": "anova_oven_timer_remaining",
+    "unit_of_measurement": "s",
+    "value_template": "{{ value_json.get('timer_remaining_secs') }}"
+  },
+  "homeassistant/sensor/anova_oven/wet_bulb_temperature/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      },
+      {
+        "topic": "anova/oven/state",
+        "value_template": "{{ 'online' if value_json.connected else 'offline' }}"
+      }
+    ],
+    "availability_mode": "all",
+    "default_entity_id": "sensor.anova_oven_wet_bulb_temperature",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "device_class": "temperature",
+    "has_entity_name": true,
+    "name": "Wet bulb temperature",
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "state_class": "measurement",
+    "state_topic": "anova/oven/state",
+    "unique_id": "anova_oven_wet_bulb_temperature",
+    "unit_of_measurement": "°C",
+    "value_template": "{{ value_json.get('wet_bulb_temperature_c') }}"
+  }
+}

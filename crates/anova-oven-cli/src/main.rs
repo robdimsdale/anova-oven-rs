@@ -8,10 +8,12 @@
 //! anova-oven-cli --server http://localhost:8080 status
 //! anova-oven-cli recipes
 //! anova-oven-cli history
+//! anova-oven-cli temperature 180c   # local mode only, as are the
+//! anova-oven-cli timer 1h30m        # other cook controls
 //! ```
 
 use anova_oven_api::{CurrentCook, HistoryEntry, OvenStatus, Recipe, RecipeSource};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(name = "anova-oven", about = "Control your Anova Precision Oven")]
@@ -42,6 +44,38 @@ enum Command {
         #[arg(long)]
         recipe_id: String,
     },
+    /// Reload recipes (in local mode, re-read the recipes directory)
+    UpdateRecipes,
+    /// Start the next stage, e.g. when the oven is waiting for you (local mode)
+    NextStage,
+    /// Restart the current stage's timer (local mode)
+    Timer {
+        /// e.g. 90s, 45m, 1h30m or 1:30:00
+        #[arg(value_parser = parse_duration)]
+        duration: u64,
+    },
+    /// Change the current stage's temperature (local mode)
+    Temperature {
+        /// With its unit, e.g. 180c or 356f
+        #[arg(value_parser = parse_temperature_c)]
+        temperature: f32,
+    },
+    /// Turn the oven light on or off; only works mid-cook (local mode)
+    Lamp { state: OnOff },
+    /// Set the oven's display unit (local mode)
+    TemperatureUnit { unit: Unit },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum OnOff {
+    On,
+    Off,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Unit {
+    C,
+    F,
 }
 
 #[tokio::main]
@@ -57,7 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Command::Status => {
-            let url = format!("{server}/status");
+            let url = format!("{server}/api/status");
             let resp = client.get(&url).send().await?;
             if !resp.status().is_success() {
                 let status = resp.status();
@@ -69,7 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Command::Recipes => {
-            let url = format!("{server}/recipes");
+            let url = format!("{server}/api/recipes");
             let resp = client.get(&url).send().await?;
             if !resp.status().is_success() {
                 let status = resp.status();
@@ -86,7 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Command::Stop => {
-            let url = format!("{server}/stop");
+            let url = format!("{server}/api/stop");
             let resp = client.post(&url).send().await?;
             if resp.status() == reqwest::StatusCode::NO_CONTENT {
                 println!("Stop command sent.");
@@ -98,7 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Command::Start { recipe_id } => {
-            let url = format!("{server}/start");
+            let url = format!("{server}/api/start");
             let resp = client
                 .post(&url)
                 .json(&serde_json::json!({ "recipe_id": recipe_id }))
@@ -113,8 +147,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        Command::UpdateRecipes => {
+            let recipes: Vec<Recipe> = post(&client, &server, "/api/update-recipes", None)
+                .await?
+                .json()
+                .await?;
+            println!("{} recipes.", recipes.len());
+        }
+
+        Command::NextStage => {
+            post(&client, &server, "/api/next-stage", None).await?;
+            println!("Next stage command sent.");
+        }
+
+        Command::Timer { duration } => {
+            let body = serde_json::json!({ "seconds": duration });
+            post(&client, &server, "/api/timer", Some(body)).await?;
+            println!("Timer set to {}.", format_duration(duration));
+        }
+
+        Command::Temperature { temperature } => {
+            let body = serde_json::json!({ "celsius": temperature });
+            post(&client, &server, "/api/temperature", Some(body)).await?;
+            println!(
+                "Temperature set to {:.0}°F ({temperature:.0}°C).",
+                celcius_to_fahrenheit(temperature)
+            );
+        }
+
+        Command::Lamp { state } => {
+            let on = matches!(state, OnOff::On);
+            post(
+                &client,
+                &server,
+                "/api/lamp",
+                Some(serde_json::json!({ "on": on })),
+            )
+            .await?;
+            println!("Lamp {} command sent.", if on { "on" } else { "off" });
+        }
+
+        Command::TemperatureUnit { unit } => {
+            let unit = match unit {
+                Unit::C => "C",
+                Unit::F => "F",
+            };
+            let body = serde_json::json!({ "unit": unit });
+            post(&client, &server, "/api/temperature-unit", Some(body)).await?;
+            println!("Display unit set to °{unit}.");
+        }
+
         Command::History => {
-            let url = format!("{server}/history");
+            let url = format!("{server}/api/history");
             let resp = client.get(&url).send().await?;
             if !resp.status().is_success() {
                 let status = resp.status();
@@ -131,7 +215,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Command::CurrentCook => {
-            let cook_url = format!("{server}/current-cook");
+            let cook_url = format!("{server}/api/current-cook");
             let cook_resp = client.get(&cook_url).send().await?;
             if cook_resp.status() == reqwest::StatusCode::NO_CONTENT {
                 println!("No active cook.");
@@ -151,8 +235,94 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// POST to the server, turning an error status into an error with its body.
+async fn post(
+    client: &reqwest::Client,
+    server: &str,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> Result<reqwest::Response, Box<dyn std::error::Error>> {
+    let mut req = client.post(format!("{server}{path}"));
+    if let Some(body) = body {
+        req = req.json(&body);
+    }
+    let resp = req.send().await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Server returned {status}: {body}").into());
+    }
+    Ok(resp)
+}
+
+/// `90s`, `45m`, `1h30m`, `1h 30m 10s`, `1:30` (m:ss) or `1:30:00` (h:mm:ss),
+/// in seconds. A bare number is refused, since minutes and seconds are both
+/// plausible.
+fn parse_duration(s: &str) -> Result<u64, String> {
+    let s = s.trim().to_ascii_lowercase();
+    let secs = if s.contains(':') {
+        let parts: Vec<u64> = s
+            .split(':')
+            .map(|p| p.parse::<u64>().map_err(|_| format!("bad duration `{s}`")))
+            .collect::<Result<_, _>>()?;
+        match parts[..] {
+            [m, sec] => m * 60 + sec,
+            [h, m, sec] => h * 3600 + m * 60 + sec,
+            _ => return Err(format!("bad duration `{s}`")),
+        }
+    } else {
+        let mut total = 0;
+        let mut number = String::new();
+        for c in s.chars().filter(|c| !c.is_whitespace()) {
+            if c.is_ascii_digit() {
+                number.push(c);
+                continue;
+            }
+            let unit = match c {
+                'h' => 3600,
+                'm' => 60,
+                's' => 1,
+                _ => return Err(format!("bad duration `{s}`")),
+            };
+            let n: u64 = number.parse().map_err(|_| format!("bad duration `{s}`"))?;
+            total += n * unit;
+            number.clear();
+        }
+        if !number.is_empty() {
+            return Err(format!("`{s}` needs a unit, e.g. {s}m or {s}s"));
+        }
+        total
+    };
+    if secs == 0 {
+        return Err("the duration must be above zero".into());
+    }
+    Ok(secs)
+}
+
+/// `180c` or `356f` (case-insensitive, `°` allowed), in °C.
+fn parse_temperature_c(s: &str) -> Result<f32, String> {
+    let s = s.trim().to_ascii_lowercase().replace('°', "");
+    let (number, to_c): (&str, fn(f32) -> f32) = if let Some(n) = s.strip_suffix('c') {
+        (n, |c| c)
+    } else if let Some(n) = s.strip_suffix('f') {
+        (n, |f| (f - 32.0) / 1.8)
+    } else {
+        return Err(format!("`{s}` needs a unit, e.g. {s}c or {s}f"));
+    };
+    let value: f32 = number
+        .trim()
+        .parse()
+        .map_err(|_| format!("bad temperature `{s}`"))?;
+    Ok(to_c(value))
+}
+
 fn print_status(s: &OvenStatus) {
     println!("Mode:        {}", s.phase());
+    if s.cook_done {
+        println!("             Done; the oven is holding until stopped");
+    } else if s.stage_transition_pending_user_action {
+        println!("             Waiting for you to start the next stage");
+    }
     println!(
         "Temperature: {:.1}°F ({})",
         celcius_to_fahrenheit(s.current_temperature_c()),
@@ -265,7 +435,7 @@ fn print_stage(index: usize, stage: &anova_oven_api::Stage) {
 }
 
 async fn fetch_status(client: &reqwest::Client, server: &str) -> Option<OvenStatus> {
-    let url = format!("{server}/status");
+    let url = format!("{server}/api/status");
     let resp = client.get(&url).send().await.ok()?;
     if !resp.status().is_success() {
         return None;
@@ -286,4 +456,30 @@ fn format_duration(secs: u64) -> String {
 
 fn celcius_to_fahrenheit(c: f32) -> f32 {
     c * 1.8 + 32.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_duration, parse_temperature_c};
+
+    #[test]
+    fn durations() {
+        assert_eq!(parse_duration("90s"), Ok(90));
+        assert_eq!(parse_duration("45m"), Ok(2700));
+        assert_eq!(parse_duration("1h30m"), Ok(5400));
+        assert_eq!(parse_duration("1h 30m 10s"), Ok(5410));
+        assert_eq!(parse_duration("1:30"), Ok(90));
+        assert_eq!(parse_duration("1:30:00"), Ok(5400));
+        assert!(parse_duration("90").is_err());
+        assert!(parse_duration("0s").is_err());
+        assert!(parse_duration("5x").is_err());
+    }
+
+    #[test]
+    fn temperatures() {
+        assert_eq!(parse_temperature_c("180c"), Ok(180.0));
+        assert_eq!(parse_temperature_c("212F"), Ok(100.0));
+        assert_eq!(parse_temperature_c("100°C"), Ok(100.0));
+        assert!(parse_temperature_c("180").is_err());
+    }
 }

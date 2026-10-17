@@ -23,9 +23,14 @@ pub struct Liveness {
     last_state_ms: AtomicU64,
     /// Whether the upstream WebSocket is currently connected.
     connected: AtomicBool,
-    /// Unix-epoch milliseconds at which the socket last transitioned from
-    /// connected to disconnected. `0` means "not currently tracking a
-    /// disconnect" (either connected, or never connected since startup). Used
+    /// Whether the oven itself is reaching Anova's cloud. The socket to the
+    /// cloud can be up while the oven is not: the cloud then answers with its
+    /// last cached state and drops commands. Only the cloud processor clears
+    /// this; it starts `true` so local mode never sees it.
+    oven_online: AtomicBool,
+    /// Unix-epoch milliseconds at which the link last transitioned from
+    /// reachable (socket connected and oven online) to unreachable, or at
+    /// which the server started. `0` means connected. Used
     /// to report *how long* the link has been down so a display client can
     /// ignore the routine ~5s max-connection-age reconnects.
     disconnected_since_ms: AtomicU64,
@@ -40,7 +45,10 @@ impl Liveness {
         Self {
             last_state_ms: AtomicU64::new(0),
             connected: AtomicBool::new(false),
-            disconnected_since_ms: AtomicU64::new(0),
+            oven_online: AtomicBool::new(true),
+            // Down from the start: an oven that never connects (local mode,
+            // oven unplugged) must count as an outage too.
+            disconnected_since_ms: AtomicU64::new(now_ms()),
             read_timeout_secs,
         }
     }
@@ -54,8 +62,21 @@ impl Liveness {
     /// called from the single WS task, so the read-modify-write below needs no
     /// external synchronization.
     pub fn set_connected(&self, connected: bool) {
-        let was = self.connected.swap(connected, Ordering::Relaxed);
-        if connected {
+        let was = self.connected();
+        self.connected.store(connected, Ordering::Relaxed);
+        self.track_transition(was);
+    }
+
+    /// Record whether the oven is reaching Anova's cloud, as far as the frames
+    /// the cloud relays tell. Same single-writer rule as [`Self::set_connected`].
+    pub fn set_oven_online(&self, online: bool) {
+        let was = self.connected();
+        self.oven_online.store(online, Ordering::Relaxed);
+        self.track_transition(was);
+    }
+
+    fn track_transition(&self, was: bool) {
+        if self.connected() {
             // Back up: clear any in-flight disconnect timer.
             self.disconnected_since_ms.store(0, Ordering::Relaxed);
         } else if was {
@@ -68,8 +89,8 @@ impl Liveness {
         }
     }
 
-    /// Seconds the link has been continuously disconnected, or `0` when
-    /// connected (or before the first connect).
+    /// Seconds the link has been continuously disconnected, counting from
+    /// startup before the first connect, or `0` when connected.
     pub fn disconnected_secs(&self) -> u64 {
         let since = self.disconnected_since_ms.load(Ordering::Relaxed);
         if since == 0 {
@@ -79,21 +100,30 @@ impl Liveness {
         }
     }
 
-    /// Whether the upstream WebSocket is currently connected.
+    /// Unix-epoch milliseconds of the last oven-state frame, or `None` if none
+    /// has arrived since startup. `/metrics` publishes this as an absolute
+    /// timestamp rather than an age (see `telemetry::record_liveness`).
+    pub fn last_state_unix_ms(&self) -> Option<u64> {
+        match self.last_state_ms.load(Ordering::Relaxed) {
+            0 => None,
+            ms => Some(ms),
+        }
+    }
+
+    /// Whether the oven is reachable: the upstream WebSocket is connected and,
+    /// in cloud mode, the oven is online behind it.
     pub fn connected(&self) -> bool {
-        self.connected.load(Ordering::Relaxed)
+        self.connected.load(Ordering::Relaxed) && self.oven_online.load(Ordering::Relaxed)
     }
 
     /// Point-in-time view for serialization.
     pub fn snapshot(&self) -> LivenessSnapshot {
-        let last = self.last_state_ms.load(Ordering::Relaxed);
-        let seconds_since_last_state = if last == 0 {
-            None
-        } else {
-            Some(now_ms().saturating_sub(last) / 1000)
-        };
+        let seconds_since_last_state = self
+            .last_state_unix_ms()
+            .map(|last| now_ms().saturating_sub(last) / 1000);
         LivenessSnapshot {
             connected: self.connected.load(Ordering::Relaxed),
+            oven_online: self.oven_online.load(Ordering::Relaxed),
             seconds_since_last_state,
             disconnected_secs: self.disconnected_secs(),
             read_timeout_secs: self.read_timeout_secs,
@@ -106,7 +136,10 @@ impl Liveness {
 pub struct LivenessSnapshot {
     /// Is the upstream WebSocket currently connected?
     pub connected: bool,
-    /// Seconds since the last oven-state frame, or `null` if none yet. A value
+    /// Is the oven reaching Anova's cloud? `false` while the socket is up but
+    /// the cloud is only replaying its cache.
+    pub oven_online: bool,
+    /// Seconds since the last fresh oven-state frame, or `null` if none yet. A value
     /// climbing toward `read_timeout_secs` means upstream has gone quiet.
     pub seconds_since_last_state: Option<u64>,
     /// Seconds the WebSocket has been continuously disconnected (`0` when
@@ -151,7 +184,10 @@ mod tests {
     #[test]
     fn disconnected_secs_is_zero_while_connected() {
         let l = Liveness::new(60);
-        assert_eq!(l.disconnected_secs(), 0); // never connected yet
+        // Never connected yet: counting from startup, still within its first
+        // second.
+        assert_eq!(l.disconnected_secs(), 0);
+        assert_ne!(l.disconnected_since_ms.load(Ordering::Relaxed), 0);
         l.set_connected(true);
         assert_eq!(l.disconnected_secs(), 0);
     }
@@ -172,6 +208,22 @@ mod tests {
         assert!(!l.connected());
         // Reconnecting clears the duration.
         l.set_connected(true);
+        assert!(l.connected());
+        assert_eq!(l.disconnected_secs(), 0);
+    }
+
+    #[test]
+    fn an_offline_oven_counts_as_disconnected_until_it_returns() {
+        let l = Liveness::new(60);
+        l.set_connected(true);
+        l.set_oven_online(false);
+        assert!(!l.connected());
+        assert!(!l.snapshot().oven_online);
+        // A reconnect of the socket alone doesn't bring the oven back.
+        l.set_connected(false);
+        l.set_connected(true);
+        assert!(!l.connected());
+        l.set_oven_online(true);
         assert!(l.connected());
         assert_eq!(l.disconnected_secs(), 0);
     }

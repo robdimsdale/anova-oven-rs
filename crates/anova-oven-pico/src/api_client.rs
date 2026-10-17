@@ -17,8 +17,8 @@ use anova_oven_pico_core::scheduler::{
 };
 
 use crate::api::{
-    fetch_current_cook, fetch_recipes, fetch_status, send_start, send_stop, Aligned,
-    HTTP_RX_BUF_LEN,
+    fetch_current_cook, fetch_recipes, fetch_status, send_next_stage, send_start, send_stop,
+    Aligned, ApiError, HTTP_RX_BUF_LEN,
 };
 
 const API_CALL_TIMEOUT_SECS: u64 = 5;
@@ -47,6 +47,7 @@ pub struct ApiClient<'a> {
 pub enum ApiCommand {
     Start { recipe_id: String },
     Stop,
+    NextStage,
 }
 
 struct ApiRuntime<'a> {
@@ -97,6 +98,12 @@ impl<'a> ApiClient<'a> {
     pub fn stop(&self) {
         if self.commands.try_send(ApiCommand::Stop).is_err() {
             warn!("API command channel full; dropping stop command");
+        }
+    }
+
+    pub fn next_stage(&self) {
+        if self.commands.try_send(ApiCommand::NextStage).is_err() {
+            warn!("API command channel full; dropping next-stage command");
         }
     }
 }
@@ -197,6 +204,7 @@ impl<'a> ApiRuntime<'a> {
         self.pending_start_recipe_id.is_some()
             || self.event_queue.has_pending(EventKind::ApiStart)
             || self.event_queue.has_pending(EventKind::ApiStop)
+            || self.event_queue.has_pending(EventKind::ApiNextStage)
     }
 
     fn reconcile_current_cook_recipe_title(&mut self) {
@@ -225,6 +233,7 @@ impl<'a> ApiRuntime<'a> {
             EventKind::PollRecipes => self.handle_poll_recipes().await,
             EventKind::ApiStart => self.handle_api_start().await,
             EventKind::ApiStop => self.handle_api_stop().await,
+            EventKind::ApiNextStage => self.handle_api_next_stage().await,
         }
     }
 
@@ -275,6 +284,18 @@ impl<'a> ApiRuntime<'a> {
         }
     }
 
+    async fn handle_api_next_stage(&mut self) {
+        if with_timeout(
+            Duration::from_secs(API_CALL_TIMEOUT_SECS),
+            send_next_stage(self.stack, &mut *self.rx_buf, &self.server_url),
+        )
+        .await
+        .is_err()
+        {
+            warn!("POST /next-stage: timed out");
+        }
+    }
+
     async fn handle_poll_status(&mut self) {
         if self.poll_action_in_flight() {
             self.enqueue(
@@ -293,6 +314,11 @@ impl<'a> ApiRuntime<'a> {
         {
             Ok(Ok(status)) => {
                 self.snapshot.install_status(status, Instant::now());
+                self.record_fast_poll_success();
+            }
+            // The server is up but the oven hasn't connected to it.
+            Ok(Err(ApiError::Http(503))) => {
+                self.snapshot.mark_oven_missing(Instant::now());
                 self.record_fast_poll_success();
             }
             Ok(Err(_)) => {
@@ -331,20 +357,21 @@ impl<'a> ApiRuntime<'a> {
         )
         .await
         {
+            // Only `/status` counts toward `fail_count`: a server answering
+            // this but not `/status` would otherwise reset the count between
+            // failures and flip the screen between offline and a stale reading.
             Ok(Ok(Some(cook))) => {
                 self.snapshot.current_cook = Some(cook);
-                self.record_fast_poll_success();
                 self.reconcile_current_cook_recipe_title();
             }
             Ok(Ok(None)) => {
                 self.snapshot.current_cook = None;
-                self.record_fast_poll_success();
             }
             Ok(Err(_)) => {
-                self.record_fast_poll_failure("GET /current-cook failed");
+                warn!("GET /current-cook failed");
             }
             Err(_) => {
-                self.record_fast_poll_failure("GET /current-cook timed out");
+                warn!("GET /current-cook timed out");
             }
         }
 
@@ -407,6 +434,10 @@ impl<'a> ApiRuntime<'a> {
             }
             ApiCommand::Stop => {
                 self.enqueue(EventKind::ApiStop, now, EnqueueMode::PreferEarlier);
+                self.queue_post_action_refresh(now);
+            }
+            ApiCommand::NextStage => {
+                self.enqueue(EventKind::ApiNextStage, now, EnqueueMode::PreferEarlier);
                 self.queue_post_action_refresh(now);
             }
         }

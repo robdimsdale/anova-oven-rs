@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Anova Oven</title>
+  <link rel="stylesheet" href="/ui/style.css">
+  <script src="/ui/common.js"></script>
+  <script src="/ui/steps.js"></script>
+</head>
+<body>
+  <header>
+    <span class="brand">Anova Oven</span>
+    <nav>
+      <a href="/" aria-current="page">Status</a>
+      <a href="/recipes">Recipes</a>
+    </nav>
+    <div class="unit-switch" role="group" aria-label="Temperature unit">
+      <button type="button" data-unit="F">°F</button>
+      <button type="button" data-unit="C">°C</button>
+    </div>
+  </header>
+  <main>
+    <div id="message" class="message"></div>
+
+    <section class="card">
+      <div class="row spread">
+        <span id="phase" class="badge">—</span>
+        <span id="link" class="badge">—</span>
+      </div>
+      <div class="row" style="margin-top: 12px; align-items: baseline;">
+        <span id="temp" class="big">—</span>
+        <span id="target" class="muted"></span>
+      </div>
+      <dl class="stats">
+        <div><dt>Timer</dt><dd id="timer">—</dd></div>
+        <div><dt>Steam</dt><dd id="steam">—</dd></div>
+        <div><dt>Probe</dt><dd id="probe">—</dd></div>
+        <div><dt>Door</dt><dd id="door">—</dd></div>
+        <div><dt>Water tank</dt><dd id="water">—</dd></div>
+        <div><dt>Light</dt><dd id="lamp-state">—</dd></div>
+      </dl>
+    </section>
+
+    <section id="cook" class="card" hidden>
+      <h2 id="cook-title"></h2>
+      <p id="cook-stage" class="muted" style="margin: 0;"></p>
+      <div class="row" style="margin-top: 14px;">
+        <button id="next-stage" class="primary" hidden>Start next stage</button>
+        <button id="stop" class="danger">Stop cook</button>
+      </div>
+    </section>
+
+    <section id="manual" hidden>
+      <div class="card">
+        <h2>Manual cook</h2>
+        <label>Title
+          <input id="manual-title" placeholder="Manual cook" maxlength="200">
+        </label>
+      </div>
+      <div id="manual-steps"></div>
+      <div class="row" style="margin-bottom: 16px;">
+        <button type="button" id="manual-add">Add stage</button>
+        <button type="button" id="manual-start" class="primary">Start cook</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Controls</h2>
+      <div class="row">
+        <button id="lamp-on">Light on</button>
+        <button id="lamp-off">Light off</button>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const message = $("message");
+    let status = null;
+
+    function render() {
+      if (!status) return;
+      const s = status;
+
+      const phase = s.mode === "idle" ? "Idle"
+        : s.timer_mode === "idle" && s.timer_current_secs === 0 ? "Preheating" : "Cooking";
+      $("phase").textContent = phase;
+      $("phase").className = "badge" + (s.mode === "idle" ? "" : " ok");
+
+      const up = s.upstream;
+      if (!up || up.connected) {
+        $("link").textContent = "Oven connected";
+        $("link").className = "badge ok";
+      } else {
+        $("link").textContent = `Oven disconnected ${formatDuration(up.disconnected_secs)}`;
+        $("link").className = "badge danger";
+      }
+
+      const current = s.temperature_bulbs_mode === "wet" ? s.wet_bulb_temperature_c : s.temperature_c;
+      $("temp").textContent = formatTemp(current);
+      $("target").textContent = s.target_temperature_c != null && s.mode !== "idle"
+        ? `target ${formatTemp(s.target_temperature_c)}` : "";
+      $("timer").textContent = s.timer_mode === "idle" && s.timer_total_secs === 0
+        ? "—" : `${formatDuration(s.timer_current_secs)} / ${formatDuration(s.timer_total_secs)}`;
+      $("steam").textContent = s.steam_target_pct != null && s.mode !== "idle"
+        ? `${Math.round(s.steam_pct)}% → ${Math.round(s.steam_target_pct)}%`
+        : `${Math.round(s.steam_pct)}%`;
+      $("probe").textContent = formatTemp(s.probe_temperature_c);
+      $("door").textContent = s.door_open ? "Open" : "Closed";
+      $("water").textContent = s.water_tank_empty ? "Empty" : "OK";
+      $("lamp-state").textContent = s.lamp_on ? "On" : "Off";
+      $("lamp-on").disabled = s.lamp_on;
+      $("lamp-off").disabled = !s.lamp_on;
+
+      const progress = s.cook_progress;
+      $("cook").hidden = s.mode === "idle";
+      // A manual cook can be set up whenever nothing is cooking. Only shown
+      // or hidden here, so polling never disturbs what's being typed.
+      $("manual").hidden = s.mode !== "idle";
+      if (progress) {
+        $("cook-title").textContent = progress.recipe_title;
+        $("cook-stage").textContent =
+          `Stage ${progress.current_stage_index + 1} of ${progress.total_stage_count}: ${stageDescription(progress)}`;
+        $("next-stage").hidden = !progress.next_stage_ready;
+      } else {
+        $("cook-title").textContent = "Cooking";
+        $("cook-stage").textContent = "";
+        $("next-stage").hidden = true;
+      }
+    }
+
+    // The running cook's stages, for describing the current one in the
+    // unit on screen. (The server's own description is in Celsius.)
+    let cookStages = null;
+
+    function stageDescription(progress) {
+      const stage = cookStages && cookStages[progress.current_stage_index];
+      if (!stage) return progress.current_stage_description;
+      const name = stage.title || (stage.kind === "preheat" ? "Preheat" : "Cook");
+      const wet = stage.temperature_bulbs_mode === "wet" ? " sous vide" : "";
+      return `${name} · ${formatTemp(stage.temperature_c)}${wet}`;
+    }
+
+    async function poll() {
+      try {
+        status = await api("GET", "/status");
+        if (status.mode !== "idle") {
+          try {
+            const cook = await api("GET", "/current-cook");
+            cookStages = cook ? cook.stages : null;
+          } catch (_) {
+            cookStages = null;
+          }
+        } else {
+          cookStages = null;
+        }
+        if (message.dataset.fromPoll) {
+          clearMessage(message);
+          delete message.dataset.fromPoll;
+        }
+        render();
+      } catch (e) {
+        showMessage(message, e.message);
+        message.dataset.fromPoll = "1";
+      }
+    }
+
+    async function act(path, body) {
+      clearMessage(message);
+      try {
+        await api("POST", path, body);
+        setTimeout(poll, 800);
+      } catch (e) {
+        showMessage(message, e.message);
+      }
+    }
+
+    const manual = createStepEditor($("manual-steps"), {
+      name: "manual",
+      onChange: (ok) => { $("manual-start").disabled = !ok; },
+    });
+    manual.reset();
+    $("manual-add").onclick = () => manual.addStep();
+    $("manual-start").onclick = async () => {
+      const title = $("manual-title").value.trim();
+      if (!confirm(`Start ${title ? `“${title}”` : "this manual cook"} now?`)) return;
+      clearMessage(message);
+      try {
+        await api("POST", "/start", { title: title || undefined, stages: manual.stages() });
+        showMessage(message, `Started ${title || "manual cook"}`, "ok");
+        $("manual-title").value = "";
+        manual.reset();
+        setTimeout(poll, 800);
+      } catch (e) {
+        showMessage(message, e.message);
+      }
+    };
+
+    $("lamp-on").onclick = () => act("/lamp", { on: true });
+    $("lamp-off").onclick = () => act("/lamp", { on: false });
+    $("next-stage").onclick = () => act("/next-stage");
+    $("stop").onclick = () => {
+      if (confirm("Stop the cook?")) act("/stop");
+    };
+
+    initUnitSwitch(() => { render(); manual.render(); });
+    poll();
+    setInterval(poll, 2000);
+  </script>
+</body>
+</html>
