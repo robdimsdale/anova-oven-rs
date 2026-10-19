@@ -32,7 +32,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::runtime::types::{OvenCook, StartedFrom, StoreCommand, StoreError, StoreEvent};
+use crate::runtime::types::{
+    CookExtras, OvenCook, StartedFrom, StoreCommand, StoreError, StoreEvent,
+};
 
 /// How many history entries `GET /history` returns, as the Firestore store.
 const HISTORY_LIMIT: usize = 50;
@@ -56,6 +58,9 @@ struct ActiveCook {
     /// first does, so a `/start` the oven never acted on leaves no history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_seen_at: Option<String>,
+    /// What the server does with the cook that the oven doesn't know.
+    #[serde(flatten)]
+    extras: CookExtras,
 }
 
 pub struct LocalStore {
@@ -99,13 +104,26 @@ impl LocalStore {
                     result: self.current_cook(oven_cook.as_ref(), now),
                 }
             }
-            StoreCommand::PatchCookRecipeRef { cook_id, from } => {
+            StoreCommand::PatchCookRecipeRef {
+                cook_id,
+                from,
+                extras,
+            } => {
                 let result = match &from {
-                    StartedFrom::Recipe(recipe_id) => self.cook_started(&cook_id, recipe_id, now),
+                    StartedFrom::Recipe(recipe_id) => {
+                        self.cook_started(&cook_id, recipe_id, extras, now)
+                    }
                     StartedFrom::Manual {
                         title,
                         cook_stage_count,
-                    } => self.journal_start(&cook_id, None, title.clone(), *cook_stage_count, now),
+                    } => self.journal_start(
+                        &cook_id,
+                        None,
+                        title.clone(),
+                        *cook_stage_count,
+                        extras,
+                        now,
+                    ),
                 };
                 let recorded = matches!(result, Ok(true));
                 let mut events = vec![StoreEvent::RecipeRefPatched {
@@ -187,6 +205,7 @@ impl LocalStore {
         &mut self,
         cook_id: &str,
         recipe_id: &str,
+        extras: CookExtras,
         now: jiff::Timestamp,
     ) -> Result<bool, StoreError> {
         let (recipe_title, cook_stage_count) = match self.recipe(recipe_id) {
@@ -207,6 +226,7 @@ impl LocalStore {
             Some(recipe_id),
             recipe_title,
             cook_stage_count,
+            extras,
             now,
         )
     }
@@ -219,6 +239,7 @@ impl LocalStore {
         recipe_id: Option<&str>,
         recipe_title: String,
         cook_stage_count: usize,
+        extras: CookExtras,
         now: jiff::Timestamp,
     ) -> Result<bool, StoreError> {
         let recorded = match self.read_active_cook() {
@@ -232,6 +253,7 @@ impl LocalStore {
             started_at: whole_seconds(now).to_string(),
             cook_stage_count,
             last_seen_at: None,
+            extras,
         })?;
         Ok(recorded)
     }
@@ -264,8 +286,8 @@ impl LocalStore {
         Ok(recorded)
     }
 
-    /// The current cook: the oven's stages, plus the title and start time
-    /// from the journal.
+    /// The current cook: the oven's stages, plus the title, start time and
+    /// extras from the journal.
     fn current_cook(
         &mut self,
         oven_cook: Option<&OvenCook>,
@@ -286,13 +308,15 @@ impl LocalStore {
                     .ok_or_else(|| StoreError::Other("cook journal missing after write".into()))?
             }
         };
+        let mut stages = oven_cook.stages.clone();
+        active.extras.apply(&mut stages);
         Ok(Some(CurrentCook {
             recipe_title: active.recipe_title,
             recipe_id: active.recipe_id,
             started_at: active.started_at,
             cook_stage_count: cook_stage_count(&oven_cook.stages),
             total_stage_count: oven_cook.stages.len(),
-            stages: oven_cook.stages.clone(),
+            stages,
         }))
     }
 
@@ -376,6 +400,7 @@ fn manual_cook(cook: &OvenCook, now: jiff::Timestamp) -> ActiveCook {
             .to_string(),
         cook_stage_count: cook_stage_count(&cook.stages),
         last_seen_at: Some(whole_seconds(now).to_string()),
+        extras: CookExtras::default(),
     }
 }
 
@@ -537,6 +562,7 @@ pub fn normalize(mut recipe: Recipe) -> Result<Recipe, RecipeError> {
     if recipe.stages.is_empty() {
         return invalid("a recipe needs at least one stage".into());
     }
+    let last = recipe.stages.len() - 1;
     for (i, stage) in recipe.stages.iter_mut().enumerate() {
         let n = i + 1;
         if stage.kind != "preheat" && stage.kind != "cook" {
@@ -589,6 +615,20 @@ pub fn normalize(mut recipe: Recipe) -> Result<Recipe, RecipeError> {
             return invalid(format!(
                 "stage {n}: a preheat ends at temperature, without a timer or probe"
             ));
+        }
+        if stage.turn_off_at_end == Some(true) {
+            if i != last {
+                return invalid(format!(
+                    "stage {n}: only the last stage can turn the oven off"
+                ));
+            }
+            if stage.timer_added != Some(true) && stage.probe_added != Some(true) {
+                return invalid(format!(
+                    "stage {n}: turning the oven off needs a timer or probe to end on"
+                ));
+            }
+        } else {
+            stage.turn_off_at_end = None;
         }
         let elements = [
             stage.heating_element_top,

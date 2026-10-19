@@ -178,6 +178,7 @@ pub fn stage_from_json(s: &serde_json::Value) -> anova_oven_api::Stage {
         heating_element_bottom,
         vent_open,
         title,
+        turn_off_at_end: None,
     }
 }
 

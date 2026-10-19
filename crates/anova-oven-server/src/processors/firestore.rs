@@ -70,7 +70,11 @@ impl FirestoreProcessor {
                         })
                         .await;
                 }
-                StoreCommand::PatchCookRecipeRef { cook_id, from } => {
+                StoreCommand::PatchCookRecipeRef {
+                    cook_id,
+                    from,
+                    extras: _,
+                } => {
                     // A manual cook has no recipe to tag it with.
                     let recipe_id = from.recipe_id().map(String::from);
                     let out = match &recipe_id {

@@ -311,7 +311,10 @@ only has to deliver commands and, at the end, `CMD_APO_STOP`.
     reports is untested.
 
   An emulator that stops the oven itself should refuse such recipes or have
-  its own fallback for ending them. Count "the last stage" from the current `cook.stages`, since
+  its own fallback for ending them. This server stops the oven only for a
+  recipe whose last stage asks to (`turn_off_at_end`), refuses that on a
+  last stage without a timer or probe, and for a probe stage watches the
+  probe reach its target itself. Count "the last stage" from the current `cook.stages`, since
   `UPDATE_COOK_STAGES` can add stages mid-cook.
 - **Steam is unproven.** The stages started and transitioned (`dry 60°C +
   RH 40%` set `wet.dosed: true` within 10s; `wet 55°C + steam 100%` switched

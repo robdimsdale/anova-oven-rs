@@ -20,9 +20,9 @@ use uuid::Uuid;
 
 use crate::read_model::ReadModel;
 use crate::runtime::types::{
-    CommandFailure, ControlRequest, CurrentCookReason, HistoryReason, OvenControl, OvenCook,
-    SmError, StartedFrom, StateMachineCommand, StateMachineEvent, StoreCommand, StoreError,
-    StoreEvent, TransitionOrigin, WsCommand, WsEvent,
+    CommandFailure, ControlRequest, CookExtras, CurrentCookReason, HistoryReason, OvenControl,
+    OvenCook, SmError, StartedFrom, StateMachineCommand, StateMachineEvent, StoreCommand,
+    StoreError, StoreEvent, TransitionOrigin, WsCommand, WsEvent,
 };
 
 // ─── Canonical state ─────────────────────────────────────────────────────────
@@ -49,6 +49,9 @@ pub struct SmState {
     pub preheat_tolerance_c: f32,
     /// The preheat being watched for a stall short of its setpoint.
     pub preheat_watch: Option<PreheatWatch>,
+    /// The cook the server stopped because it was done and its recipe said
+    /// to turn the oven off, so it's stopped once.
+    pub turned_off: Option<String>,
 }
 
 /// How long a preheat must stay within [`SmState::preheat_tolerance_c`] of
@@ -332,6 +335,7 @@ fn start(
     });
 
     let cook_id = format!("ios-{}", uuid::Uuid::new_v4());
+    let extras = CookExtras::from_stages(&recipe.stages);
     let effects = vec![
         SmEffect::Ws(WsCommand::SendStart {
             request_id,
@@ -339,7 +343,11 @@ fn start(
             recipe_id: recipe.id.clone(),
             stages: recipe.stages.clone(),
         }),
-        SmEffect::Store(StoreCommand::PatchCookRecipeRef { cook_id, from }),
+        SmEffect::Store(StoreCommand::PatchCookRecipeRef {
+            cook_id,
+            from,
+            extras,
+        }),
     ];
 
     (Ok(()), effects)
@@ -459,16 +467,73 @@ fn stop_cook(state: &mut SmState) -> (Result<(), SmError>, Vec<SmEffect>) {
         return (Err(SmError::Disconnected), Vec::new());
     }
 
+    let mut effects = Vec::new();
+    // The lamp goes off with the oven. Before the stop: the oven ignores
+    // `SET_LAMP` once it's idle.
+    if state.local && state.status.as_ref().is_some_and(|s| s.lamp_on) {
+        effects.push(send_control(
+            state,
+            "lamp",
+            OvenControl::SetLamp { on: false },
+        ));
+    }
+
     let request_id = Uuid::new_v4().to_string();
     state.pending.stop = Some(PendingStop {
         request_id: request_id.clone(),
     });
     state.set_lifecycle(Lifecycle::StopPending, TransitionOrigin::LocalCommand);
+    effects.push(SmEffect::Ws(WsCommand::SendStop { request_id }));
 
-    (
-        Ok(()),
-        vec![SmEffect::Ws(WsCommand::SendStop { request_id })],
-    )
+    (Ok(()), effects)
+}
+
+/// Local mode: stop a cook whose recipe says to turn the oven off once its
+/// last stage ends, as pressing Stop would. The stage has ended when the
+/// oven says the cook is done (its timer ran out) or, for a probe stage,
+/// when the probe reaches its target.
+fn turn_off_when_done(state: &mut SmState) -> Vec<SmEffect> {
+    if !state.local || state.lifecycle != Lifecycle::Cooking {
+        return Vec::new();
+    }
+    let (Some(status), Some(oven_cook), Some(cook)) =
+        (&state.status, &state.oven_cook, &state.current_cook)
+    else {
+        return Vec::new();
+    };
+    if !cook
+        .stages
+        .last()
+        .is_some_and(|s| s.turn_off_at_end == Some(true))
+        || state.turned_off.as_deref() == Some(oven_cook.cook_id.as_str())
+    {
+        return Vec::new();
+    }
+    let Some(last) = oven_cook.stages.len().checked_sub(1) else {
+        return Vec::new();
+    };
+    if status.active_stage_index != Some(last) {
+        return Vec::new();
+    }
+    let stage = &oven_cook.stages[last];
+    let probe_done = stage.probe_added == Some(true)
+        && matches!(
+            (status.probe_temperature_c, status.probe_target_temperature_c.or(stage.probe_target_c)),
+            (Some(current), Some(target)) if current >= target
+        );
+    if !status.cook_done && !probe_done {
+        return Vec::new();
+    }
+
+    info!(target: "sm", cook_id = %oven_cook.cook_id, probe_done, "cook done; turning the oven off");
+    state.turned_off = Some(oven_cook.cook_id.clone());
+    match stop_cook(state) {
+        (Ok(()), effects) => effects,
+        (Err(e), _) => {
+            warn!(target: "sm", error = %e, "couldn't turn the oven off");
+            Vec::new()
+        }
+    }
 }
 
 // ─── External-event transitions ──────────────────────────────────────────────
@@ -557,6 +622,17 @@ fn apply_apo_state(state: &mut SmState, status: OvenStatus) -> Vec<SmEffect> {
         state.pending.start = None;
         state.set_lifecycle(Lifecycle::Cooking, origin);
 
+        // The lamp comes on with the oven, whatever its lamp preference.
+        // Not for a cook already running when the server first sees it: the
+        // lamp may have been turned off since.
+        if state.local && seen_before && !status.lamp_on {
+            effects.push(send_control(
+                state,
+                "lamp",
+                OvenControl::SetLamp { on: true },
+            ));
+        }
+
         // After leaving StartPending: the oven was idle, so its cook is the
         // new one, not one being replaced.
         effects.push(fetch_current_cook(state, reason));
@@ -610,6 +686,7 @@ fn apply_apo_state(state: &mut SmState, status: OvenStatus) -> Vec<SmEffect> {
     }
 
     state.status = Some(status);
+    effects.extend(turn_off_when_done(state));
     effects.push(SmEffect::PublishReadModel);
     effects
 }
@@ -1095,6 +1172,7 @@ mod tests {
             heating_element_bottom: Some(true),
             vent_open: Some(false),
             title: None,
+            turn_off_at_end: None,
         }
     }
 
@@ -1610,6 +1688,121 @@ mod tests {
                 settle_preheat(&mut state, &mut status, t0 + Duration::from_secs(secs)).is_empty()
             );
         }
+    }
+
+    /// A local-mode state cooking the last stage of a timed cook that turns
+    /// the oven off at the end or not, with the lamp on.
+    fn last_stage(turn_off: bool, probe: bool) -> SmState {
+        let mut last = stage(Some("ios-s2"), "cook", false, (!probe).then_some(600));
+        if probe {
+            last.probe_added = Some(true);
+            last.probe_target_c = Some(60.0);
+        }
+        let stages = vec![stage(Some("ios-s1"), "cook", false, Some(600)), last];
+        let mut current = cook(stages.clone());
+        current.stages[1].turn_off_at_end = turn_off.then_some(true);
+        let mut state = local_state();
+        state.oven_cook = Some(OvenCook {
+            cook_id: "ios-c".into(),
+            stages,
+            raw_stages: Vec::new(),
+            seconds_elapsed: 0,
+        });
+        let _ = apply_apo_state(&mut state, on_last_stage(|_| {}));
+        state.current_cook = Some(current);
+        state
+    }
+
+    fn on_last_stage(edit: impl FnOnce(&mut OvenStatus)) -> OvenStatus {
+        let mut status = oven_status("cook", 600);
+        status.active_stage_index = Some(1);
+        status.lamp_on = true;
+        edit(&mut status);
+        status
+    }
+
+    fn ws_cmds(effects: &[SmEffect]) -> Vec<String> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                SmEffect::Ws(WsCommand::SendStop { .. }) => Some("stop".to_string()),
+                SmEffect::Ws(WsCommand::Control { control, .. }) => Some(format!("{control:?}")),
+                SmEffect::Ws(WsCommand::SendStart { .. }) => Some("start".to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn done(status: &mut OvenStatus) {
+        status.cook_done = true;
+        status.timer_mode = "idle".into();
+    }
+
+    #[test]
+    fn a_cook_set_to_turn_off_is_stopped_when_done_with_the_lamp_first() {
+        let mut state = last_stage(true, false);
+        assert!(ws_cmds(&apply_apo_state(&mut state, on_last_stage(|_| {}))).is_empty());
+
+        let effects = apply_apo_state(&mut state, on_last_stage(done));
+        assert_eq!(ws_cmds(&effects), ["SetLamp { on: false }", "stop"]);
+        assert_eq!(state.lifecycle, Lifecycle::StopPending);
+
+        // Once only, even if the stop is refused.
+        let Some(request_id) = state.pending.stop.as_ref().map(|p| p.request_id.clone()) else {
+            panic!("expected a pending stop");
+        };
+        let _ = apply_command_ack(&mut state, &request_id, "error");
+        assert!(ws_cmds(&apply_apo_state(&mut state, on_last_stage(done))).is_empty());
+    }
+
+    #[test]
+    fn a_probe_cook_set_to_turn_off_is_stopped_at_its_target() {
+        let mut state = last_stage(true, true);
+        let probe = |c| move |s: &mut OvenStatus| s.probe_temperature_c = Some(c);
+        assert!(ws_cmds(&apply_apo_state(&mut state, on_last_stage(probe(59.0)))).is_empty());
+        assert_eq!(
+            ws_cmds(&apply_apo_state(&mut state, on_last_stage(probe(60.0)))),
+            ["SetLamp { on: false }", "stop"]
+        );
+    }
+
+    #[test]
+    fn a_done_cook_keeps_holding_unless_set_to_turn_off() {
+        let mut state = last_stage(false, false);
+        assert!(ws_cmds(&apply_apo_state(&mut state, on_last_stage(done))).is_empty());
+
+        let mut cloud = last_stage(true, false);
+        cloud.local = false;
+        assert!(ws_cmds(&apply_apo_state(&mut cloud, on_last_stage(done))).is_empty());
+    }
+
+    #[test]
+    fn the_lamp_comes_on_when_a_cook_starts() {
+        let mut state = local_state();
+        let _ = apply_apo_state(&mut state, oven_status("idle", 0));
+        assert_eq!(
+            ws_cmds(&apply_apo_state(&mut state, oven_status("cook", 600))),
+            ["SetLamp { on: true }"]
+        );
+
+        // Not for a cook already running when the server starts.
+        let mut state = local_state();
+        assert!(ws_cmds(&apply_apo_state(&mut state, oven_status("cook", 600))).is_empty());
+    }
+
+    #[test]
+    fn a_start_journals_whether_the_cook_turns_off_at_the_end() {
+        let mut state = local_state();
+        let _ = apply_apo_state(&mut state, oven_status("idle", 0));
+        let mut last = stage(Some("s1"), "cook", false, Some(600));
+        last.turn_off_at_end = Some(true);
+        state.recipes = vec![recipe(vec![last])];
+        let (_, effects) = start_cook(&mut state, "r");
+        let extras = effects.iter().find_map(|e| match e {
+            SmEffect::Store(StoreCommand::PatchCookRecipeRef { extras, .. }) => Some(extras),
+            _ => None,
+        });
+        assert_eq!(extras.map(|e| e.turn_off_at_end), Some(true));
     }
 
     fn fetched_oven_cook_ids(effects: &[SmEffect]) -> Vec<Option<String>> {

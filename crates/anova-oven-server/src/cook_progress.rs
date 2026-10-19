@@ -642,6 +642,7 @@ mod tests {
             heating_element_bottom: Some(true),
             vent_open: Some(false),
             title: Some("Stage".into()),
+            turn_off_at_end: None,
         }
     }
 

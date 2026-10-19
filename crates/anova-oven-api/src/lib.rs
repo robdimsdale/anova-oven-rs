@@ -361,6 +361,11 @@ pub struct Stage {
     /// Stage title, if set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Stop the cook once this stage ends on its timer or probe, as pressing
+    /// Stop would. Only on the last stage. Not something the oven knows:
+    /// the server acts on it, in local mode only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_off_at_end: Option<bool>,
 }
 
 impl Stage {
@@ -606,6 +611,7 @@ mod tests {
             heating_element_bottom: None,
             vent_open: None,
             title: Some(title.into()),
+            turn_off_at_end: None,
         }
     }
 
@@ -708,6 +714,7 @@ mod tests {
                     heating_element_bottom: None,
                     vent_open: None,
                     title: None,
+                    turn_off_at_end: None,
                 },
                 Stage {
                     id: None,
@@ -727,6 +734,7 @@ mod tests {
                     heating_element_bottom: None,
                     vent_open: None,
                     title: None,
+                    turn_off_at_end: None,
                 },
             ],
         };

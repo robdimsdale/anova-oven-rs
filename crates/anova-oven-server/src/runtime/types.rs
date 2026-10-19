@@ -7,6 +7,7 @@
 #![allow(dead_code, clippy::enum_variant_names, clippy::large_enum_variant)]
 
 use anova_oven_api::{CurrentCook, HistoryEntry, OvenStatus, Recipe, Stage};
+use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use crate::firestore::FirestoreError;
@@ -302,10 +303,39 @@ pub enum StoreCommand {
     PatchCookRecipeRef {
         cook_id: String,
         from: StartedFrom,
+        extras: CookExtras,
     },
     ResolveManualCookTitle {
         cook: CurrentCook,
     },
+}
+
+/// What a cook the server started asks of the server beyond what the oven
+/// keeps of its stages. The local store journals it and lays it back over
+/// the oven's stages (see [`CookExtras::apply`]), so it lasts the cook and
+/// a restart; Firestore drops it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CookExtras {
+    /// Stop the cook once its last stage ends on its timer or probe.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub turn_off_at_end: bool,
+}
+
+impl CookExtras {
+    pub fn from_stages(stages: &[Stage]) -> Self {
+        Self {
+            turn_off_at_end: stages
+                .last()
+                .is_some_and(|s| s.turn_off_at_end == Some(true)),
+        }
+    }
+
+    /// Lay these over the oven's copy of the stages.
+    pub fn apply(&self, stages: &mut [Stage]) {
+        if let Some(last) = stages.last_mut() {
+            last.turn_off_at_end = self.turn_off_at_end.then_some(true);
+        }
+    }
 }
 
 /// What a cook the server started was made from.

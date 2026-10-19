@@ -249,8 +249,8 @@ pub fn to_oven_cook(oven: &OvenState) -> Option<crate::runtime::types::OvenCook>
 ///   `UPDATE_COOK_STAGES` can grow mid-cook.
 ///
 /// A last stage with no timer, or one ending on a probe target, never meets
-/// this. The server doesn't stop the oven when it's met; neither does Anova's
-/// cloud.
+/// this. Anova's cloud doesn't stop the oven when it's met; this server does
+/// only for a cook whose last stage has `turn_off_at_end`.
 pub fn cook_done(oven: &OvenState) -> bool {
     let Some(cook) = &oven.cook else {
         return false;

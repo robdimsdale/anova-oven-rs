@@ -62,6 +62,13 @@ function toStages(steps) {
       stages.push(copy);
     }
   }
+  // Only the last stage turns the oven off, and only once it ends on its own.
+  stages.forEach((stage, i) => {
+    const last = i === stages.length - 1;
+    if (!stage.turn_off_at_end || !last || !(stage.timer_added || stage.probe_added)) {
+      delete stage.turn_off_at_end;
+    }
+  });
   return stages;
 }
 
@@ -197,6 +204,26 @@ function createStepEditor(container, { name, onChange = () => {} }) {
       </div>`;
   }
 
+  // What happens once the last step ends on its timer or probe: shown under
+  // its card.
+  function finishHtml() {
+    const last = steps[steps.length - 1];
+    const ending = last && last.cook &&
+      { timer: "timer ends", probe: "probe reaches its target" }[endsOf(last.cook)];
+    if (!ending) return "";
+    const n = steps.length;
+    return `
+      <div class="between">
+        <fieldset class="ends">
+          <legend>When stage ${n}'s ${ending}</legend>
+          ${radios(`${name}-finish`, "data-finish", last.cook.turn_off_at_end ? "off" : "hold", [
+            ["hold", "Keep holding until I stop", `The oven keeps holding stage ${n}'s settings until you press Stop.`],
+            ["off", "Turn the oven off", "The cook stops and the light goes off, as if you'd pressed Stop."],
+          ])}
+        </fieldset>
+      </div>`;
+  }
+
   function elementsHtml(stage, i) {
     const current = elementsOf(stage);
     return `
@@ -282,7 +309,7 @@ function createStepEditor(container, { name, onChange = () => {} }) {
   function render() {
     container.innerHTML = steps
       .map((s, i) => (i > 0 ? betweenHtml(i) : "") + stepHtml(s, i, steps.length))
-      .join("");
+      .join("") + finishHtml();
     validate();
   }
 
@@ -307,6 +334,12 @@ function createStepEditor(container, { name, onChange = () => {} }) {
     if (input.hasAttribute("data-between-choice")) {
       const step = steps[Number(input.closest("[data-between]").dataset.between)];
       firstStage(step).user_action_required = input.value === "wait";
+      render();
+      return;
+    }
+
+    if (input.hasAttribute("data-finish")) {
+      steps[steps.length - 1].cook.turn_off_at_end = input.value === "off";
       render();
       return;
     }

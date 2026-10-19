@@ -164,8 +164,8 @@ types, not every field):
   Firestore stage id (used as `stageId` for `CMD_APO_START_STAGE` — see
   exploration note below), kind, target temperature, optional bulb mode,
   duration, timer/probe flags, probe target, steam %, fan speed,
-  `user_action_required`, rack position, heating-element flags, vent, and
-  title. `Recipe::normalize()` and `Stage::normalize_fan_speed()` enforce
+  `user_action_required`, rack position, heating-element flags, vent,
+  title, and `turn_off_at_end` (last stage only; see below). `Recipe::normalize()` and `Stage::normalize_fan_speed()` enforce
   Anova's "fan must be 100% with rear heat or steam" rule.
 - **`HistoryEntry`** — recipe title (or `"[manual]"`), `ended_at` (ISO 8601),
   stage count.
@@ -287,8 +287,10 @@ still available.
     added by hand works too. Re-read on every refresh and
     `POST /update-recipes`.
   - `active-cook.json` — a journal of the cook in flight, keyed by the
-    oven's `cookId`: title, recipe ID, start time, and when the oven last
-    reported it. Written on `/start` (or on first sight of a cook started
+    oven's `cookId`: title, recipe ID, start time, when the oven last
+    reported it, and what the server does with the cook that the oven
+    doesn't keep (`turn_off_at_end`), laid back over the oven's stages in
+    the current cook. Written on `/start` (or on first sight of a cook started
     from the oven's panel, as `[manual]`), rewritten in place on each report
     of that cook (every 5s while cooking), and removed when the cook goes
     to history. A restart mid-cook keeps the title. The stages come from the
@@ -325,7 +327,10 @@ are always sent as Celsius.
   steps, when the first ends on its own (timer, probe, or a preheat-only
   step at temperature), a radio picks whether the next goes straight on or
   waits for you; it's the next step's first stage's `user_action_required`.
-  The first step's flag isn't shown and is kept as saved. Each choice has a
+  The first step's flag isn't shown and is kept as saved. Under the last
+  step, when it ends on a timer or probe, a radio picks whether the oven
+  keeps holding until you press Stop (the oven's own behaviour) or turns off:
+  the last stage's `turn_off_at_end`. Each choice has a
   one-line hint under it saying what the oven will do. Fan, vent and rack aren't shown:
   new stages get fan 100 and no vent or rack, and existing values are kept on
   save, as is anything else the form doesn't show. The page checks the
@@ -428,6 +433,17 @@ supervisor restarts the whole process from a clean slate, rather than
 leaving a zombie where some processors serve stale data while a
 load-bearing one is gone. Run under `systemd` with `Restart=always` (or an
 equivalent container restart policy) to make this self-healing.
+
+**Ending a cook (local mode).** The oven never stops a cook by itself: at
+the end of the last stage it keeps holding its settings (see
+[oven-cloud-emulation.md](oven-cloud-emulation.md#running-a-cook)). When the
+cook's last stage has `turn_off_at_end`, the state machine stops it as
+`POST /stop` would, once the oven reports it done (`cook_done`) or, for a
+probe stage, the probe reaches its target. The lamp follows the cook: the
+server turns it on when a cook starts (unless it's already on, and not for
+a cook already running when the server starts), and off just before every
+stop it sends, since the oven ignores `CMD_APO_SET_LAMP` once idle. A cook
+stopped from the oven's own panel is left to the oven.
 
 **Logging what the oven does.** Some of what the oven does isn't in any
 recipe: the lamp has no per-stage setting (only a preference and
