@@ -394,11 +394,7 @@ fn build_cook_progress(tracker: &Tracker) -> CookProgress {
     let current_kind = current
         .map(|s| s.kind.clone())
         .unwrap_or_else(|| "cook".into());
-    let next_description = if tracker.next_stage_ready {
-        tracker.next_stage().map(Stage::short_description)
-    } else {
-        None
-    };
+    let next = tracker.next_stage().filter(|_| tracker.next_stage_ready);
 
     CookProgress {
         recipe_title: tracker.recipe_title.clone(),
@@ -407,7 +403,8 @@ fn build_cook_progress(tracker: &Tracker) -> CookProgress {
         current_stage_description: current_description,
         current_stage_kind: current_kind,
         next_stage_ready: tracker.next_stage_ready,
-        next_stage_description: next_description,
+        next_stage_description: next.map(Stage::short_description),
+        next_stage_prompt: next.and_then(|s| s.prompt.clone()),
     }
 }
 
@@ -595,6 +592,22 @@ mod tests {
     }
 
     #[test]
+    fn a_waiting_stage_passes_on_its_prompt() {
+        let (mut task, rx) = local_task_with_rx();
+        let mut cook = stale_cook();
+        cook.stages[1].prompt = Some("Rotate the pan".into());
+        task.on_current_cook(Some(cook), Some(&oven_status(0, false)));
+        let prompt = |rx: &watch::Receiver<Option<CookProgress>>| {
+            rx.borrow().clone().and_then(|p| p.next_stage_prompt)
+        };
+        assert_eq!(prompt(&rx), None, "not until the oven waits");
+        task.on_status(Some(&oven_status(0, true)));
+        assert_eq!(prompt(&rx).as_deref(), Some("Rotate the pan"));
+        task.on_status(Some(&oven_status(1, false)));
+        assert_eq!(prompt(&rx), None);
+    }
+
+    #[test]
     fn local_mode_waiting_flag_on_the_last_stage_is_not_a_next_stage() {
         let (mut task, rx) = local_task_with_rx();
         task.on_current_cook(Some(stale_cook()), Some(&oven_status(2, false)));
@@ -643,6 +656,7 @@ mod tests {
             vent_open: Some(false),
             title: Some("Stage".into()),
             turn_off_at_end: None,
+            prompt: None,
         }
     }
 

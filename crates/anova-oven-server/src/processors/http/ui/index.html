@@ -45,6 +45,7 @@
     <section id="cook" class="card" hidden>
       <h2 id="cook-title"></h2>
       <p id="cook-stage" class="muted" style="margin: 0;"></p>
+      <p id="cook-prompt" style="margin: 10px 0 0;" hidden></p>
       <div class="row" style="margin-top: 14px;">
         <button id="next-stage" class="primary" hidden>Start next stage</button>
         <button id="stop" class="danger">Stop cook</button>
@@ -123,10 +124,13 @@
         $("cook-stage").textContent =
           `Stage ${progress.current_stage_index + 1} of ${progress.total_stage_count}: ${stageDescription(progress)}`;
         $("next-stage").hidden = !progress.next_stage_ready;
+        $("cook-prompt").textContent = progress.next_stage_prompt || "";
+        $("cook-prompt").hidden = !progress.next_stage_prompt;
       } else {
         $("cook-title").textContent = "Cooking";
         $("cook-stage").textContent = "";
         $("next-stage").hidden = true;
+        $("cook-prompt").hidden = true;
       }
     }
 

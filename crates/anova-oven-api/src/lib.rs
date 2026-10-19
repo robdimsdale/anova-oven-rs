@@ -186,6 +186,11 @@ pub struct CookProgress {
     /// [`next_stage_ready`] is `true`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_stage_description: Option<String>,
+    /// What the next stage tells the user to do before starting it (its
+    /// [`Stage::prompt`]). Present only when [`next_stage_ready`] is `true`
+    /// and the stage has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_stage_prompt: Option<String>,
 }
 
 impl OvenStatus {
@@ -366,6 +371,11 @@ pub struct Stage {
     /// the server acts on it, in local mode only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_off_at_end: Option<bool>,
+    /// A sentence for the user while the oven waits to start this stage
+    /// (`user_action_required`), e.g. "Rotate the pan". Not something the
+    /// oven knows: the server keeps it, in local mode only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
 }
 
 impl Stage {
@@ -612,6 +622,7 @@ mod tests {
             vent_open: None,
             title: Some(title.into()),
             turn_off_at_end: None,
+            prompt: None,
         }
     }
 
@@ -624,6 +635,7 @@ mod tests {
             current_stage_kind: "cook".into(),
             next_stage_ready: false,
             next_stage_description: None,
+            next_stage_prompt: None,
         }
     }
 
@@ -715,6 +727,7 @@ mod tests {
                     vent_open: None,
                     title: None,
                     turn_off_at_end: None,
+                    prompt: None,
                 },
                 Stage {
                     id: None,
@@ -735,6 +748,7 @@ mod tests {
                     vent_open: None,
                     title: None,
                     turn_off_at_end: None,
+                    prompt: None,
                 },
             ],
         };

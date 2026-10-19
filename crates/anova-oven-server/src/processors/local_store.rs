@@ -41,6 +41,10 @@ const HISTORY_LIMIT: usize = 50;
 
 const MANUAL_TITLE: &str = "[manual]";
 
+/// The longest [`Stage::prompt`](anova_oven_api::Stage::prompt): a sentence,
+/// to fit the panels.
+const PROMPT_MAX_CHARS: usize = 100;
+
 /// `active-cook.json`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct ActiveCook {
@@ -629,6 +633,23 @@ pub fn normalize(mut recipe: Recipe) -> Result<Recipe, RecipeError> {
             }
         } else {
             stage.turn_off_at_end = None;
+        }
+        stage.prompt = stage
+            .prompt
+            .take()
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty());
+        if let Some(prompt) = &stage.prompt {
+            if prompt.chars().count() > PROMPT_MAX_CHARS {
+                return invalid(format!(
+                    "stage {n}: the note for when it waits must be at most {PROMPT_MAX_CHARS} characters"
+                ));
+            }
+            if stage.user_action_required != Some(true) {
+                return invalid(format!(
+                    "stage {n}: only a stage that waits for you can have a note for when it waits"
+                ));
+            }
         }
         let elements = [
             stage.heating_element_top,

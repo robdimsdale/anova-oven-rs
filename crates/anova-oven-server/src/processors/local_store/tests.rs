@@ -45,6 +45,7 @@ fn stage(kind: &str) -> Stage {
         vent_open: Some(false),
         title: None,
         turn_off_at_end: None,
+        prompt: None,
     }
 }
 
@@ -474,6 +475,13 @@ fn recipes_the_oven_cant_run_are_refused() {
     off_early.timer_added = Some(true);
     off_early.turn_off_at_end = Some(true);
     assert!(invalid(draft("Off early", vec![off_early, stage("cook")])));
+    let mut chatty = stage("cook");
+    chatty.user_action_required = Some(true);
+    chatty.prompt = Some("x".repeat(101));
+    assert!(invalid(draft("Chatty", vec![chatty])));
+    let mut unprompted = stage("cook");
+    unprompted.prompt = Some("Rotate the pan".into());
+    assert!(invalid(draft("Never waits", vec![unprompted])));
     let mut off_whenever = stage("cook");
     off_whenever.duration_secs = None;
     off_whenever.turn_off_at_end = Some(true);
@@ -557,4 +565,43 @@ fn a_cook_that_turns_off_at_the_end_says_so_on_its_last_stage() {
         assert_eq!(cook.stages[0].turn_off_at_end, None);
         assert_eq!(cook.stages[1].turn_off_at_end, Some(true));
     }
+}
+
+#[test]
+fn a_waiting_stage_keeps_its_prompt_through_the_cook() {
+    let dir = TempDir::new();
+    let files = RecipeFiles::new(&dir.0);
+    let mut waits = stage("cook");
+    waits.user_action_required = Some(true);
+    waits.prompt = Some("  Rotate the pan  ".into());
+    let mut blank = stage("cook");
+    blank.user_action_required = Some(true);
+    blank.prompt = Some(" ".into());
+    let saved = files
+        .create(draft("Roast", vec![stage("cook"), waits, blank]))
+        .unwrap();
+    assert_eq!(saved.stages[1].prompt.as_deref(), Some("Rotate the pan"));
+    assert_eq!(saved.stages[2].prompt, None);
+
+    // Keyed by the IDs the oven reports the stages by.
+    let mut sent = saved.stages.clone();
+    for (i, stage) in sent.iter_mut().enumerate() {
+        stage.id = Some(format!("ios-{i}"));
+    }
+    let mut store = LocalStore::new(dir.0.clone());
+    let extras = crate::runtime::types::CookExtras::from_stages(&sent);
+    store
+        .cook_started("ios-cook", &saved.id, extras, ts("2026-10-15T18:00:00Z"))
+        .unwrap();
+    let mut reported = oven_cook("ios-cook", 300);
+    reported.stages = sent.clone();
+    for stage in &mut reported.stages {
+        stage.prompt = None;
+    }
+    let cook = store
+        .current_cook(Some(&reported), ts("2026-10-15T18:05:00Z"))
+        .unwrap()
+        .unwrap();
+    let prompts: Vec<_> = cook.stages.iter().map(|s| s.prompt.as_deref()).collect();
+    assert_eq!(prompts, [None, Some("Rotate the pan"), None]);
 }

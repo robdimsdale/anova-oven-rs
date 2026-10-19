@@ -919,6 +919,7 @@ mod tests {
             current_stage_kind: String::from("cook"),
             next_stage_ready: false,
             next_stage_description: None,
+            next_stage_prompt: None,
         });
 
         let plan = plan_lcd(

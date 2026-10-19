@@ -307,6 +307,13 @@ fn start(
     from: StartedFrom,
 ) -> (Result<(), SmError>, Vec<SmEffect>) {
     crate::recipe::rewrite_preheat_stage_ids(&mut recipe.stages);
+    // The IDs the oven will report the stages by, which the cook's extras
+    // are kept under.
+    for stage in &mut recipe.stages {
+        stage.id = Some(crate::protocol::stages::normalize_stage_id_for_ws(
+            stage.id.as_deref(),
+        ));
+    }
 
     // Placeholder request-id tracking: the real WS processor will allocate the
     // request id when it serializes the command.
@@ -1173,6 +1180,7 @@ mod tests {
             vent_open: Some(false),
             title: None,
             turn_off_at_end: None,
+            prompt: None,
         }
     }
 
@@ -1803,6 +1811,34 @@ mod tests {
             _ => None,
         });
         assert_eq!(extras.map(|e| e.turn_off_at_end), Some(true));
+    }
+
+    #[test]
+    fn a_start_keeps_prompts_under_the_ids_the_oven_is_sent() {
+        let mut state = local_state();
+        let _ = apply_apo_state(&mut state, oven_status("idle", 0));
+        let mut waits = stage(Some("android-2"), "cook", true, Some(600));
+        waits.prompt = Some("Baste".into());
+        state.recipes = vec![recipe(vec![
+            stage(Some("1"), "cook", false, Some(60)),
+            waits,
+        ])];
+        let (_, effects) = start_cook(&mut state, "r");
+        let Some(WsCommand::SendStart { stages, .. }) = effect_ws(&effects) else {
+            panic!("expected a start");
+        };
+        let ids: Vec<_> = stages.iter().map(|s| s.id.clone().unwrap()).collect();
+        assert_eq!(ids, ["ios-1", "ios-2"]);
+        let prompts = effects.iter().find_map(|e| match e {
+            SmEffect::Store(StoreCommand::PatchCookRecipeRef { extras, .. }) => {
+                Some(extras.prompts.clone())
+            }
+            _ => None,
+        });
+        assert_eq!(
+            prompts,
+            Some([("ios-2".to_string(), "Baste".to_string())].into())
+        );
     }
 
     fn fetched_oven_cook_ids(effects: &[SmEffect]) -> Vec<Option<String>> {

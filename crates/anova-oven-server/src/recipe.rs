@@ -57,6 +57,7 @@ mod tests {
             vent_open: None,
             title: None,
             turn_off_at_end: None,
+            prompt: None,
         }
     }
 

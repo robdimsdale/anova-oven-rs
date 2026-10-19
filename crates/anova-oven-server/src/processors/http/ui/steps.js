@@ -59,6 +59,8 @@ function toStages(steps) {
       const copy = { ...stage };
       if (!copy.timer_added) delete copy.duration_secs;
       if (!copy.probe_added) delete copy.probe_target_c;
+      if (copy.user_action_required && copy.prompt && copy.prompt.trim()) copy.prompt = copy.prompt.trim();
+      else delete copy.prompt;
       stages.push(copy);
     }
   }
@@ -169,6 +171,18 @@ function createStepEditor(container, { name, onChange = () => {} }) {
         ${chosen && chosen[2] ? `<p class="hint choice-hint">${chosen[2]}</p>` : ""}`;
   }
 
+  // A note for the user while the oven waits to start `stage`, under a
+  // "wait for me" choice. `which` says which of step i's stages it is.
+  function promptHtml(stage, i, which) {
+    return `
+        <div class="fields">
+          <label>Note for when it waits (optional)
+            <input data-prompt="${which}" data-step="${i}" value="${escapeHtml(stage.prompt || "")}"
+              maxlength="100" placeholder="e.g. Rotate the pan and baste">
+          </label>
+        </div>`;
+  }
+
   function preheatHtml(step, i) {
     if (!step.cook) {
       return `<p class="hint" style="margin: 16px 0 0;">Preheat only: this stage ends when the oven reaches temperature.</p>`;
@@ -181,6 +195,7 @@ function createStepEditor(container, { name, onChange = () => {} }) {
           ["wait", "Preheat, then wait for me", "The oven heats up, then holds at temperature until you press Next stage, e.g. once the food is in."],
           ["go", "Preheat, then start cooking", "The oven heats up, then starts cooking on its own."],
         ])}
+        ${preheatOf(step) === "wait" ? promptHtml(step.cook, i, "cook") : ""}
       </fieldset>`;
   }
 
@@ -200,6 +215,7 @@ function createStepEditor(container, { name, onChange = () => {} }) {
             ["go", `Go straight on to stage ${i + 1}`],
             ["wait", "Wait for me", `The oven keeps holding stage ${i}'s settings until you press Next stage.`],
           ])}
+          ${wait ? promptHtml(firstStage(steps[i]), i, "first") : ""}
         </fieldset>
       </div>`;
   }
@@ -335,6 +351,15 @@ function createStepEditor(container, { name, onChange = () => {} }) {
       const step = steps[Number(input.closest("[data-between]").dataset.between)];
       firstStage(step).user_action_required = input.value === "wait";
       render();
+      return;
+    }
+
+    // Typed, so only revalidated: a render would lose focus.
+    if (input.hasAttribute("data-prompt")) {
+      const step = steps[Number(input.dataset.step)];
+      const stage = input.dataset.prompt === "cook" ? step.cook : firstStage(step);
+      stage.prompt = input.value.trim() ? input.value : undefined;
+      validate();
       return;
     }
 

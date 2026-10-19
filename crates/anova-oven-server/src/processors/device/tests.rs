@@ -351,6 +351,7 @@ fn start_cmd(request_id: &str) -> WsCommand {
             vent_open: Some(false),
             title: Some("Cook".into()),
             turn_off_at_end: None,
+            prompt: None,
         }],
     }
 }

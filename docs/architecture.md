@@ -157,7 +157,8 @@ types, not every field):
   `activeStageId`, and an optional `cook_progress: Option<CookProgress>`.
 - **`CookProgress`** — server-derived cook progression (recipe title,
   current stage index, total stage count, current/next stage description
-  and kind, `next_stage_ready` flag for manual-advance prompts). Included
+  and kind, `next_stage_ready` flag for manual-advance prompts, and
+  `next_stage_prompt`, the waiting stage's note for the user). Included
   inline on `GET /status` while a cook is active rather than requiring the
   pico to re-decode `CurrentCook` every tick.
 - **`Recipe` + `Stage`** — saved recipe with stages. `Stage` carries
@@ -165,7 +166,9 @@ types, not every field):
   exploration note below), kind, target temperature, optional bulb mode,
   duration, timer/probe flags, probe target, steam %, fan speed,
   `user_action_required`, rack position, heating-element flags, vent,
-  title, and `turn_off_at_end` (last stage only; see below). `Recipe::normalize()` and `Stage::normalize_fan_speed()` enforce
+  title, `turn_off_at_end` (last stage only; see below), and `prompt`: a
+  note of up to 100 characters for while the oven waits to start the stage
+  (only on a stage with `user_action_required`), e.g. "Rotate the pan". `Recipe::normalize()` and `Stage::normalize_fan_speed()` enforce
   Anova's "fan must be 100% with rear heat or steam" rule.
 - **`HistoryEntry`** — recipe title (or `"[manual]"`), `ended_at` (ISO 8601),
   stage count.
@@ -289,8 +292,9 @@ still available.
   - `active-cook.json` — a journal of the cook in flight, keyed by the
     oven's `cookId`: title, recipe ID, start time, when the oven last
     reported it, and what the server does with the cook that the oven
-    doesn't keep (`turn_off_at_end`), laid back over the oven's stages in
-    the current cook. Written on `/start` (or on first sight of a cook started
+    doesn't keep (`turn_off_at_end`, and each stage's `prompt` by the
+    stage ID the oven was sent), laid back over the oven's stages in the
+    current cook. Written on `/start` (or on first sight of a cook started
     from the oven's panel, as `[manual]`), rewritten in place on each report
     of that cook (every 5s while cooking), and removed when the cook goes
     to history. A restart mid-cook keeps the title. The stages come from the
@@ -327,7 +331,11 @@ are always sent as Celsius.
   steps, when the first ends on its own (timer, probe, or a preheat-only
   step at temperature), a radio picks whether the next goes straight on or
   waits for you; it's the next step's first stage's `user_action_required`.
-  The first step's flag isn't shown and is kept as saved. Under the last
+  The first step's flag isn't shown and is kept as saved. Each "wait for
+  you" choice (between steps, or preheat then wait) has an optional note
+  for while it waits: that stage's `prompt`, shown on the status page by
+  Start next stage (and served as `cook_progress.next_stage_prompt` for the
+  panels). Under the last
   step, when it ends on a timer or probe, a radio picks whether the oven
   keeps holding until you press Stop (the oven's own behaviour) or turns off:
   the last stage's `turn_off_at_end`. Each choice has a

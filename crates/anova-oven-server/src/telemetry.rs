@@ -824,6 +824,7 @@ mod tests {
             current_stage_kind: kind.into(),
             next_stage_ready: false,
             next_stage_description: None,
+            next_stage_prompt: None,
         }
     }
 

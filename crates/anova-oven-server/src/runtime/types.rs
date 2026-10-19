@@ -6,6 +6,8 @@
 
 #![allow(dead_code, clippy::enum_variant_names, clippy::large_enum_variant)]
 
+use std::collections::BTreeMap;
+
 use anova_oven_api::{CurrentCook, HistoryEntry, OvenStatus, Recipe, Stage};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
@@ -319,14 +321,22 @@ pub struct CookExtras {
     /// Stop the cook once its last stage ends on its timer or probe.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub turn_off_at_end: bool,
+    /// Each stage's [`Stage::prompt`], by the stage ID the oven was sent.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub prompts: BTreeMap<String, String>,
 }
 
 impl CookExtras {
+    /// From the stages as sent to the oven, IDs and all.
     pub fn from_stages(stages: &[Stage]) -> Self {
         Self {
             turn_off_at_end: stages
                 .last()
                 .is_some_and(|s| s.turn_off_at_end == Some(true)),
+            prompts: stages
+                .iter()
+                .filter_map(|s| Some((s.id.clone()?, s.prompt.clone()?)))
+                .collect(),
         }
     }
 
@@ -334,6 +344,13 @@ impl CookExtras {
     pub fn apply(&self, stages: &mut [Stage]) {
         if let Some(last) = stages.last_mut() {
             last.turn_off_at_end = self.turn_off_at_end.then_some(true);
+        }
+        for stage in stages {
+            stage.prompt = stage
+                .id
+                .as_ref()
+                .and_then(|id| self.prompts.get(id))
+                .cloned();
         }
     }
 }

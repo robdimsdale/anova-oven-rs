@@ -8,7 +8,7 @@
 
 use uuid::Uuid;
 
-fn normalize_stage_id_for_ws(id: Option<&str>) -> String {
+pub fn normalize_stage_id_for_ws(id: Option<&str>) -> String {
     match id {
         Some(raw) if raw.starts_with("ios-") => raw.to_string(),
         Some(raw) if raw.starts_with("android-") => {
@@ -179,6 +179,7 @@ pub fn stage_from_json(s: &serde_json::Value) -> anova_oven_api::Stage {
         vent_open,
         title,
         turn_off_at_end: None,
+        prompt: None,
     }
 }
 
