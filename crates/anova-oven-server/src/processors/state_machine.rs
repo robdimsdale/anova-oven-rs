@@ -11,6 +11,8 @@
 
 #![allow(dead_code)]
 
+use std::time::{Duration, Instant};
+
 use anova_oven_api::{CookProgress, CurrentCook, HistoryEntry, OvenStatus, Recipe, Stage};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tracing::{debug, info, warn};
@@ -42,6 +44,27 @@ pub struct SmState {
     /// oven's own state, sent just before the ack, and the controls Anova's
     /// cloud refused are available.
     pub local: bool,
+    /// Local mode: how far short of its setpoint a preheat may stall and
+    /// still count as reached (see [`settle_preheat`]).
+    pub preheat_tolerance_c: f32,
+    /// The preheat being watched for a stall short of its setpoint.
+    pub preheat_watch: Option<PreheatWatch>,
+}
+
+/// How long a preheat must stay within [`SmState::preheat_tolerance_c`] of
+/// its setpoint before the server treats it as reached: a couple of reports
+/// at the oven's 5s cooking rate, so one noisy sample doesn't end it.
+const PREHEAT_SETTLE_WINDOW: Duration = Duration::from_secs(10);
+
+/// A preheat the server is watching, by the oven's stage ID.
+#[derive(Clone, Debug)]
+pub struct PreheatWatch {
+    stage_id: String,
+    /// When the temperature came within tolerance, while it stays there.
+    near_since: Option<Instant>,
+    /// Treated as reached: the next stage was started, or it waits for the
+    /// user and the cook shows as waiting.
+    reached: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -183,20 +206,8 @@ pub fn reduce_command(state: &mut SmState, cmd: StateMachineCommand) -> CommandO
         StateMachineCommand::Control { request, reply } => {
             let (result, effects) = match control(state, &request) {
                 Ok(control) => {
-                    let request_id = Uuid::new_v4().to_string();
-                    info!(target: "sm", request = ?request, request_id = %request_id, "sending control");
-                    let controls = &mut state.pending.controls;
-                    controls.push((request_id.clone(), request.name()));
-                    if controls.len() > MAX_PENDING_CONTROLS {
-                        controls.remove(0);
-                    }
-                    (
-                        Ok(()),
-                        vec![SmEffect::Ws(WsCommand::Control {
-                            request_id,
-                            control,
-                        })],
-                    )
+                    info!(target: "sm", request = ?request, "sending control");
+                    (Ok(()), vec![send_control(state, request.name(), control)])
                 }
                 Err(e) => (Err(e), Vec::new()),
             };
@@ -408,6 +419,21 @@ fn control(state: &SmState, request: &ControlRequest) -> Result<OvenControl, SmE
     }
 }
 
+/// Send `control` to the oven, tracked under `name` until it's acked.
+fn send_control(state: &mut SmState, name: &'static str, control: OvenControl) -> SmEffect {
+    let request_id = Uuid::new_v4().to_string();
+    debug!(target: "sm", request_id = %request_id, control = name, "control sent");
+    let controls = &mut state.pending.controls;
+    controls.push((request_id.clone(), name));
+    if controls.len() > MAX_PENDING_CONTROLS {
+        controls.remove(0);
+    }
+    SmEffect::Ws(WsCommand::Control {
+        request_id,
+        control,
+    })
+}
+
 fn update_cook_stages(raw: &[serde_json::Value]) -> OvenControl {
     OvenControl::UpdateCookStages {
         stages: raw
@@ -479,7 +505,10 @@ fn reduce_ws_event(state: &mut SmState, event: WsEvent) -> Vec<SmEffect> {
                 })
             });
             state.oven_cook = cook;
+            let mut status = status;
+            let settled = settle_preheat(state, &mut status, Instant::now());
             let mut effects = apply_apo_state(state, status);
+            effects.extend(settled);
             if let Some(report) = report {
                 effects.insert(0, report);
             }
@@ -583,6 +612,89 @@ fn apply_apo_state(state: &mut SmState, status: OvenStatus) -> Vec<SmEffect> {
     state.status = Some(status);
     effects.push(SmEffect::PublishReadModel);
     effects
+}
+
+/// Local mode: treat a preheat that has stalled just short of its setpoint
+/// as reached. The oven ends a preheat only at the setpoint itself, and at
+/// low temperatures (90°F for proofing) its controller can settle a degree
+/// or two below and stay there. Once the temperature has been within
+/// [`SmState::preheat_tolerance_c`] for [`PREHEAT_SETTLE_WINDOW`], the
+/// server does what the oven would have: starts the next stage, or, when
+/// that stage waits for the user, sets `stage_transition_pending_user_action`
+/// on `status` (and every later report of this preheat) so the cook shows as
+/// waiting. The oven keeps heating towards the setpoint meanwhile.
+///
+/// A preheat with no stage after it is left to the oven.
+fn settle_preheat(state: &mut SmState, status: &mut OvenStatus, now: Instant) -> Vec<SmEffect> {
+    let preheat = match (&state.oven_cook, status.active_stage_index) {
+        (Some(cook), Some(i)) if state.local && status.is_cooking() => cook
+            .stages
+            .get(i)
+            .filter(|s| s.kind == "preheat")
+            .zip(cook.stages.get(i + 1))
+            .and_then(|(preheat, next)| Some((preheat.id.clone()?, preheat.temperature_c, next))),
+        _ => None,
+    };
+    let Some((stage_id, target, next)) = preheat else {
+        state.preheat_watch = None;
+        return Vec::new();
+    };
+    let next_waits = next.user_action_required == Some(true);
+    let next_id = next.id.clone();
+
+    let watch = match &mut state.preheat_watch {
+        Some(w) if w.stage_id == stage_id => w,
+        slot => slot.insert(PreheatWatch {
+            stage_id,
+            near_since: None,
+            reached: false,
+        }),
+    };
+    // The oven got there itself.
+    if status.stage_transition_pending_user_action {
+        watch.reached = true;
+        return Vec::new();
+    }
+    if watch.reached {
+        if next_waits {
+            status.stage_transition_pending_user_action = true;
+        }
+        return Vec::new();
+    }
+
+    let current = status.current_temperature_c();
+    if current < target - state.preheat_tolerance_c {
+        watch.near_since = None;
+        return Vec::new();
+    }
+    let since = *watch.near_since.get_or_insert(now);
+    if now.duration_since(since) < PREHEAT_SETTLE_WINDOW {
+        return Vec::new();
+    }
+    watch.reached = true;
+    info!(
+        target: "sm",
+        stage_id = %watch.stage_id,
+        current,
+        target,
+        next_waits,
+        "preheat settled within tolerance; treating it as reached"
+    );
+    if next_waits {
+        status.stage_transition_pending_user_action = true;
+        return Vec::new();
+    }
+    match next_id {
+        Some(stage_id) => vec![send_control(
+            state,
+            "next_stage",
+            OvenControl::StartStage { stage_id },
+        )],
+        None => {
+            warn!(target: "sm", "the stage after the preheat has no id; leaving it to the oven");
+            Vec::new()
+        }
+    }
 }
 
 fn apply_command_ack(state: &mut SmState, request_id: &str, status: &str) -> Vec<SmEffect> {
@@ -834,6 +946,7 @@ pub struct StateMachineProcessor {
 }
 
 impl StateMachineProcessor {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         cmd_rx: mpsc::Receiver<StateMachineCommand>,
         evt_rx: mpsc::Receiver<StateMachineEvent>,
@@ -842,6 +955,7 @@ impl StateMachineProcessor {
         read_model_tx: watch::Sender<ReadModel>,
         failures_tx: broadcast::Sender<CommandFailure>,
         local: bool,
+        preheat_tolerance_c: f32,
     ) -> Self {
         Self {
             cmd_rx,
@@ -852,6 +966,7 @@ impl StateMachineProcessor {
             failures_tx,
             state: SmState {
                 local,
+                preheat_tolerance_c,
                 ..SmState::new()
             },
         }
@@ -1402,6 +1517,99 @@ mod tests {
         // The timer the oven shows during a preheat is the next stage's.
         assert_eq!(stages[1]["timer"]["initial"], 90);
         assert_eq!(stages[0]["timer"]["initial"], 600);
+    }
+
+    /// A local-mode state preheating to 32 °C, with a 2 °F tolerance, before
+    /// a cook stage that waits for the user or not.
+    fn preheating(next_waits: bool) -> SmState {
+        let mut preheat = stage(Some("c-preheat"), "preheat", false, None);
+        preheat.temperature_c = 32.0;
+        let mut state = local_state();
+        state.preheat_tolerance_c = 2.0 / 1.8;
+        state.oven_cook = Some(OvenCook {
+            cook_id: "c".into(),
+            stages: vec![preheat, stage(Some("c"), "cook", next_waits, Some(600))],
+            raw_stages: Vec::new(),
+            seconds_elapsed: 0,
+        });
+        state
+    }
+
+    fn preheat_report(celsius: f32) -> OvenStatus {
+        let mut status = oven_status("cook", 0);
+        status.active_stage_index = Some(0);
+        status.temperature_c = celsius;
+        status
+    }
+
+    fn started_stage(effects: &[SmEffect]) -> Option<&str> {
+        match effect_ws(effects) {
+            Some(WsCommand::Control {
+                control: OvenControl::StartStage { stage_id },
+                ..
+            }) => Some(stage_id),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_preheat_stalled_within_tolerance_starts_the_next_stage() {
+        let mut state = preheating(false);
+        let t0 = Instant::now();
+        let mut at = |secs, celsius| {
+            let mut status = preheat_report(celsius);
+            settle_preheat(&mut state, &mut status, t0 + Duration::from_secs(secs))
+        };
+        assert!(at(0, 31.0).is_empty());
+        assert!(at(5, 31.2).is_empty());
+        assert_eq!(started_stage(&at(10, 31.1)), Some("c"));
+        // Once only.
+        assert!(at(15, 31.1).is_empty());
+    }
+
+    #[test]
+    fn a_preheat_still_short_of_the_tolerance_is_left_alone() {
+        let mut state = preheating(false);
+        let t0 = Instant::now();
+        let mut at = |secs, celsius| {
+            let mut status = preheat_report(celsius);
+            settle_preheat(&mut state, &mut status, t0 + Duration::from_secs(secs))
+        };
+        assert!(at(0, 31.0).is_empty());
+        // Dropping out of the band restarts the window.
+        assert!(at(5, 30.5).is_empty());
+        assert!(at(10, 31.0).is_empty());
+        assert!(at(15, 31.0).is_empty());
+        assert_eq!(started_stage(&at(20, 31.0)), Some("c"));
+    }
+
+    #[test]
+    fn a_settled_preheat_before_a_waiting_stage_shows_as_waiting() {
+        let mut state = preheating(true);
+        let t0 = Instant::now();
+        let mut at = |secs, celsius| {
+            let mut status = preheat_report(celsius);
+            let effects = settle_preheat(&mut state, &mut status, t0 + Duration::from_secs(secs));
+            assert!(effects.is_empty(), "the user starts a waiting stage");
+            status.stage_transition_pending_user_action
+        };
+        assert!(!at(0, 31.0));
+        assert!(at(10, 31.0));
+        // For as long as the oven stays on the preheat, even if it dips.
+        assert!(at(15, 29.0));
+    }
+
+    #[test]
+    fn preheats_are_left_to_the_oven_in_cloud_mode() {
+        let mut state = preheating(false);
+        state.local = false;
+        let t0 = Instant::now();
+        for secs in [0, 10, 20] {
+            let mut status = preheat_report(31.5);
+            assert!(
+                settle_preheat(&mut state, &mut status, t0 + Duration::from_secs(secs)).is_empty()
+            );
+        }
     }
 
     fn fetched_oven_cook_ids(effects: &[SmEffect]) -> Vec<Option<String>> {

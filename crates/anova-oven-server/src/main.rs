@@ -50,6 +50,7 @@ const DEFAULT_WS_READ_TIMEOUT_SECS: u64 = 1200;
 const DEFAULT_LOCAL_READ_TIMEOUT_SECS: u64 = 90;
 const DEFAULT_HEALTHCHECK_INTERVAL_SECS: u64 = 10;
 const DEFAULT_DATA_DIR: &str = "anova-oven-data";
+const DEFAULT_PREHEAT_TOLERANCE_F: f32 = 2.0;
 
 /// `ANOVA_MODE`: whether the server is a client of Anova's cloud or stands in
 /// for it.
@@ -84,6 +85,28 @@ fn env_duration_secs(var: &str, default_secs: u64) -> Duration {
         },
         Err(_) => Duration::from_secs(default_secs),
     }
+}
+
+/// `ANOVA_PREHEAT_TOLERANCE_F`: how far short of its setpoint, in °F, a
+/// preheat may stall and still count as reached. Returned in °C.
+fn preheat_tolerance_c_from_env() -> f32 {
+    const VAR: &str = "ANOVA_PREHEAT_TOLERANCE_F";
+    let fahrenheit = match std::env::var(VAR) {
+        Ok(value) => match value.parse::<f32>() {
+            Ok(f) if f >= 0.0 && f.is_finite() => f,
+            _ => {
+                warn!(
+                    env_var = VAR,
+                    value = %value,
+                    default = DEFAULT_PREHEAT_TOLERANCE_F,
+                    "Invalid tolerance; using default"
+                );
+                DEFAULT_PREHEAT_TOLERANCE_F
+            }
+        },
+        Err(_) => DEFAULT_PREHEAT_TOLERANCE_F,
+    };
+    fahrenheit / 1.8
 }
 
 fn init_tracing() -> WorkerGuard {
@@ -242,6 +265,7 @@ async fn main() {
         },
     );
     let liveness = std::sync::Arc::new(liveness::Liveness::new(ws_read_timeout.as_secs()));
+    let preheat_tolerance_c = preheat_tolerance_c_from_env();
 
     let (sm_cmd_tx, sm_cmd_rx) = mpsc::channel::<StateMachineCommand>(64);
     let (sm_evt_tx, sm_evt_rx) = mpsc::channel::<StateMachineEvent>(256);
@@ -317,6 +341,7 @@ async fn main() {
         read_model_tx.clone(),
         failures_tx.clone(),
         mode == Mode::Local,
+        preheat_tolerance_c,
     );
     spawn_critical("state-machine", state_machine.run());
 
@@ -342,7 +367,8 @@ async fn main() {
         cook_timeline.clone(),
     ));
 
-    let cook_progress_task = CookProgressTask::new(cook_progress_tx, mode == Mode::Local);
+    let cook_progress_task =
+        CookProgressTask::new(cook_progress_tx, mode == Mode::Local, preheat_tolerance_c);
     spawn_critical(
         "cook-progress",
         cook_progress_task.run(status_rx, current_cook_rx, cook_progress_msg_rx),

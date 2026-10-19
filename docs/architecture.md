@@ -270,6 +270,15 @@ still available.
   usable the requests go unanswered, which the oven tolerates.
 - `ANOVA_HEALTHCHECK_INTERVAL_SECS` — `CMD_APO_HEALTHCHECK` cadence
   (default `10`, as the real cloud does)
+- `ANOVA_PREHEAT_TOLERANCE_F` — how far short of its setpoint, in °F, a
+  preheat may stall and still count as reached (default `2`). The oven only
+  ends a preheat at the setpoint itself, and at low temperatures its
+  controller can settle a degree or two below and stay there. After 10s
+  within the tolerance the server starts the next stage itself, or, when
+  that stage waits for the user, reports the cook as waiting
+  (`stage_transition_pending_user_action`) while the oven keeps heating.
+  `0` leaves preheats to the oven. Cloud mode's progress tracker uses the
+  same tolerance to call a preheat done.
 - `ANOVA_DATA_DIR` — where the local store keeps its files (default
   `anova-oven-data`, relative to the working directory):
   - `recipes/*.json` — one `Recipe` per file, as `GET /recipes` serves
