@@ -410,7 +410,7 @@
     "step": 1,
     "unique_id": "anova_oven_set_timer",
     "unit_of_measurement": "min",
-    "value_template": "{{ (value_json.timer_total_secs / 60) | round(0) | int }}"
+    "value_template": "{% set s = value_json.timer_total_secs %}{{ [(s / 60) | round(0) | int, 1] | max if s else 'None' }}"
   },
   "homeassistant/select/anova_oven/recipe/config": {
     "availability": [

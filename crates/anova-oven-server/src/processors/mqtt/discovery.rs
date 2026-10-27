@@ -436,7 +436,9 @@ fn entities(topics: &Topics, options: &[String]) -> Vec<Entity> {
                 "command_topic": topics.command("timer"),
                 "command_template": "{{ (value * 60) | int }}",
                 "state_topic": topics.state(),
-                "value_template": "{{ (value_json.timer_total_secs / 60) | round(0) | int }}",
+                // No timer reads as 0, below min, which HA would log on every
+                // state message; HA's payload_reset ("None") makes it unknown.
+                "value_template": "{% set s = value_json.timer_total_secs %}{{ [(s / 60) | round(0) | int, 1] | max if s else 'None' }}",
                 "min": 1,
                 "max": 1440,
                 "step": 1,
