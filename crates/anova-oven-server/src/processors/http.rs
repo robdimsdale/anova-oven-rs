@@ -711,6 +711,7 @@ async fn handle_save_current_cook(
     let mut stages = cook.stages;
     for stage in &mut stages {
         stage.id = None;
+        crate::protocol::stages::restore_end_flags(stage);
     }
     let recipe = match files.create(RecipeDraft { title, stages }) {
         Ok(recipe) => recipe,

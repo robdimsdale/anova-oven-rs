@@ -297,6 +297,22 @@ pub fn start_stages_json(stages: &[anova_oven_api::Stage]) -> Vec<serde_json::Va
         .collect()
 }
 
+/// Restore the `timer_added`/`probe_added` flags of a stage the oven
+/// reported. It echoes back the `timer` or `temperatureProbe` it was sent but
+/// not the flags, so they're read back the way [`start_stages_json`] chose
+/// them: a timer if there's a duration, else a probe if there's a target.
+/// Flags already present, and preheat stages (which end at temperature),
+/// are left alone.
+pub fn restore_end_flags(stage: &mut anova_oven_api::Stage) {
+    if stage.kind == "preheat" || stage.timer_added.is_some() || stage.probe_added.is_some() {
+        return;
+    }
+    let timer = stage.duration_secs.is_some_and(|d| d > 0);
+    let probe = !timer && stage.probe_target_c.is_some();
+    stage.timer_added = Some(timer);
+    stage.probe_added = Some(probe);
+}
+
 /// The `stages` list of a `CMD_APO_UPDATE_COOK_STAGES` payload. The stage
 /// whose ID matches `active_stage_id` is marked `manual`.
 #[cfg_attr(not(test), allow(dead_code))] // Used once stage advance lands (Phase 4).
@@ -339,7 +355,7 @@ pub fn update_cook_stages_json(
 
 #[cfg(test)]
 mod tests {
-    use super::setpoint_celsius;
+    use super::{restore_end_flags, setpoint_celsius, stage_from_json};
 
     #[test]
     fn a_fahrenheit_setpoint_keeps_its_precision() {
@@ -355,5 +371,36 @@ mod tests {
         );
         let odd = serde_json::json!({ "celsius": 180, "fahrenheit": 400 });
         assert_eq!(setpoint_celsius(&odd), Some(180.0));
+    }
+
+    #[test]
+    fn a_reported_stage_gets_back_the_end_it_was_sent_with() {
+        let mut timed = stage_from_json(&serde_json::json!({
+            "type": "cook",
+            "timer": { "initial": 600 },
+            "temperatureProbe": { "setpoint": { "celsius": 60 } },
+        }));
+        restore_end_flags(&mut timed);
+        assert_eq!(
+            (timed.timer_added, timed.probe_added),
+            (Some(true), Some(false))
+        );
+
+        let mut probed = stage_from_json(&serde_json::json!({
+            "type": "cook",
+            "temperatureProbe": { "setpoint": { "celsius": 60 } },
+        }));
+        restore_end_flags(&mut probed);
+        assert_eq!(
+            (probed.timer_added, probed.probe_added),
+            (Some(false), Some(true))
+        );
+
+        let mut preheat = stage_from_json(&serde_json::json!({
+            "type": "preheat",
+            "temperatureProbe": { "setpoint": { "celsius": 60 } },
+        }));
+        restore_end_flags(&mut preheat);
+        assert_eq!((preheat.timer_added, preheat.probe_added), (None, None));
     }
 }
