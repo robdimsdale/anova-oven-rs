@@ -605,3 +605,36 @@ fn a_waiting_stage_keeps_its_prompt_through_the_cook() {
     let prompts: Vec<_> = cook.stages.iter().map(|s| s.prompt.as_deref()).collect();
     assert_eq!(prompts, [None, Some("Rotate the pan"), None]);
 }
+
+#[test]
+fn a_cook_saved_as_a_recipe_goes_to_history_under_it() {
+    let dir = TempDir::new();
+    let mut store = LocalStore::new(dir.0.clone());
+    store
+        .journal_start(
+            "ios-m",
+            None,
+            MANUAL_TITLE.into(),
+            1,
+            Default::default(),
+            ts("2026-10-15T18:00:00Z"),
+        )
+        .unwrap();
+    store
+        .oven_reported(Some(&oven_cook("ios-m", 60)), ts("2026-10-15T18:01:00Z"))
+        .unwrap();
+
+    store.link_cook("r9".into(), "Sunday roast".into()).unwrap();
+    let cook = store
+        .current_cook(Some(&oven_cook("ios-m", 120)), ts("2026-10-15T18:02:00Z"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(cook.recipe_id.as_deref(), Some("r9"));
+    assert_eq!(cook.recipe_title, "Sunday roast");
+    assert_eq!(cook.started_at, "2026-10-15T18:00:00Z");
+
+    store
+        .oven_reported(None, ts("2026-10-15T18:10:00Z"))
+        .unwrap();
+    assert_eq!(store.history().unwrap()[0].recipe_title, "Sunday roast");
+}

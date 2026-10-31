@@ -206,6 +206,14 @@ pub fn reduce_command(state: &mut SmState, cmd: StateMachineCommand) -> CommandO
             let (result, effects) = stop_cook(state);
             CommandOutcome::reply_unit_with_effects(reply, result, effects)
         }
+        StateMachineCommand::LinkCurrentCook {
+            recipe_id,
+            title,
+            reply,
+        } => {
+            let (result, effects) = link_current_cook(state, recipe_id, title);
+            CommandOutcome::reply_unit_with_effects(reply, result, effects)
+        }
         StateMachineCommand::Control { request, reply } => {
             let (result, effects) = match control(state, &request) {
                 Ok(control) => {
@@ -261,6 +269,23 @@ fn fetch_current_cook(state: &SmState, reason: CurrentCookReason) -> SmEffect {
 }
 
 // ─── Client-command transitions ──────────────────────────────────────────────
+
+fn link_current_cook(
+    state: &mut SmState,
+    recipe_id: String,
+    title: String,
+) -> (Result<(), SmError>, Vec<SmEffect>) {
+    let Some(cook) = state.current_cook.as_mut() else {
+        return (Err(SmError::NotCooking), Vec::new());
+    };
+    cook.recipe_id = Some(recipe_id.clone());
+    cook.recipe_title = title.clone();
+    let effects = vec![
+        SmEffect::Store(StoreCommand::LinkCookToRecipe { recipe_id, title }),
+        SmEffect::PublishReadModel,
+    ];
+    (Ok(()), effects)
+}
 
 fn start_cook(state: &mut SmState, recipe_id: &str) -> (Result<(), SmError>, Vec<SmEffect>) {
     // Guardrails: connected + known cooker id + recipe resolvable.
@@ -1278,6 +1303,30 @@ mod tests {
     fn stop_rejects_when_idle() {
         let mut state = SmState::new();
         let (result, effects) = stop_cook(&mut state);
+        assert!(matches!(result, Err(SmError::NotCooking)));
+        assert!(effects.is_empty());
+    }
+
+    // A cook saved as a recipe becomes that recipe's, here and in the store.
+    #[test]
+    fn linking_the_cook_names_it_after_its_saved_recipe() {
+        let mut state = SmState::new();
+        state.current_cook = Some(cook(vec![stage(Some("s1"), "cook", false, None)]));
+        let (result, effects) = link_current_cook(&mut state, "r9".into(), "Sunday roast".into());
+        assert!(result.is_ok());
+        let cook = state.current_cook.as_ref().unwrap();
+        assert_eq!(cook.recipe_id.as_deref(), Some("r9"));
+        assert_eq!(cook.recipe_title, "Sunday roast");
+        assert!(matches!(
+            store_cmds(&effects)[..],
+            [StoreCommand::LinkCookToRecipe { recipe_id, .. }] if recipe_id == "r9"
+        ));
+    }
+
+    #[test]
+    fn linking_rejects_when_idle() {
+        let mut state = SmState::new();
+        let (result, effects) = link_current_cook(&mut state, "r9".into(), "Sunday roast".into());
         assert!(matches!(result, Err(SmError::NotCooking)));
         assert!(effects.is_empty());
     }

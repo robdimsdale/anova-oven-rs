@@ -80,6 +80,13 @@ pub enum StateMachineCommand {
     StopCook {
         reply: oneshot::Sender<Result<(), SmError>>,
     },
+    /// The running cook was just saved as recipe `recipe_id`: it's that
+    /// recipe's cook from now on.
+    LinkCurrentCook {
+        recipe_id: String,
+        title: String,
+        reply: oneshot::Sender<Result<(), SmError>>,
+    },
     /// A control the cloud refused or never offered; local mode only.
     Control {
         request: ControlRequest,
@@ -309,6 +316,13 @@ pub enum StoreCommand {
     },
     ResolveManualCookTitle {
         cook: CurrentCook,
+    },
+    /// The cook in flight was saved as recipe `recipe_id`. The local store
+    /// journals it as that recipe's cook; Firestore ignores it, since saving
+    /// is local mode only.
+    LinkCookToRecipe {
+        recipe_id: String,
+        title: String,
     },
 }
 

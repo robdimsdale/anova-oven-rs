@@ -25,6 +25,7 @@ Target capabilities:
 │  ├── POST /api/update-recipes → refresh + return list    │
 │  ├── GET  /api/history        → cook history JSON        │
 │  ├── GET  /api/current-cook   → in-progress cook or 204  │
+│  ├── POST /api/current-cook/save → save cook as recipe   │
 │  ├── POST /api/start          → start cook from recipe   │
 │  ├── POST /api/stop           → CMD_APO_STOP             │
 │  └── …controls (local mode)                              │
@@ -521,6 +522,16 @@ without the prefix: `GET /status` is `GET /api/status`. (The pico's own
                           where recipes are Anova's.
 - `GET /history`        — cached cook history with resolved titles.
 - `GET /current-cook`   — `CurrentCook` JSON, or 204 if none in progress.
+                          Adds `can_save`: in local mode, whether the cook
+                          isn't from a recipe that's still saved.
+- `POST /current-cook/save` — body `{ "title": "..." }` (optional; the
+                          cook's title by default). Saves the running cook's
+                          stages as a new recipe (`201` with it), and makes
+                          the cook that recipe's, so it goes to history
+                          under its title. `409` if the cook's recipe is
+                          already saved or nothing is cooking, `422` if the
+                          stages don't pass the recipe checks, `501` in
+                          cloud mode.
 - `POST /start`         — body `{ "recipe_id": "..." }`, or a manual cook
                           `{ "title": "...", "stages": [Stage] }` (title
                           optional, "Manual cook" by default; the stages

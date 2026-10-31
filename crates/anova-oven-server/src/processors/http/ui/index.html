@@ -48,6 +48,7 @@
       <p id="cook-prompt" style="margin: 10px 0 0;" hidden></p>
       <div class="row" style="margin-top: 14px;">
         <button id="next-stage" class="primary" hidden>Start next stage</button>
+        <button id="save-recipe" hidden>Save as recipe</button>
         <button id="stop" class="danger">Stop cook</button>
       </div>
     </section>
@@ -126,17 +127,22 @@
         $("next-stage").hidden = !progress.next_stage_ready;
         $("cook-prompt").textContent = progress.next_stage_prompt || "";
         $("cook-prompt").hidden = !progress.next_stage_prompt;
+        $("save-recipe").hidden = !cookCanSave;
       } else {
         $("cook-title").textContent = "Cooking";
         $("cook-stage").textContent = "";
         $("next-stage").hidden = true;
         $("cook-prompt").hidden = true;
+        $("save-recipe").hidden = !cookCanSave;
       }
     }
 
     // The running cook's stages, for describing the current one in the
     // unit on screen. (The server's own description is in Celsius.)
     let cookStages = null;
+    // Whether the running cook isn't a saved recipe and can be saved as one.
+    let cookCanSave = false;
+    let cookTitle = null;
 
     function stageDescription(progress) {
       const stage = cookStages && cookStages[progress.current_stage_index];
@@ -153,11 +159,15 @@
           try {
             const cook = await api("GET", "/current-cook");
             cookStages = cook ? cook.stages : null;
+            cookCanSave = !!(cook && cook.can_save);
+            cookTitle = cook ? cook.recipe_title : null;
           } catch (_) {
             cookStages = null;
+            cookCanSave = false;
           }
         } else {
           cookStages = null;
+          cookCanSave = false;
         }
         if (message.dataset.fromPoll) {
           clearMessage(message);
@@ -204,6 +214,26 @@
     $("lamp-on").onclick = () => act("/lamp", { on: true });
     $("lamp-off").onclick = () => act("/lamp", { on: false });
     $("next-stage").onclick = () => act("/next-stage");
+    $("save-recipe").onclick = async () => {
+      const suggested = cookTitle && cookTitle !== "[manual]" ? cookTitle : "";
+      const title = prompt("Save this cook as a recipe called:", suggested);
+      if (title === null) return;
+      if (!title.trim()) {
+        showMessage(message, "Give the recipe a title");
+        return;
+      }
+      clearMessage(message);
+      try {
+        const recipe = await api("POST", "/current-cook/save", { title });
+        cookCanSave = false;
+        render();
+        message.className = "message ok";
+        message.innerHTML = `Saved <a href="/recipes/${encodeURIComponent(recipe.id)}">${escapeHtml(recipe.title)}</a>`;
+        setTimeout(poll, 800);
+      } catch (e) {
+        showMessage(message, e.message);
+      }
+    };
     $("stop").onclick = () => {
       if (confirm("Stop the cook?")) act("/stop");
     };

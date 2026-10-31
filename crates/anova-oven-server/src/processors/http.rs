@@ -63,6 +63,10 @@ pub(crate) fn router(state: HttpState) -> Router {
         .route("/lamp", routing::post(handle_lamp))
         .route("/temperature-unit", routing::post(handle_temperature_unit))
         .route("/current-cook", routing::get(handle_current_cook))
+        .route(
+            "/current-cook/save",
+            routing::post(handle_save_current_cook),
+        )
         .route("/health", routing::get(handle_health));
     Router::new()
         .nest("/api", api)
@@ -624,25 +628,111 @@ async fn recipe_progress_seed(
     }
 }
 
-async fn handle_current_cook(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
+/// `GET /current-cook`: the cook, and whether it can be saved as a recipe.
+#[derive(Serialize)]
+struct CurrentCookResponse {
+    #[serde(flatten)]
+    cook: anova_oven_api::CurrentCook,
+    /// Not from a saved recipe (or from one since deleted), in local mode.
+    can_save: bool,
+}
+
+async fn handle_current_cook(State(state): State<Arc<HttpState>>) -> Response {
+    match current_cook(&state, "GET /current-cook").await {
+        Ok(Some(cook)) => {
+            let can_save = match &state.recipe_files {
+                Some(files) => !is_saved(files, &cook),
+                None => false,
+            };
+            json_response(StatusCode::OK, &CurrentCookResponse { cook, can_save })
+        }
+        Ok(None) => empty_response(StatusCode::NO_CONTENT),
+        Err(err) => map_sm_error(err),
+    }
+}
+
+async fn current_cook(
+    state: &HttpState,
+    route: &str,
+) -> Result<Option<anova_oven_api::CurrentCook>, SmError> {
     let (reply_tx, reply_rx) = oneshot::channel();
     if let Err(msg) = send_cmd(
-        &state,
+        state,
         StateMachineCommand::GetCurrentCook { reply: reply_tx },
     )
     .await
     {
-        warn!("[http] GET /current-cook -> INTERNAL_SERVER_ERROR ({msg})");
-        return text_response(StatusCode::INTERNAL_SERVER_ERROR, msg);
+        warn!("[http] {route} -> INTERNAL_SERVER_ERROR ({msg})");
+        return Err(SmError::Internal(msg.into()));
     }
+    reply_rx
+        .await
+        .unwrap_or_else(|_| Err(SmError::Internal("State machine dropped reply".into())))
+}
 
-    match reply_rx.await {
-        Ok(Ok(Some(cook))) => json_response(StatusCode::OK, &cook),
-        Ok(Ok(None)) => empty_response(StatusCode::NO_CONTENT),
-        Ok(Err(err)) => map_sm_error(err),
-        Err(_) => text_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "State machine dropped reply",
-        ),
+/// Whether `cook` is from a recipe that's still in the files. A read error
+/// counts as saved, so it isn't offered for saving again.
+fn is_saved(files: &RecipeFiles, cook: &anova_oven_api::CurrentCook) -> bool {
+    match &cook.recipe_id {
+        Some(id) => !matches!(files.get(id), Ok(None)),
+        None => false,
     }
+}
+
+#[derive(Deserialize)]
+struct SaveCurrentCookRequest {
+    #[serde(default)]
+    title: Option<String>,
+}
+
+/// `POST /current-cook/save`: save the running cook's stages as a new
+/// recipe, and make the cook that recipe's. `201` with the recipe.
+async fn handle_save_current_cook(
+    State(state): State<Arc<HttpState>>,
+    Json(req): Json<SaveCurrentCookRequest>,
+) -> Response {
+    let Some(files) = &state.recipe_files else {
+        return recipes_read_only();
+    };
+    let cook = match current_cook(&state, "POST /current-cook/save").await {
+        Ok(Some(cook)) => cook,
+        Ok(None) => return map_sm_error(SmError::NotCooking),
+        Err(err) => return map_sm_error(err),
+    };
+    if is_saved(files, &cook) {
+        return text_response(StatusCode::CONFLICT, "this cook's recipe is already saved");
+    }
+    let title = req
+        .title
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or_else(|| cook.display_name().to_string());
+    // Fresh IDs: the oven's are this cook's, and a preheat's is derived
+    // from the stage after it when the recipe starts.
+    let mut stages = cook.stages;
+    for stage in &mut stages {
+        stage.id = None;
+    }
+    let recipe = match files.create(RecipeDraft { title, stages }) {
+        Ok(recipe) => recipe,
+        Err(e) => return recipe_error(e),
+    };
+    info!(id = %recipe.id, title = %recipe.title, "[http] POST /current-cook/save -> CREATED");
+    refresh_recipes(&state).await;
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let cmd = StateMachineCommand::LinkCurrentCook {
+        recipe_id: recipe.id.clone(),
+        title: recipe.title.clone(),
+        reply: reply_tx,
+    };
+    // The recipe is saved either way; the cook just isn't known to be it.
+    match send_cmd(&state, cmd).await {
+        Ok(()) => {
+            if let Ok(Err(err)) = reply_rx.await {
+                warn!(error = %err, "[http] couldn't link the cook to its saved recipe");
+            }
+        }
+        Err(msg) => warn!("[http] couldn't link the cook to its saved recipe ({msg})"),
+    }
+    json_response(StatusCode::CREATED, &recipe)
 }

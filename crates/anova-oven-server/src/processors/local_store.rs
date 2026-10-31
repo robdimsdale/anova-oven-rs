@@ -151,6 +151,12 @@ impl LocalStore {
                     }
                 };
             }
+            StoreCommand::LinkCookToRecipe { recipe_id, title } => {
+                if let Err(e) = self.link_cook(recipe_id, title) {
+                    warn!(error = %e, "[store] couldn't link the cook to its saved recipe");
+                }
+                return Vec::new();
+            }
             // Titles of manual cooks are only known to Anova's cloud.
             StoreCommand::ResolveManualCookTitle { cook: _ } => {
                 StoreEvent::ManualCookTitleResolved {
@@ -260,6 +266,17 @@ impl LocalStore {
             extras,
         })?;
         Ok(recorded)
+    }
+
+    /// The cook in the journal was saved as recipe `recipe_id`: journal it
+    /// as that recipe's cook, so it goes to history under its title.
+    fn link_cook(&self, recipe_id: String, title: String) -> Result<(), StoreError> {
+        let Some(mut active) = self.read_active_cook() else {
+            return Ok(());
+        };
+        active.recipe_id = Some(recipe_id);
+        active.recipe_title = title;
+        self.write_active_cook(&active)
     }
 
     /// Reconcile the journal with an oven report. Returns whether a cook went
