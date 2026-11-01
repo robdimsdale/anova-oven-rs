@@ -417,9 +417,17 @@ cargo run -p anova-oven-server
   `availability` (last-will), `state` (the `/status` JSON plus `connected`,
   `phase`, `recipe_title`, `timer_remaining_secs`, `stage_ends_at`),
   `next_stage/availability`, `recipes`, `recipe/selected` and its
-  `/attributes`, `event` (milestones, not retained) and `cmd/<name>`
-  (`start`, `stop`, `select_recipe`, and in local mode `next_stage`,
-  `lamp`, `timer`, `temperature`). Milestones (`cook_started`,
+  `/attributes`, `manual` (the manual cook being set up), `event`
+  (milestones, not retained) and `cmd/<name>` (`start`, `stop`,
+  `select_recipe`, `start_manual`, `manual/<field>`, and in local mode
+  `next_stage`, `lamp`, `timer`, `temperature`). A manual cook from Home
+  Assistant is one step, as the web UI's stage editor makes one (a cook
+  stage, optionally led by a preheat): its fields are number and select
+  entities over a draft the server keeps in memory (`mqtt::manual`), with a
+  sensor showing the summary and any `problem`, and the Start manual cook
+  button sends it through `StartManualCook`, checked by the same
+  `local_store::normalize` as `POST /start`. `cmd/start_manual` also takes
+  `{"title", "stages"}` for a cook given in full. Milestones (`cook_started`,
   `preheat_done`, `stage_started`, `stage_waiting`, `cook_done`,
   `cook_stopped`, `oven_lost`) are a pure function of successive snapshots
   in `mqtt::milestones`, keyed by the oven's `cookId`; the first snapshot
@@ -607,8 +615,8 @@ a staleness signal.
                                (recipes, history, current cook)
 - `src/processors/mqtt.rs`   — Home Assistant over MQTT (connection,
                                retained state, commands); `mqtt/discovery.rs`,
-                               `mqtt/milestones.rs`, `mqtt/recipes.rs` are
-                               pure and unit-tested
+                               `mqtt/manual.rs`, `mqtt/milestones.rs`,
+                               `mqtt/recipes.rs` are pure and unit-tested
 - `src/processors/state_machine.rs` — central decision logic
 - `src/processors/http.rs`   — axum router + handlers
 - `src/runtime/types.rs`     — `StateMachineCommand`/`Event`, `WsCommand`/

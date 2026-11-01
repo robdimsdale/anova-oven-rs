@@ -241,6 +241,35 @@
     },
     "unique_id": "anova_oven_start"
   },
+  "homeassistant/button/anova_oven/start_manual/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      },
+      {
+        "topic": "anova/oven/state",
+        "value_template": "{{ 'online' if value_json.connected else 'offline' }}"
+      }
+    ],
+    "availability_mode": "all",
+    "command_topic": "anova/oven/cmd/start_manual",
+    "default_entity_id": "button.anova_oven_start_manual",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "has_entity_name": true,
+    "name": "Start manual cook",
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "unique_id": "anova_oven_start_manual"
+  },
   "homeassistant/button/anova_oven/stop/config": {
     "availability": [
       {
@@ -338,6 +367,136 @@
     "state_value_template": "{{ 'ON' if value_json.lamp_on else 'OFF' }}",
     "unique_id": "anova_oven_lamp"
   },
+  "homeassistant/number/anova_oven/manual_probe_target/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      }
+    ],
+    "availability_mode": "all",
+    "command_topic": "anova/oven/cmd/manual/probe_target",
+    "default_entity_id": "number.anova_oven_manual_probe_target",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "device_class": "temperature",
+    "has_entity_name": true,
+    "max": 100,
+    "min": 1,
+    "mode": "box",
+    "name": "Manual probe target",
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "state_topic": "anova/oven/manual",
+    "step": 1,
+    "unique_id": "anova_oven_manual_probe_target",
+    "unit_of_measurement": "°C",
+    "value_template": "{{ value_json.probe_target_c }}"
+  },
+  "homeassistant/number/anova_oven/manual_steam/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      }
+    ],
+    "availability_mode": "all",
+    "command_topic": "anova/oven/cmd/manual/steam",
+    "default_entity_id": "number.anova_oven_manual_steam",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "has_entity_name": true,
+    "max": 100,
+    "min": 0,
+    "mode": "box",
+    "name": "Manual steam",
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "state_topic": "anova/oven/manual",
+    "step": 1,
+    "unique_id": "anova_oven_manual_steam",
+    "unit_of_measurement": "%",
+    "value_template": "{{ value_json.steam_pct }}"
+  },
+  "homeassistant/number/anova_oven/manual_temperature/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      }
+    ],
+    "availability_mode": "all",
+    "command_topic": "anova/oven/cmd/manual/temperature",
+    "default_entity_id": "number.anova_oven_manual_temperature",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "device_class": "temperature",
+    "has_entity_name": true,
+    "max": 250,
+    "min": 25,
+    "mode": "box",
+    "name": "Manual temperature",
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "state_topic": "anova/oven/manual",
+    "step": 1,
+    "unique_id": "anova_oven_manual_temperature",
+    "unit_of_measurement": "°C",
+    "value_template": "{{ value_json.temperature_c }}"
+  },
+  "homeassistant/number/anova_oven/manual_timer/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      }
+    ],
+    "availability_mode": "all",
+    "command_topic": "anova/oven/cmd/manual/timer",
+    "default_entity_id": "number.anova_oven_manual_timer",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "has_entity_name": true,
+    "max": 1440,
+    "min": 1,
+    "mode": "box",
+    "name": "Manual timer",
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "state_topic": "anova/oven/manual",
+    "step": 1,
+    "unique_id": "anova_oven_manual_timer",
+    "unit_of_measurement": "min",
+    "value_template": "{{ value_json.timer_mins }}"
+  },
   "homeassistant/number/anova_oven/set_temperature/config": {
     "availability": [
       {
@@ -412,6 +571,167 @@
     "unit_of_measurement": "min",
     "value_template": "{% set s = value_json.timer_total_secs %}{{ [(s / 60) | round(0) | int, 1] | max if s else 'None' }}"
   },
+  "homeassistant/select/anova_oven/manual_at_end/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      }
+    ],
+    "availability_mode": "all",
+    "command_topic": "anova/oven/cmd/manual/at_end",
+    "default_entity_id": "select.anova_oven_manual_at_end",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "has_entity_name": true,
+    "name": "Manual at end",
+    "options": [
+      "Keep holding",
+      "Turn the oven off"
+    ],
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "state_topic": "anova/oven/manual",
+    "unique_id": "anova_oven_manual_at_end",
+    "value_template": "{{ value_json.at_end }}"
+  },
+  "homeassistant/select/anova_oven/manual_elements/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      }
+    ],
+    "availability_mode": "all",
+    "command_topic": "anova/oven/cmd/manual/elements",
+    "default_entity_id": "select.anova_oven_manual_elements",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "has_entity_name": true,
+    "name": "Manual heating elements",
+    "options": [
+      "Rear",
+      "Top",
+      "Bottom",
+      "Top + rear",
+      "Bottom + rear",
+      "Top + bottom"
+    ],
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "state_topic": "anova/oven/manual",
+    "unique_id": "anova_oven_manual_elements",
+    "value_template": "{{ value_json.elements }}"
+  },
+  "homeassistant/select/anova_oven/manual_ends/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      }
+    ],
+    "availability_mode": "all",
+    "command_topic": "anova/oven/cmd/manual/ends",
+    "default_entity_id": "select.anova_oven_manual_ends",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "has_entity_name": true,
+    "name": "Manual ends",
+    "options": [
+      "Timer",
+      "Probe",
+      "When I say"
+    ],
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "state_topic": "anova/oven/manual",
+    "unique_id": "anova_oven_manual_ends",
+    "value_template": "{{ value_json.ends }}"
+  },
+  "homeassistant/select/anova_oven/manual_mode/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      }
+    ],
+    "availability_mode": "all",
+    "command_topic": "anova/oven/cmd/manual/mode",
+    "default_entity_id": "select.anova_oven_manual_mode",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "has_entity_name": true,
+    "name": "Manual mode",
+    "options": [
+      "Oven (dry bulb)",
+      "Sous vide (wet bulb)"
+    ],
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "state_topic": "anova/oven/manual",
+    "unique_id": "anova_oven_manual_mode",
+    "value_template": "{{ value_json.mode }}"
+  },
+  "homeassistant/select/anova_oven/manual_preheat/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      }
+    ],
+    "availability_mode": "all",
+    "command_topic": "anova/oven/cmd/manual/preheat",
+    "default_entity_id": "select.anova_oven_manual_preheat",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "has_entity_name": true,
+    "name": "Manual preheat",
+    "options": [
+      "No preheat",
+      "Preheat, then wait for me",
+      "Preheat, then start cooking"
+    ],
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "state_topic": "anova/oven/manual",
+    "unique_id": "anova_oven_manual_preheat",
+    "value_template": "{{ value_json.preheat }}"
+  },
   "homeassistant/select/anova_oven/recipe/config": {
     "availability": [
       {
@@ -471,6 +791,34 @@
     "state_topic": "anova/oven/state",
     "unique_id": "anova_oven_current_recipe",
     "value_template": "{{ value_json.get('recipe_title') }}"
+  },
+  "homeassistant/sensor/anova_oven/manual_cook/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      }
+    ],
+    "availability_mode": "all",
+    "default_entity_id": "sensor.anova_oven_manual_cook",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "has_entity_name": true,
+    "json_attributes_template": "{{ {'problem': value_json.problem} | tojson }}",
+    "json_attributes_topic": "anova/oven/manual",
+    "name": "Manual cook",
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "state_topic": "anova/oven/manual",
+    "unique_id": "anova_oven_manual_cook",
+    "value_template": "{{ value_json.summary }}"
   },
   "homeassistant/sensor/anova_oven/mode/config": {
     "availability": [

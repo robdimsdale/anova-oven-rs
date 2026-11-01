@@ -12,6 +12,7 @@
 
 use serde_json::{json, Value};
 
+use super::manual;
 use super::milestones::EVENT_TYPES;
 
 /// The topics under the server's prefix and Home Assistant's.
@@ -42,6 +43,9 @@ impl Topics {
     }
     pub fn selected_attributes(&self) -> String {
         self.under("recipe/selected/attributes")
+    }
+    pub fn manual(&self) -> String {
+        self.under("manual")
     }
     pub fn event(&self) -> String {
         self.under("event")
@@ -161,6 +165,40 @@ fn on_off(topics: &Topics, condition: &str, device_class: Option<&str>) -> Value
     });
     if let Some(class) = device_class {
         v["device_class"] = class.into();
+    }
+    v
+}
+
+/// A select over one of the manual cook's fields.
+fn manual_select(topics: &Topics, field: &str, options: &[&str]) -> Value {
+    json!({
+        "state_topic": topics.manual(),
+        "value_template": format!("{{{{ value_json.{field} }}}}"),
+        "command_topic": topics.command(&format!("manual/{field}")),
+        "options": options,
+    })
+}
+
+/// A number box over one of the manual cook's fields; `extra` adds the
+/// unit and device class.
+fn manual_number(
+    topics: &Topics,
+    field: &str,
+    command: &str,
+    (min, max): (u32, u32),
+    extra: Value,
+) -> Value {
+    let mut v = json!({
+        "state_topic": topics.manual(),
+        "value_template": format!("{{{{ value_json.{field} }}}}"),
+        "command_topic": topics.command(&format!("manual/{command}")),
+        "min": min,
+        "max": max,
+        "step": 1,
+        "mode": "box",
+    });
+    for (k, val) in extra.as_object().expect("an object") {
+        v[k] = val.clone();
     }
     v
 }
@@ -380,6 +418,115 @@ fn entities(topics: &Topics, options: &[String]) -> Vec<Entity> {
             "Stop",
             Needs::Oven,
             json!({ "command_topic": topics.command("stop") }),
+        ),
+        // A manual cook: one step, set up here and started with a button.
+        // Editing it needs only the server; starting it, the oven too.
+        entity(
+            "number",
+            "manual_temperature",
+            "Manual temperature",
+            Needs::Server,
+            manual_number(
+                topics,
+                "temperature_c",
+                "temperature",
+                (25, 250),
+                json!({ "device_class": "temperature", "unit_of_measurement": "°C" }),
+            ),
+        ),
+        entity(
+            "select",
+            "manual_mode",
+            "Manual mode",
+            Needs::Server,
+            manual_select(topics, "mode", &manual::MODES),
+        ),
+        entity(
+            "number",
+            "manual_steam",
+            "Manual steam",
+            Needs::Server,
+            manual_number(
+                topics,
+                "steam_pct",
+                "steam",
+                (0, 100),
+                json!({ "unit_of_measurement": "%" }),
+            ),
+        ),
+        entity(
+            "select",
+            "manual_elements",
+            "Manual heating elements",
+            Needs::Server,
+            manual_select(topics, "elements", &manual::ELEMENTS),
+        ),
+        entity(
+            "select",
+            "manual_preheat",
+            "Manual preheat",
+            Needs::Server,
+            manual_select(topics, "preheat", &manual::PREHEATS),
+        ),
+        entity(
+            "select",
+            "manual_ends",
+            "Manual ends",
+            Needs::Server,
+            manual_select(topics, "ends", &manual::ENDS),
+        ),
+        entity(
+            "number",
+            "manual_timer",
+            "Manual timer",
+            Needs::Server,
+            manual_number(
+                topics,
+                "timer_mins",
+                "timer",
+                (1, 1440),
+                json!({ "unit_of_measurement": "min" }),
+            ),
+        ),
+        entity(
+            "number",
+            "manual_probe_target",
+            "Manual probe target",
+            Needs::Server,
+            manual_number(
+                topics,
+                "probe_target_c",
+                "probe_target",
+                (1, 100),
+                json!({ "device_class": "temperature", "unit_of_measurement": "°C" }),
+            ),
+        ),
+        entity(
+            "select",
+            "manual_at_end",
+            "Manual at end",
+            Needs::Server,
+            manual_select(topics, "at_end", &manual::AT_END),
+        ),
+        // What the button will start, or why it can't (`problem`).
+        entity(
+            "sensor",
+            "manual_cook",
+            "Manual cook",
+            Needs::Server,
+            json!({
+                "state_topic": topics.manual(),
+                "value_template": "{{ value_json.summary }}",
+                "json_attributes_topic": topics.manual(),
+                "json_attributes_template": "{{ {'problem': value_json.problem} | tojson }}",
+            }),
+        ),
+        entity(
+            "button",
+            "start_manual",
+            "Start manual cook",
+            Needs::Oven,
+            json!({ "command_topic": topics.command("start_manual") }),
         ),
         // Milestones.
         entity(

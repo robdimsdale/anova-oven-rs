@@ -10,6 +10,7 @@
 //! retained state.
 
 mod discovery;
+mod manual;
 mod milestones;
 mod recipes;
 
@@ -115,6 +116,8 @@ pub async fn run(config: MqttConfig, mut sources: Sources) {
         recipes: Vec::new(),
         options: Vec::new(),
         selected: None,
+        manual: manual::Draft::default(),
+        last_manual: None,
         last_state: None,
         last_snapshot: None,
         next_stage_ready: None,
@@ -196,6 +199,9 @@ struct Processor {
     /// The selected recipe's ID. Lives here, not in Home Assistant, so it
     /// survives an HA restart and a stale select can't start the wrong one.
     selected: Option<String>,
+    /// The manual cook being set up. Here for the same reasons.
+    manual: manual::Draft,
+    last_manual: Option<String>,
     last_state: Option<String>,
     /// `None` until the first snapshot, which is the baseline: a restart
     /// mid-cook announces nothing.
@@ -234,6 +240,7 @@ impl Processor {
         }
         self.publish_recipes().await;
         self.last_state = None;
+        self.last_manual = None;
         self.next_stage_ready = None;
         self.on_change(sources, true).await;
     }
@@ -280,6 +287,17 @@ impl Processor {
             attributes.to_string(),
         )
         .await;
+    }
+
+    /// The manual cook's state, if it changed. Its summary is in the
+    /// oven's display unit, so a change of unit counts.
+    async fn publish_manual(&mut self) {
+        let state = self.manual.state(&self.unit()).to_string();
+        if self.last_manual.as_deref() != Some(state.as_str()) {
+            self.publish(self.topics.manual(), true, state.clone())
+                .await;
+            self.last_manual = Some(state);
+        }
     }
 
     fn unit(&self) -> String {
@@ -342,6 +360,7 @@ impl Processor {
             }
         }
         self.last_snapshot = Some(snapshot);
+        self.publish_manual().await;
     }
 
     async fn event(&self, milestone: Milestone, payload: serde_json::Value) {
@@ -401,6 +420,33 @@ impl Processor {
                     reply: reply_tx,
                 }
             }
+            "start_manual" => {
+                // `{"title": "…", "stages": [...]}` for any manual cook, or
+                // anything else (a button's `PRESS`) for the one set up in
+                // the manual entities.
+                let recipe = match serde_json::from_str::<ManualStart>(&text) {
+                    Ok(start) => manual::check(start.title, start.stages),
+                    Err(_) => self.manual.recipe(),
+                };
+                match recipe {
+                    Ok(recipe) => StateMachineCommand::StartManualCook {
+                        title: recipe.title,
+                        stages: recipe.stages,
+                        reply: reply_tx,
+                    },
+                    Err(e) => {
+                        self.command_failed("start_manual", &e).await;
+                        return;
+                    }
+                }
+            }
+            field if field.starts_with("manual/") => {
+                if let Err(e) = self.manual.set(&field["manual/".len()..], &text) {
+                    self.command_failed(field, &e).await;
+                }
+                self.publish_manual().await;
+                return;
+            }
             "stop" => StateMachineCommand::StopCook { reply: reply_tx },
             other => {
                 let request = match control_request(other, &text) {
@@ -428,6 +474,14 @@ impl Processor {
             }
         }
     }
+}
+
+/// A manual cook given in full, as `POST /start` takes one.
+#[derive(serde::Deserialize)]
+struct ManualStart {
+    #[serde(default)]
+    title: Option<String>,
+    stages: Vec<anova_oven_api::Stage>,
 }
 
 /// Host and port from `mqtt://host[:port]`. TLS (`mqtts://`) isn't supported
