@@ -119,6 +119,8 @@ pub async fn run(config: MqttConfig, mut sources: Sources) {
         manual: manual::Draft::default(),
         last_manual: None,
         last_state: None,
+        unit: None,
+        discovered_unit: None,
         last_snapshot: None,
         next_stage_ready: None,
     };
@@ -203,6 +205,12 @@ struct Processor {
     manual: manual::Draft,
     last_manual: Option<String>,
     last_state: Option<String>,
+    /// The oven's display unit, from the last status that had one: the
+    /// temperature numbers' unit, and the summaries'. Kept while the oven
+    /// is away, so their discovery doesn't flip to °C and back.
+    unit: Option<String>,
+    /// The unit the discovery configs went out in.
+    discovered_unit: Option<String>,
     /// `None` until the first snapshot, which is the baseline: a restart
     /// mid-cook announces nothing.
     last_snapshot: Option<Snapshot>,
@@ -223,12 +231,13 @@ impl Processor {
     /// Discovery, availability and every retained topic, then the
     /// subscription. On every connect, since the broker may have lost them.
     async fn on_connected(&mut self, sources: &Sources) {
-        self.recipes = sources.read_model.borrow().recipes.clone();
+        let model = sources.read_model.borrow().clone();
+        self.recipes = model.recipes;
         self.options = recipes::options(&self.recipes);
-        let titles = self.titles();
-        for (topic, payload) in discovery::configs(&self.topics, self.local, &titles) {
-            self.publish(topic, true, payload).await;
+        if let Some(status) = &model.status {
+            self.unit = Some(status.temperature_unit.clone());
         }
+        self.publish_discovery().await;
         self.publish(self.topics.availability(), true, "online")
             .await;
         if let Err(e) = self
@@ -243,6 +252,15 @@ impl Processor {
         self.last_manual = None;
         self.next_stage_ready = None;
         self.on_change(sources, true).await;
+    }
+
+    async fn publish_discovery(&mut self) {
+        let unit = self.unit();
+        for (topic, payload) in discovery::configs(&self.topics, self.local, &self.titles(), &unit)
+        {
+            self.publish(topic, true, payload).await;
+        }
+        self.discovered_unit = Some(unit);
     }
 
     fn titles(&self) -> Vec<String> {
@@ -301,9 +319,7 @@ impl Processor {
     }
 
     fn unit(&self) -> String {
-        self.last_snapshot
-            .as_ref()
-            .map_or_else(|| "C".into(), |s| s.unit.clone())
+        self.unit.clone().unwrap_or_else(|| "C".into())
     }
 
     /// Something may have changed: republish what did, and announce any
@@ -332,6 +348,13 @@ impl Processor {
             });
             status
         });
+
+        if let Some(status) = &status {
+            self.unit = Some(status.temperature_unit.clone());
+            if self.discovered_unit.is_some() && self.discovered_unit != self.unit {
+                self.publish_discovery().await;
+            }
+        }
 
         let state = state_json(status.as_ref(), model.current_cook.as_ref(), connected).to_string();
         if force || self.last_state.as_deref() != Some(state.as_str()) {

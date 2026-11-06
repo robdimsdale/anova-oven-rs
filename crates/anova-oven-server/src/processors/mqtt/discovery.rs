@@ -84,9 +84,15 @@ struct Entity {
 }
 
 /// `(topic, payload)` for every discovery config. `options` are the recipe
-/// select's options.
-pub fn configs(topics: &Topics, local: bool, options: &[String]) -> Vec<(String, String)> {
-    entities(topics, options)
+/// select's options; `unit` is the oven's display unit (`C` or `F`), which
+/// the temperature numbers take.
+pub fn configs(
+    topics: &Topics,
+    local: bool,
+    options: &[String],
+    unit: &str,
+) -> Vec<(String, String)> {
+    entities(topics, options, unit)
         .into_iter()
         .map(|e| {
             let topic = topics.config(e.component, e.object);
@@ -101,8 +107,9 @@ pub fn configs(topics: &Topics, local: bool, options: &[String]) -> Vec<(String,
 }
 
 /// The recipe select's config alone, republished when the recipes change.
+/// It doesn't depend on the unit.
 pub fn select_config(topics: &Topics, options: &[String]) -> (String, String) {
-    configs(topics, true, options)
+    configs(topics, true, options, "C")
         .into_iter()
         .find(|(topic, _)| topic == &topics.config("select", "recipe"))
         .expect("the recipe select is always present")
@@ -180,7 +187,7 @@ fn manual_select(topics: &Topics, field: &str, options: &[&str]) -> Value {
 }
 
 /// A number box over one of the manual cook's fields; `extra` adds the
-/// unit and device class.
+/// unit.
 fn manual_number(
     topics: &Topics,
     field: &str,
@@ -203,11 +210,57 @@ fn manual_number(
     v
 }
 
-fn celsius() -> Value {
-    json!({ "device_class": "temperature", "unit_of_measurement": "°C", "state_class": "measurement" })
+/// A number box over a temperature the server keeps in °C, `field` of the
+/// JSON on `state_topic`, shown in the oven's display unit. In °F the
+/// templates convert both ways and round, since Home Assistant's own
+/// conversion of a °C number leaves fractions (`160.000006103516 °F`) and
+/// a 1 °C step skips most of °F. A null field reads as unknown.
+fn temperature_number(
+    state_topic: String,
+    field: &str,
+    command_topic: String,
+    (min, max): (u32, u32),
+    unit: &str,
+) -> Value {
+    let get = format!("value_json.get('{field}')");
+    let mut v = json!({
+        "state_topic": state_topic,
+        "command_topic": command_topic,
+        "step": 1,
+        "mode": "box",
+        "device_class": "temperature",
+    });
+    if unit.eq_ignore_ascii_case("F") {
+        let f = |c: u32| f64::from(c) * 1.8 + 32.0;
+        v["value_template"] = format!(
+            "{{% set c = {get} %}}{{{{ (c * 1.8 + 32) | round | int if c is not none else 'None' }}}}"
+        )
+        .into();
+        // `* 5 / 9`, not `/ 1.8`, so the ends land exactly on the °C limits.
+        v["command_template"] = "{{ (value - 32) * 5 / 9 }}".into();
+        v["min"] = f(min).ceil().into();
+        v["max"] = f(max).floor().into();
+        v["unit_of_measurement"] = "°F".into();
+    } else {
+        v["value_template"] = format!("{{{{ {get} }}}}").into();
+        v["min"] = min.into();
+        v["max"] = max.into();
+        v["unit_of_measurement"] = "°C".into();
+    }
+    v
 }
 
-fn entities(topics: &Topics, options: &[String]) -> Vec<Entity> {
+/// A °C sensor, shown to the degree whatever Home Assistant converts it to.
+fn celsius() -> Value {
+    json!({
+        "device_class": "temperature",
+        "unit_of_measurement": "°C",
+        "state_class": "measurement",
+        "suggested_display_precision": 0,
+    })
+}
+
+fn entities(topics: &Topics, options: &[String], unit: &str) -> Vec<Entity> {
     let entity = |component, object, name, needs, fields| Entity {
         component,
         object,
@@ -426,12 +479,12 @@ fn entities(topics: &Topics, options: &[String]) -> Vec<Entity> {
             "manual_temperature",
             "Manual temperature",
             Needs::Server,
-            manual_number(
-                topics,
+            temperature_number(
+                topics.manual(),
                 "temperature_c",
-                "temperature",
+                topics.command("manual/temperature"),
                 (25, 250),
-                json!({ "device_class": "temperature", "unit_of_measurement": "°C" }),
+                unit,
             ),
         ),
         entity(
@@ -493,12 +546,12 @@ fn entities(topics: &Topics, options: &[String]) -> Vec<Entity> {
             "manual_probe_target",
             "Manual probe target",
             Needs::Server,
-            manual_number(
-                topics,
+            temperature_number(
+                topics.manual(),
                 "probe_target_c",
-                "probe_target",
+                topics.command("manual/probe_target"),
                 (1, 100),
-                json!({ "device_class": "temperature", "unit_of_measurement": "°C" }),
+                unit,
             ),
         ),
         entity(
@@ -562,17 +615,13 @@ fn entities(topics: &Topics, options: &[String]) -> Vec<Entity> {
             "set_temperature",
             "Set temperature",
             Needs::Oven,
-            json!({
-                "command_topic": topics.command("temperature"),
-                "state_topic": topics.state(),
-                "value_template": "{{ value_json.get('target_temperature_c') }}",
-                "min": 25,
-                "max": 250,
-                "step": 1,
-                "mode": "box",
-                "device_class": "temperature",
-                "unit_of_measurement": "°C",
-            }),
+            temperature_number(
+                topics.state(),
+                "target_temperature_c",
+                topics.command("temperature"),
+                (25, 250),
+                unit,
+            ),
         ),
         local(
             "number",
@@ -610,7 +659,11 @@ mod tests {
     }
 
     fn render(local: bool) -> Value {
-        let configs = configs(&topics(), local, &["Bread".into(), "Toast".into()]);
+        render_in(local, "C")
+    }
+
+    fn render_in(local: bool, unit: &str) -> Value {
+        let configs = configs(&topics(), local, &["Bread".into(), "Toast".into()], unit);
         Value::Object(
             configs
                 .into_iter()
@@ -681,6 +734,43 @@ mod tests {
         ids.sort();
         ids.dedup();
         assert_eq!(ids.len(), count);
+    }
+
+    #[test]
+    fn temperature_numbers_take_the_ovens_unit() {
+        let all = render_in(true, "F");
+        let manual = &all["homeassistant/number/anova_oven/manual_temperature/config"];
+        assert_eq!(manual["unit_of_measurement"], "°F");
+        assert_eq!(
+            (manual["min"].clone(), manual["max"].clone()),
+            (json!(77.0), json!(482.0))
+        );
+        let probe = &all["homeassistant/number/anova_oven/manual_probe_target/config"];
+        assert_eq!(
+            (probe["min"].clone(), probe["max"].clone()),
+            (json!(34.0), json!(212.0))
+        );
+        assert_eq!(
+            all["homeassistant/number/anova_oven/set_temperature/config"]["command_template"],
+            "{{ (value - 32) * 5 / 9 }}"
+        );
+        // Everything else is the same in either unit.
+        let celsius = render_in(true, "C");
+        let differ: Vec<&String> = all
+            .as_object()
+            .unwrap()
+            .iter()
+            .filter(|(k, v)| celsius[k.as_str()] != **v)
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(
+            differ,
+            [
+                "homeassistant/number/anova_oven/manual_probe_target/config",
+                "homeassistant/number/anova_oven/manual_temperature/config",
+                "homeassistant/number/anova_oven/set_temperature/config",
+            ]
+        );
     }
 
     #[test]

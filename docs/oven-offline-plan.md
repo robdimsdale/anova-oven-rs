@@ -513,9 +513,14 @@ One device, "Anova Oven", with:
 - **Light:** lamp (only works mid-cook; the oven ignores it when idle).
 - **Numbers:** target temperature, timer.
 
-Temperatures are published in °C with `device_class: temperature`; Home
-Assistant converts them to the user's unit system. The oven's own display unit
-is a separate setting and doesn't affect what is published.
+Temperature sensors are published in °C with `device_class: temperature`;
+Home Assistant converts them to the user's unit system, shown to the degree
+(`suggested_display_precision: 0`). Temperature numbers (the target, and the
+manual cook's temperature and probe target) are the exception: they take the
+oven's display unit, whole degrees, with templates converting to and from the
+°C the server keeps. Home Assistant's own conversion of a °C number shows
+fractions (`160.000006 °F`), and a 1 °C step skips most of °F. Their
+discovery is republished when the display unit changes.
 
 Availability uses an MQTT last-will on the server's connection, combined with
 the server's own `connected` flag for the oven. If either the server or the
@@ -541,7 +546,7 @@ So:
 - Each stage also carries a one-line `summary` the server formats, e.g.
   `Cook · 220 °C dry · 30% steam · 25 min · waits for you`. A dashboard
   markdown card can then list a recipe without templating every field. The
-  summary uses the oven's display unit, the one place that setting matters.
+  summary uses the oven's display unit, as the temperature numbers do.
 
 Home Assistant's recorder stores attributes on every state change, so the
 sensor's state is the recipe title and the attributes change only when the
