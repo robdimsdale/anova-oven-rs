@@ -817,6 +817,9 @@ Key findings carried forward:
 - **Server:** exponential backoff on WebSocket reconnect (current is a
   flat 5 s sleep), graceful SIGINT shutdown. Token-expiry handling
   already lands automatically via `maybe_refresh_session` on 401.
+- **Server:** separate the MQTT topic API from the Home Assistant
+  adapter, whose state (recipe selection, manual draft) now shares the
+  topic namespace (see [`docs/mqtt-ha-split.md`](mqtt-ha-split.md)).
 - **CLI:** richer output formatting (tables, colours), `--watch` flag,
   `--json` flag.
 - **Pico:** OTA updates (see [`docs/pico-ota.md`](pico-ota.md)),
