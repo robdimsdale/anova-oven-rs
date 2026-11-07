@@ -206,9 +206,17 @@ impl OvenStatus {
         }
     }
 
-    /// Whether the oven is actively cooking (not idle).
+    /// Whether the oven is actively cooking: not idle, and not running its
+    /// own descale program.
     pub fn is_cooking(&self) -> bool {
-        self.mode != "idle"
+        self.mode != "idle" && !self.is_descaling()
+    }
+
+    /// Whether the oven runs its descale program (mode `"descale"`, seen on
+    /// firmware 2.1.16). It isn't a cook: it has no stages and no timer in
+    /// the state, and it must never be stopped or recorded as one.
+    pub fn is_descaling(&self) -> bool {
+        self.mode == "descale"
     }
 
     /// Infer the human-readable phase: "Preheating", "Cooking", or "Idle".
@@ -218,6 +226,7 @@ impl OvenStatus {
     pub fn phase(&self) -> &'static str {
         match self.mode.as_str() {
             "idle" => "Idle",
+            "descale" => "Descaling",
             "cook" if self.timer_mode == "idle" && self.timer_current_secs == 0 => "Preheating",
             "cook" => "Cooking",
             _ => "Unknown",
@@ -566,6 +575,17 @@ mod tests {
             cook_progress: None,
             upstream: None,
         }
+    }
+
+    #[test]
+    fn a_descale_is_not_a_cook() {
+        let mut status = cooking_status();
+        status.mode = "descale".into();
+        assert!(status.is_descaling());
+        assert!(!status.is_cooking());
+        assert_eq!(status.phase(), "Descaling");
+        status.mode = "idle".into();
+        assert!(!status.is_descaling() && !status.is_cooking());
     }
 
     #[test]
