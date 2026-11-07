@@ -94,6 +94,17 @@ pub struct OvenStatus {
     pub door_open: bool,
     /// Whether the water tank is empty.
     pub water_tank_empty: bool,
+    /// Faults the oven reports, as short names such as `"top_element_failed"`
+    /// or `"triacs_failed"`, in a fixed order. Empty while all is well.
+    #[serde(default)]
+    pub faults: Vec<String>,
+    /// The oven couldn't wet the wet bulb's wick, so the wet-bulb reading
+    /// (the sous vide temperature) isn't reliable.
+    #[serde(default)]
+    pub wet_bulb_dose_failed: bool,
+    /// The oven's firmware version, from its system info.
+    #[serde(default)]
+    pub firmware_version: Option<String>,
 
     /// Zero-based index of the stage the oven currently considers active, as
     /// reported by `state.cook.activeStageIndex`. Authoritative source for
@@ -544,6 +555,9 @@ mod tests {
             boiler_celsius: 90.0,
             boiler_watts: 240.0,
             boiler_descale_required: false,
+            faults: Default::default(),
+            wet_bulb_dose_failed: false,
+            firmware_version: None,
             evaporator_celsius: 85.0,
             evaporator_watts: 80.0,
             fan_speed: 100,

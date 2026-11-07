@@ -435,6 +435,25 @@ fn entities(topics: &Topics, options: &[String], unit: &str) -> Vec<Entity> {
                 None,
             ),
         ),
+        // A part failed or overheated; the attribute names which ones.
+        entity("binary_sensor", "problem", "Problem", Needs::Oven, {
+            let mut v = on_off(topics, "value_json.faults", Some("problem"));
+            v["json_attributes_topic"] = topics.state().into();
+            v["json_attributes_template"] = "{{ {'faults': value_json.faults} | tojson }}".into();
+            v
+        }),
+        entity(
+            "sensor",
+            "firmware",
+            "Firmware",
+            Needs::Oven,
+            json!({
+                "state_topic": topics.state(),
+                "value_template": "{{ value_json.firmware_version }}",
+                "entity_category": "diagnostic",
+                "icon": "mdi:chip",
+            }),
+        ),
         entity(
             "binary_sensor",
             "descale_required",
