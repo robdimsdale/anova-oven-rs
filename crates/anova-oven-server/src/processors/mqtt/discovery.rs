@@ -408,7 +408,11 @@ fn entities(topics: &Topics, options: &[String], unit: &str) -> Vec<Entity> {
             "cooking",
             "Cooking",
             Needs::Oven,
-            on_off(topics, "value_json.mode != 'idle'", Some("running")),
+            on_off(
+                topics,
+                "value_json.mode not in ['idle', 'descale']",
+                Some("running"),
+            ),
         ),
         entity(
             "binary_sensor",
