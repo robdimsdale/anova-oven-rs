@@ -42,6 +42,19 @@ pub struct MqttConfig {
     pub topics: Topics,
     /// Local mode: announce the controls only it can drive.
     pub local: bool,
+    /// The broker drops one of two clients with the same ID, so a second
+    /// server on the same broker (a test run beside the real one) needs
+    /// its own.
+    pub client_id: String,
+}
+
+/// `ANOVA_MQTT_CLIENT_ID`, or `anova-oven-server` when it's unset or blank.
+fn client_id(value: Option<&str>) -> String {
+    value
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .unwrap_or("anova-oven-server")
+        .to_string()
 }
 
 impl MqttConfig {
@@ -59,12 +72,13 @@ impl MqttConfig {
                     .unwrap_or_else(|_| "homeassistant".into()),
             },
             local,
+            client_id: client_id(std::env::var("ANOVA_MQTT_CLIENT_ID").ok().as_deref()),
         })
     }
 
     fn options(&self) -> Result<MqttOptions, String> {
         let (host, port) = broker_address(&self.url)?;
-        let mut options = MqttOptions::new("anova-oven-server", host, port);
+        let mut options = MqttOptions::new(self.client_id.clone(), host, port);
         if let (Some(user), Some(pass)) = (&self.username, &self.password) {
             options.set_credentials(user, pass);
         }
@@ -641,9 +655,17 @@ mod tests {
                 discovery: "homeassistant".into(),
             },
             local: true,
+            client_id: "anova-oven-test".into(),
         };
         let options = config.options().unwrap();
         assert_eq!(options.broker_address(), ("broker.lan".to_string(), 1883));
-        assert_eq!(options.client_id(), "anova-oven-server");
+        assert_eq!(options.client_id(), "anova-oven-test");
+    }
+
+    #[test]
+    fn client_id_defaults_when_unset_or_blank() {
+        assert_eq!(client_id(None), "anova-oven-server");
+        assert_eq!(client_id(Some("  ")), "anova-oven-server");
+        assert_eq!(client_id(Some(" oven-test ")), "oven-test");
     }
 }

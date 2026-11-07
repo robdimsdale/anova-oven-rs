@@ -353,6 +353,9 @@ are always sent as Celsius.
 - `ANOVA_MQTT_USERNAME`, `ANOVA_MQTT_PASSWORD`
 - `ANOVA_MQTT_TOPIC_PREFIX` — default `anova/oven`
 - `ANOVA_MQTT_DISCOVERY_PREFIX` — default `homeassistant`
+- `ANOVA_MQTT_CLIENT_ID` — default `anova-oven-server`. A second server
+  on the same broker needs its own, or the broker drops one of the two
+  again and again. It also needs its own topic and discovery prefixes.
 
 **Running:**
 ```sh
