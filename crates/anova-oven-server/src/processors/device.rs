@@ -373,6 +373,7 @@ async fn handle_message(
                 telemetry::record_system_info(info);
             }
             let status = protocol::to_oven_status(&state);
+            log_raw_state(&status.mode, text);
             info!(
                 mode = %status.mode,
                 temp_c = format!("{:.1}", status.temperature_c),
@@ -622,6 +623,26 @@ async fn handshake(
         ws,
         log: OvenLog::default(),
     })
+}
+
+/// How often [`log_raw_state`] writes the raw report.
+const RAW_LOG_EVERY: Duration = Duration::from_secs(60);
+
+/// At debug level, logs the oven's whole state report, at most once a
+/// minute. The parsed state keeps only the fields the server knows, so this
+/// is the way to find new ones (the descale countdown on the display, for
+/// one, turned out not to be in the report at all).
+fn log_raw_state(mode: &str, raw: &str) {
+    static LAST: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
+    let Ok(mut last) = LAST.lock() else { return };
+    if last.is_some_and(|t| t.elapsed() < RAW_LOG_EVERY) {
+        return;
+    }
+    *last = Some(Instant::now());
+    debug!(mode = %mode, raw = %raw, "[device] raw state");
 }
 
 #[cfg(test)]
