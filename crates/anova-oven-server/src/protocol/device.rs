@@ -57,6 +57,19 @@ mod tests {
         }
     }
 
+    /// A real state report from the middle of a descale (firmware 2.1.16).
+    const DESCALE: &str = include_str!("../../testdata/device-state-descale.json");
+
+    #[test]
+    fn a_descale_report_is_descaling_not_cooking() {
+        let status = to_oven_status(&parse_state(DESCALE));
+        assert_eq!(status.mode, "descale");
+        assert!(status.is_descaling());
+        assert!(!status.is_cooking());
+        assert_eq!(status.phase(), "Descaling");
+        assert!(status.boiler_descale_required);
+    }
+
     #[test]
     fn a_healthy_oven_reports_no_faults_and_its_firmware() {
         let status = to_oven_status(&parse_state(COOKING));

@@ -55,7 +55,7 @@
     },
     "state_topic": "anova/oven/state",
     "unique_id": "anova_oven_cooking",
-    "value_template": "{{ 'ON' if value_json.mode != 'idle' else 'OFF' }}"
+    "value_template": "{{ 'ON' if value_json.mode not in ['idle', 'descale'] else 'OFF' }}"
   },
   "homeassistant/binary_sensor/anova_oven/descale_required/config": {
     "availability": [
