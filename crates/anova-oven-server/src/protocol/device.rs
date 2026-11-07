@@ -58,6 +58,38 @@ mod tests {
     }
 
     #[test]
+    fn a_healthy_oven_reports_no_faults_and_its_firmware() {
+        let status = to_oven_status(&parse_state(COOKING));
+        assert!(status.faults.is_empty());
+        assert!(!status.wet_bulb_dose_failed);
+        assert_eq!(status.firmware_version.as_deref(), Some("2.1.16"));
+    }
+
+    #[test]
+    fn fault_flags_become_fault_names() {
+        let mut v: serde_json::Value = serde_json::from_str(COOKING).unwrap();
+        let d = &mut v["data"];
+        d["systemInfo"]["triacsFailed"] = true.into();
+        d["nodes"]["heatingElements"]["rear"]["failed"] = true.into();
+        d["nodes"]["steamGenerators"]["boiler"]["overheated"] = true.into();
+        d["nodes"]["temperatureBulbs"]["dryTop"]["overheated"] = true.into();
+        d["nodes"]["temperatureBulbs"]["wet"]["doseFailed"] = true.into();
+        d["nodes"]["userInterfaceCircuit"]["communicationFailed"] = true.into();
+        let status = to_oven_status(&parse_state(&v.to_string()));
+        assert_eq!(
+            status.faults,
+            [
+                "triacs_failed",
+                "rear_element_failed",
+                "boiler_overheated",
+                "top_overheated",
+                "display_link_failed"
+            ]
+        );
+        assert!(status.wet_bulb_dose_failed);
+    }
+
+    #[test]
     fn cooking_state_parses_cook_block() {
         let state = parse_state(COOKING);
         assert_eq!(state.state.processed_command_ids.len(), 10);

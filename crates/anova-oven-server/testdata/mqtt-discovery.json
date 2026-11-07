@@ -149,6 +149,39 @@
     "unique_id": "anova_oven_next_stage_ready",
     "value_template": "{{ 'ON' if value_json.get('cook_progress') and value_json.get('cook_progress').next_stage_ready else 'OFF' }}"
   },
+  "homeassistant/binary_sensor/anova_oven/problem/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      },
+      {
+        "topic": "anova/oven/state",
+        "value_template": "{{ 'online' if value_json.connected else 'offline' }}"
+      }
+    ],
+    "availability_mode": "all",
+    "default_entity_id": "binary_sensor.anova_oven_problem",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "device_class": "problem",
+    "has_entity_name": true,
+    "json_attributes_template": "{{ {'faults': value_json.faults} | tojson }}",
+    "json_attributes_topic": "anova/oven/state",
+    "name": "Problem",
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "state_topic": "anova/oven/state",
+    "unique_id": "anova_oven_problem",
+    "value_template": "{{ 'ON' if value_json.faults else 'OFF' }}"
+  },
   "homeassistant/binary_sensor/anova_oven/water_tank_empty/config": {
     "availability": [
       {
@@ -791,6 +824,38 @@
     "state_topic": "anova/oven/state",
     "unique_id": "anova_oven_current_recipe",
     "value_template": "{{ value_json.get('recipe_title') }}"
+  },
+  "homeassistant/sensor/anova_oven/firmware/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      },
+      {
+        "topic": "anova/oven/state",
+        "value_template": "{{ 'online' if value_json.connected else 'offline' }}"
+      }
+    ],
+    "availability_mode": "all",
+    "default_entity_id": "sensor.anova_oven_firmware",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "entity_category": "diagnostic",
+    "has_entity_name": true,
+    "icon": "mdi:chip",
+    "name": "Firmware",
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "state_topic": "anova/oven/state",
+    "unique_id": "anova_oven_firmware",
+    "value_template": "{{ value_json.firmware_version }}"
   },
   "homeassistant/sensor/anova_oven/manual_cook/config": {
     "availability": [
