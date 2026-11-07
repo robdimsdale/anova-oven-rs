@@ -48,6 +48,10 @@ pub struct SystemInfo {
     pub hardware_version: Option<String>,
     /// When the oven last dropped off Anova's cloud, as `YYYY-MM-DDTHH:MM:SSZ`.
     pub last_disconnected_timestamp: Option<String>,
+    /// The triacs switch the heating elements. A failed triac can leave an
+    /// element on.
+    #[serde(default)]
+    pub triacs_failed: bool,
 }
 
 impl SystemInfo {
@@ -113,6 +117,16 @@ pub struct Nodes {
     pub timer: Timer,
     pub vent: Vent,
     pub water_tank: WaterTank,
+    #[serde(default)]
+    pub user_interface_circuit: Option<UserInterfaceCircuit>,
+}
+
+/// The link between the handle's display and the main board.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserInterfaceCircuit {
+    #[serde(default)]
+    pub communication_failed: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -123,6 +137,8 @@ pub struct Door {
 #[derive(Debug, Deserialize)]
 pub struct Fan {
     pub speed: u32,
+    #[serde(default)]
+    pub failed: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -136,12 +152,16 @@ pub struct HeatingElements {
 pub struct HeatingElement {
     pub on: bool,
     pub watts: f32,
+    #[serde(default)]
+    pub failed: bool,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct Lamp {
     pub on: bool,
     pub preference: String,
+    #[serde(default)]
+    pub failed: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -165,12 +185,20 @@ pub struct Boiler {
     pub celsius: f32,
     pub watts: f32,
     pub descale_required: bool,
+    #[serde(default)]
+    pub failed: bool,
+    #[serde(default)]
+    pub overheated: bool,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct Evaporator {
     pub celsius: f32,
     pub watts: f32,
+    #[serde(default)]
+    pub failed: bool,
+    #[serde(default)]
+    pub overheated: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -186,15 +214,21 @@ pub struct TemperatureBulbs {
 /// Used for `dry` and `wet`, the bulbs a stage can target. `setpoint` is
 /// present only on the bulb the current stage cooks by.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SetpointBulb {
     pub current: Temperature,
     pub setpoint: Option<Temperature>,
+    /// Wet bulb only: the oven couldn't wet the wick.
+    #[serde(default)]
+    pub dose_failed: bool,
 }
 
 /// Used for `dryTop` and `dryBottom`, which only expose `current`.
 #[derive(Debug, Deserialize)]
 pub struct SimpleBulb {
     pub current: Temperature,
+    #[serde(default)]
+    pub overheated: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -262,6 +296,41 @@ pub fn cook_done(oven: &OvenState) -> bool {
 }
 
 /// Convert a parsed [`OvenState`] into the simplified `OvenStatus` type.
+/// The faults the oven reports, as short names, in a fixed order.
+pub fn faults(oven: &OvenState) -> Vec<String> {
+    let n = &oven.nodes;
+    let he = &n.heating_elements;
+    let sg = &n.steam_generators;
+    let tb = &n.temperature_bulbs;
+    [
+        (
+            oven.system_info.as_ref().is_some_and(|i| i.triacs_failed),
+            "triacs_failed",
+        ),
+        (he.top.failed, "top_element_failed"),
+        (he.bottom.failed, "bottom_element_failed"),
+        (he.rear.failed, "rear_element_failed"),
+        (n.fan.failed, "fan_failed"),
+        (sg.boiler.failed, "boiler_failed"),
+        (sg.boiler.overheated, "boiler_overheated"),
+        (sg.evaporator.failed, "evaporator_failed"),
+        (sg.evaporator.overheated, "evaporator_overheated"),
+        (tb.dry_top.overheated, "top_overheated"),
+        (tb.dry_bottom.overheated, "bottom_overheated"),
+        (n.lamp.failed, "lamp_failed"),
+        (
+            n.user_interface_circuit
+                .as_ref()
+                .is_some_and(|u| u.communication_failed),
+            "display_link_failed",
+        ),
+    ]
+    .into_iter()
+    .filter(|(on, _)| *on)
+    .map(|(_, name)| name.to_string())
+    .collect()
+}
+
 pub fn to_oven_status(oven: &OvenState) -> anova_oven_api::OvenStatus {
     let nodes = &oven.nodes;
     let sg = &nodes.steam_generators;
@@ -320,6 +389,12 @@ pub fn to_oven_status(oven: &OvenState) -> anova_oven_api::OvenStatus {
         vent_open: nodes.vent.open,
         door_open: !nodes.door.closed,
         water_tank_empty: nodes.water_tank.empty,
+        faults: faults(oven),
+        wet_bulb_dose_failed: tb.wet.dose_failed,
+        firmware_version: oven
+            .system_info
+            .as_ref()
+            .and_then(|i| i.firmware_version.clone()),
         active_stage_index,
         active_stage_id,
         cook_done: cook_done(oven),
