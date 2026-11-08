@@ -4,16 +4,17 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Anova Oven</title>
-  <link rel="stylesheet" href="/ui/style.css">
-  <script src="/ui/common.js"></script>
-  <script src="/ui/steps.js"></script>
+  <base href="/">
+  <link rel="stylesheet" href="ui/style.css">
+  <script src="ui/common.js"></script>
+  <script src="ui/steps.js"></script>
 </head>
 <body>
   <header>
     <span class="brand">Anova Oven</span>
     <nav>
-      <a href="/" aria-current="page">Status</a>
-      <a href="/recipes">Recipes</a>
+      <a href="./" aria-current="page">Status</a>
+      <a href="recipes">Recipes</a>
     </nav>
     <div class="unit-switch" role="group" aria-label="Temperature unit">
       <button type="button" data-unit="F">°F</button>
@@ -379,7 +380,7 @@
         cookCanSave = false;
         render();
         message.className = "message ok";
-        message.innerHTML = `Saved <a href="/recipes/${encodeURIComponent(recipe.id)}">${escapeHtml(recipe.title)}</a>`;
+        message.innerHTML = `Saved <a href="recipes/${encodeURIComponent(recipe.id)}">${escapeHtml(recipe.title)}</a>`;
         setTimeout(poll, 800);
       } catch (e) {
         showMessage(message, e.message);

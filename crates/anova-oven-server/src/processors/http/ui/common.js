@@ -1,5 +1,6 @@
 // Shared helpers for the UI pages. Everything goes through the JSON API
-// under /api; temperatures there are Celsius.
+// under api/, relative to the page's <base> (a reverse proxy may serve the
+// UI under a prefix); temperatures there are Celsius.
 
 async function api(method, path, body) {
   const options = { method, headers: {} };
@@ -7,7 +8,7 @@ async function api(method, path, body) {
     options.headers["Content-Type"] = "application/json";
     options.body = JSON.stringify(body);
   }
-  const response = await fetch("/api" + path, options);
+  const response = await fetch("api" + path, options);
   const text = await response.text();
   if (!response.ok) {
     throw new Error(text || `${method} ${path}: HTTP ${response.status}`);

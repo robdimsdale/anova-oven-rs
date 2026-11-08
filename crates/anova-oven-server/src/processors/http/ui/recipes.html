@@ -4,16 +4,17 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Recipes · Anova Oven</title>
-  <link rel="stylesheet" href="/ui/style.css">
-  <script src="/ui/common.js"></script>
-  <script src="/ui/steps.js"></script>
+  <base href="/">
+  <link rel="stylesheet" href="ui/style.css">
+  <script src="ui/common.js"></script>
+  <script src="ui/steps.js"></script>
 </head>
 <body>
   <header>
     <span class="brand">Anova Oven</span>
     <nav>
-      <a href="/">Status</a>
-      <a href="/recipes" aria-current="page">Recipes</a>
+      <a href="./">Status</a>
+      <a href="recipes" aria-current="page">Recipes</a>
     </nav>
     <div class="unit-switch" role="group" aria-label="Temperature unit">
       <button type="button" data-unit="F">°F</button>
@@ -23,7 +24,7 @@
   <main>
     <div class="row spread" style="margin-bottom: 16px;">
       <h1 style="margin: 0;">Recipes</h1>
-      <a class="button primary" href="/recipes/new">New recipe</a>
+      <a class="button primary" href="recipes/new">New recipe</a>
     </div>
     <div id="message" class="message"></div>
     <section class="card" style="padding: 4px 8px;">
@@ -55,7 +56,7 @@
       }
       list.innerHTML = recipes.map((r) => `
         <tr>
-          <td><a href="/recipes/${encodeURIComponent(r.id)}">${escapeHtml(r.title)}</a></td>
+          <td><a href="recipes/${encodeURIComponent(r.id)}">${escapeHtml(r.title)}</a></td>
           <td class="hide-narrow">${toSteps(r.stages).length}</td>
           <td class="hide-narrow"><span class="badge">${r.source === "bookmarked" ? "Bookmarked" : "Own"}</span></td>
           <td class="actions">
