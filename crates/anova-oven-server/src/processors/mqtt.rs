@@ -35,6 +35,8 @@ use milestones::{Milestone, Snapshot};
 /// and how long it has been away.
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
+/// How long a publish may wait for room in the client's queue.
+const PUBLISH_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub struct MqttConfig {
     /// `mqtt://host:1883`; the port defaults to 1883.
@@ -235,13 +237,7 @@ struct Processor {
 
 impl Processor {
     async fn publish(&self, topic: String, retain: bool, payload: impl Into<Vec<u8>>) {
-        if let Err(e) = self
-            .client
-            .publish(topic.clone(), QoS::AtLeastOnce, retain, payload)
-            .await
-        {
-            warn!(topic, error = %e, "[mqtt] publish failed");
-        }
+        publish_within(&self.client, PUBLISH_TIMEOUT, topic, retain, payload).await;
     }
 
     /// Discovery, availability and every retained topic, then the
@@ -568,6 +564,35 @@ fn control_request(name: &str, payload: &str) -> Result<ControlRequest, String> 
     }
 }
 
+/// Publish, but wait at most `limit` for room in the client's queue.
+///
+/// While the broker is away, the event loop sends nothing, so the queue
+/// fills, and a plain publish would then wait until the broker returns.
+/// Every other task of the processor (the oven's state, events, commands)
+/// would wait with it, and stale messages would pile up. A publish that
+/// times out is dropped: a reconnect publishes every retained topic again
+/// (`on_connected`), and an event from the outage is stale anyway.
+async fn publish_within(
+    client: &AsyncClient,
+    limit: Duration,
+    topic: String,
+    retain: bool,
+    payload: impl Into<Vec<u8>>,
+) -> bool {
+    let send = client.publish(topic.clone(), QoS::AtLeastOnce, retain, payload);
+    match tokio::time::timeout(limit, send).await {
+        Ok(Ok(())) => true,
+        Ok(Err(e)) => {
+            warn!(topic, error = %e, "[mqtt] publish failed");
+            false
+        }
+        Err(_) => {
+            debug!(topic, "[mqtt] publish dropped: the broker is away");
+            false
+        }
+    }
+}
+
 /// The state topic: the `/status` JSON plus what Home Assistant can't
 /// work out without templating every field: `connected`, `phase`,
 /// `recipe_title`, `timer_remaining_secs` and `stage_ends_at` (so the phone
@@ -600,6 +625,21 @@ fn state_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_publish_gives_up_when_the_queue_stays_full() {
+        // An event loop that never runs, as while the broker is away: the
+        // queue holds one message, and nothing takes it out.
+        let (client, _eventloop) = AsyncClient::new(MqttOptions::new("test", "localhost", 1883), 1);
+        let limit = Duration::from_millis(50);
+        assert!(publish_within(&client, limit, "a".into(), false, "1").await);
+        let started = std::time::Instant::now();
+        assert!(!publish_within(&client, limit, "a".into(), false, "2").await);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "it must not wait for the broker"
+        );
+    }
 
     #[test]
     fn control_payloads() {
