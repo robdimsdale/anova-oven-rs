@@ -58,13 +58,27 @@
           <td><a href="/recipes/${encodeURIComponent(r.id)}">${escapeHtml(r.title)}</a></td>
           <td class="hide-narrow">${toSteps(r.stages).length}</td>
           <td class="hide-narrow"><span class="badge">${r.source === "bookmarked" ? "Bookmarked" : "Own"}</span></td>
-          <td class="actions"><button data-start="${escapeHtml(r.id)}" data-title="${escapeHtml(r.title)}">Start</button></td>
+          <td class="actions">
+            <button class="hide-narrow" data-later="in" data-start="${escapeHtml(r.id)}" data-title="${escapeHtml(r.title)}">Start in…</button>
+            <button class="hide-narrow" data-later="at" data-start="${escapeHtml(r.id)}" data-title="${escapeHtml(r.title)}">Start at…</button>
+            <button data-start="${escapeHtml(r.id)}" data-title="${escapeHtml(r.title)}">Start</button>
+          </td>
         </tr>`).join("");
     }
 
     list.addEventListener("click", async (event) => {
       const button = event.target.closest("button[data-start]");
       if (!button) return;
+      if (button.dataset.later) {
+        clearMessage(message);
+        try {
+          const scheduled = await startLater(button.dataset.later, button.dataset.title, { recipe_id: button.dataset.start });
+          if (scheduled) showMessage(message, `${scheduled.title} starts at ${formatStartsAt(scheduled.at)}`, "ok");
+        } catch (e) {
+          showMessage(message, e.message);
+        }
+        return;
+      }
       if (!confirm(`Start “${button.dataset.title}” now?`)) return;
       clearMessage(message);
       try {

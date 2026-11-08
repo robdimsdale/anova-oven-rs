@@ -25,6 +25,7 @@ version = "0.1.0"
 dependencies = [
  "anova-oven-api",
  "clap",
+ "jiff",
  "reqwest",
  "serde_json",
  "tokio",

@@ -16,6 +16,7 @@ mod protocol;
 mod read_model;
 mod recipe;
 mod runtime;
+mod schedule;
 mod telemetry;
 
 use std::time::Duration;
@@ -51,6 +52,8 @@ const DEFAULT_LOCAL_READ_TIMEOUT_SECS: u64 = 90;
 const DEFAULT_HEALTHCHECK_INTERVAL_SECS: u64 = 10;
 const DEFAULT_DATA_DIR: &str = "anova-oven-data";
 const DEFAULT_PREHEAT_TOLERANCE_F: f32 = 2.0;
+/// How often to see whether the scheduled cook's time has come.
+const SCHEDULED_START_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 /// `ANOVA_MODE`: whether the server is a client of Anova's cloud or stands in
 /// for it.
@@ -266,6 +269,15 @@ async fn main() {
     );
     let liveness = std::sync::Arc::new(liveness::Liveness::new(ws_read_timeout.as_secs()));
     let preheat_tolerance_c = preheat_tolerance_c_from_env();
+    // Local mode: where the oven is. Answered to the oven, and what "Start
+    // at 16:30" is read in.
+    let time_zone = match mode {
+        Mode::Cloud => None,
+        Mode::Local => processors::device::time_zone_from_env(),
+    };
+    if let Some(zone) = &time_zone {
+        info!(zone = zone.iana_name().unwrap_or("?"), "[device] time zone");
+    }
 
     let (sm_cmd_tx, sm_cmd_rx) = mpsc::channel::<StateMachineCommand>(64);
     let (sm_evt_tx, sm_evt_rx) = mpsc::channel::<StateMachineEvent>(256);
@@ -327,6 +339,7 @@ async fn main() {
                 store_cmd_rx,
                 store_evt_tx,
                 ws_read_timeout,
+                time_zone.clone(),
                 liveness.clone(),
             )
             .await
@@ -342,6 +355,11 @@ async fn main() {
         failures_tx.clone(),
         mode == Mode::Local,
         preheat_tolerance_c,
+    )
+    .with_scheduled_start(
+        (mode == Mode::Local)
+            .then(|| processors::local_store::load_scheduled_start(&data_dir_from_env()))
+            .flatten(),
     );
     spawn_critical("state-machine", state_machine.run());
 
@@ -393,14 +411,21 @@ async fn main() {
         TickKind::RecipesRefresh,
     );
     spawn_tick_loop(
-        sm_evt_tx,
+        sm_evt_tx.clone(),
         history_refresh_interval,
         TickKind::HistoryRefresh,
     );
+    if mode == Mode::Local {
+        spawn_tick_loop(
+            sm_evt_tx,
+            SCHEDULED_START_CHECK_INTERVAL,
+            TickKind::ScheduledStart,
+        );
+    }
 
     // Home Assistant over MQTT, only when a broker is configured. Not
     // critical: a broker outage mustn't take the server down.
-    match processors::mqtt::MqttConfig::from_env(mode == Mode::Local) {
+    match processors::mqtt::MqttConfig::from_env(mode == Mode::Local, time_zone.clone()) {
         Some(config) => {
             info!(url = %config.url, "[mqtt] publishing to Home Assistant");
             let sources = processors::mqtt::Sources {
@@ -425,6 +450,7 @@ async fn main() {
         liveness,
         recipe_files: (mode == Mode::Local)
             .then(|| processors::local_store::RecipeFiles::new(&data_dir_from_env())),
+        time_zone,
         metrics,
         cook_timeline,
     });
@@ -503,6 +529,7 @@ async fn spawn_local(
     store_cmd_rx: mpsc::Receiver<StoreCommand>,
     store_evt_tx: mpsc::Sender<StoreEvent>,
     state_timeout: Duration,
+    time_zone: Option<jiff::tz::TimeZone>,
     liveness: std::sync::Arc<liveness::Liveness>,
 ) {
     let data_dir = data_dir_from_env();
@@ -523,7 +550,7 @@ async fn spawn_local(
             DEFAULT_HEALTHCHECK_INTERVAL_SECS,
         ),
         state_timeout,
-        time_zone: processors::device::time_zone_from_env(),
+        time_zone,
         ack_timeout: processors::device::DEFAULT_ACK_TIMEOUT,
     };
     spawn_critical(

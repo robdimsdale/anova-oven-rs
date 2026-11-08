@@ -10,9 +10,10 @@
 //! anova-oven-cli history
 //! anova-oven-cli temperature 180c   # local mode only, as are the
 //! anova-oven-cli timer 1h30m        # other cook controls
+//! anova-oven-cli start --recipe-id ID --at 16:30   # or --in 25m (local mode)
 //! ```
 
-use anova_oven_api::{CurrentCook, HistoryEntry, OvenStatus, Recipe, RecipeSource};
+use anova_oven_api::{CurrentCook, HistoryEntry, OvenStatus, Recipe, RecipeSource, ScheduledStart};
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
@@ -38,12 +39,27 @@ enum Command {
     CurrentCook,
     /// Stop the current cook
     Stop,
-    /// Start a cook with a recipe
+    /// Start a cook with a recipe, now or later
     Start {
         /// Recipe ID to start
         #[arg(long)]
         recipe_id: String,
+        /// Start in this long instead of now, e.g. 25m or 1h30m (local mode)
+        #[arg(long = "in", value_parser = parse_duration, conflicts_with = "at")]
+        start_in: Option<u64>,
+        /// Start at this time instead of now, e.g. 16:30 (local mode)
+        #[arg(long)]
+        at: Option<String>,
+        /// Replace a cook already scheduled
+        #[arg(long)]
+        replace: bool,
     },
+    /// Show the cook set to start later
+    Scheduled,
+    /// Cancel the cook set to start later
+    CancelScheduled,
+    /// Start the cook set to start later now
+    StartScheduled,
     /// Reload recipes (in local mode, re-read the recipes directory)
     UpdateRecipes,
     /// Start the next stage, e.g. when the oven is waiting for you (local mode)
@@ -131,20 +147,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        Command::Start { recipe_id } => {
+        Command::Start {
+            recipe_id,
+            start_in,
+            at,
+            replace,
+        } => {
             let url = format!("{server}/api/start");
-            let resp = client
-                .post(&url)
-                .json(&serde_json::json!({ "recipe_id": recipe_id }))
-                .send()
-                .await?;
+            let mut body = serde_json::json!({ "recipe_id": recipe_id, "replace": replace });
+            if let Some(secs) = start_in {
+                body["start_in_minutes"] = secs.div_ceil(60).into();
+            }
+            if let Some(at) = at {
+                body["start_at"] = at.into();
+                // So the server refuses if its zone says otherwise.
+                body["time_zone"] = jiff::tz::TimeZone::system().iana_name().into();
+            }
+            let resp = client.post(&url).json(&body).send().await?;
             if resp.status() == reqwest::StatusCode::NO_CONTENT {
                 println!("Start command sent.");
+            } else if resp.status() == reqwest::StatusCode::CREATED {
+                let scheduled: ScheduledStart = resp.json().await?;
+                print_scheduled(&scheduled);
             } else {
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
                 return Err(format!("Server returned {status}: {body}").into());
             }
+        }
+
+        Command::Scheduled => {
+            let resp = client.get(format!("{server}/api/scheduled")).send().await?;
+            if resp.status() == reqwest::StatusCode::NO_CONTENT {
+                println!("Nothing is scheduled.");
+            } else if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(format!("Server returned {status}: {body}").into());
+            } else {
+                print_scheduled(&resp.json().await?);
+            }
+        }
+
+        Command::CancelScheduled => {
+            let resp = client
+                .delete(format!("{server}/api/scheduled"))
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(format!("Server returned {status}: {body}").into());
+            }
+            println!("Nothing is scheduled now.");
+        }
+
+        Command::StartScheduled => {
+            post(&client, &server, "/api/scheduled/start", None).await?;
+            println!("Start command sent.");
         }
 
         Command::UpdateRecipes => {
@@ -343,6 +403,28 @@ fn print_status(s: &OvenStatus) {
         "Water tank:  {}",
         if s.water_tank_empty { "EMPTY" } else { "ok" }
     );
+    if let Some(scheduled) = &s.scheduled_start {
+        println!(
+            "Scheduled:   {} at {}",
+            scheduled.title,
+            local_time(&scheduled.at)
+        );
+    }
+}
+
+fn print_scheduled(s: &ScheduledStart) {
+    println!("{} starts at {}.", s.title, local_time(&s.at));
+}
+
+/// An RFC 3339 time from the server, in this machine's zone.
+fn local_time(at: &str) -> String {
+    match at.parse::<jiff::Timestamp>() {
+        Ok(ts) => ts
+            .to_zoned(jiff::tz::TimeZone::system())
+            .strftime("%H:%M on %a %-d %b")
+            .to_string(),
+        Err(_) => at.to_string(),
+    }
 }
 
 fn print_recipe(r: &Recipe) {

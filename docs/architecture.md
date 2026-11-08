@@ -27,6 +27,8 @@ Target capabilities:
 │  ├── GET  /api/current-cook   → in-progress cook or 204  │
 │  ├── POST /api/current-cook/save → save cook as recipe   │
 │  ├── POST /api/start          → start cook from recipe   │
+│  │     (now, or later with "Start in" / "Start at")      │
+│  ├── GET/DELETE /api/scheduled, POST …/scheduled/start   │
 │  ├── POST /api/stop           → CMD_APO_STOP             │
 │  └── …controls (local mode)                              │
 │  Web UI: /  (status, light)   /recipes  (recipe editor)  │
@@ -283,8 +285,10 @@ still available.
   Point `iot-prod.anovaculinary.io` at this host in the LAN's DNS (see
   [oven-cloud-emulation.md](oven-cloud-emulation.md#redirecting-the-oven)).
 - `ANOVA_TIMEZONE` — IANA zone answered to the oven's `timezone` requests,
-  e.g. `America/Los_Angeles`. Defaults to the system's zone; if neither is
-  usable the requests go unanswered, which the oven tolerates.
+  e.g. `America/Los_Angeles`, and the zone "Start at 16:30" is read in.
+  Defaults to the system's zone; if neither is usable the requests go
+  unanswered, which the oven tolerates, and "Start at" a time of day is
+  refused.
 - `ANOVA_HEALTHCHECK_INTERVAL_SECS` — `CMD_APO_HEALTHCHECK` cadence
   (default `10`, as the real cloud does)
 - `ANOVA_PREHEAT_TOLERANCE_F` — how far short of its setpoint, in °F, a
@@ -313,6 +317,10 @@ still available.
     of that cook (every 5s while cooking), and removed when the cook goes
     to history. A restart mid-cook keeps the title. The stages come from the
     oven's own `cook` block.
+  - `scheduled-start.json` — the cook set to start later, if there is one:
+    `{"at", "recipe_id"}`, or `{"at", "title", "stages"}` for a manual
+    cook. Read at startup, so a scheduled cook outlasts a restart; removed
+    when it starts or is dropped.
   - `history.jsonl` — one `HistoryEntry` per line, one line per cook.
     `GET /history` returns the last 50, newest first. A cook goes to history
     when an oven report shows the journalled cook is no longer running: on
@@ -331,9 +339,12 @@ are always sent as Celsius.
   each place it waits for you and its note) with stop and next-stage, and
   the light. While
   nothing is cooking, a manual cook: a title and stages in the same editor as
-  recipes, started with `POST /start`.
+  recipes, started with `POST /start`, now or with Start in… / Start at….
+  A cook set to start later shows at the top, with when (in the browser's
+  time), Start now and Cancel.
 - `/recipes` — the recipe list, own first then bookmarked, each by title,
-  with a start button per recipe.
+  with a start button per recipe, and Start in… / Start at… on wider
+  screens. The recipe page has all three.
 - `/recipes/new`, `/recipes/{id}` — the recipe editor. It works in *steps*,
   as Anova's app does: a cook stage, optionally with "Preheat first", which
   saves as a preheat stage with the same settings followed by the cook
@@ -437,10 +448,22 @@ cargo run -p anova-oven-server
   `availability` (last-will), `state` (the `/status` JSON plus `connected`,
   `phase`, `recipe_title`, `timer_remaining_secs`, `stage_ends_at`),
   `next_stage/availability`, `recipes`, `recipe/selected` and its
-  `/attributes`, `manual` (the manual cook being set up), `event`
+  `/attributes`, `manual` (the manual cook being set up), `start_later`
+  (the values the Start in and Start at buttons use), `event`
   (milestones, not retained) and `cmd/<name>` (`start`, `stop`,
   `select_recipe`, `start_manual`, `manual/<field>`, and in local mode
-  `next_stage`, `lamp`, `timer`, `temperature`). A manual cook from Home
+  `next_stage`, `lamp`, `timer`, `temperature`, `start_in`, `start_at`,
+  `start_later/<field>`, `start_scheduled_now`,
+  `cancel_scheduled_start`). `state` carries `scheduled_start` (or
+  `null`), which the Scheduled start sensor (a timestamp) and the
+  availability of Start scheduled cook now and Cancel scheduled start read.
+  The Start in and Start at buttons start the selected recipe after the
+  Start in minutes number, or at the Start at time text. The text sends
+  Home Assistant's zone with it, so a server in a different zone refuses
+  rather than start at the wrong time. `cmd/start_in` also takes
+  `{"recipe_id", "minutes", "replace"}` and `cmd/start_at`
+  `{"recipe_id", "at", "time_zone", "replace"}` (`at` is `HH:MM` or RFC
+  3339) from a script. A manual cook from Home
   Assistant is one step, as the web UI's stage editor makes one (a cook
   stage, optionally led by a preheat): its fields are number and select
   entities over a draft the server keeps in memory (`mqtt::manual`), with a
@@ -451,7 +474,9 @@ cargo run -p anova-oven-server
   `preheat_done`, `stage_started`, `stage_waiting`, `cook_done`,
   `cook_stopped`, `oven_lost`) are a pure function of successive snapshots
   in `mqtt::milestones`, keyed by the oven's `cookId`; the first snapshot
-  is a baseline, so a restart announces nothing. `command_failed` comes from
+  is a baseline, so a restart announces nothing. `cook_scheduled` (with
+  `recipe_title`, `recipe_id` and `at`) is sent when a cook is set to
+  start later, or its time changes. `command_failed` comes from
   refusals and from the state machine's failed acks (a `broadcast` of
   `CommandFailure`). The discovery set is pinned by
   `testdata/mqtt-discovery.json`; regenerate it with
@@ -571,6 +596,29 @@ without the prefix: `GET /status` is `GET /api/status`. (The pico's own
                           tracker with the recipe stages so the next
                           `/status` already carries `cook_progress`.
                           Fire-and-forget `204` once queued.
+                          Local mode: with `"start_in_minutes": 25`
+                          ("Start in") or `"start_at": "16:30"` ("Start
+                          at", read in `ANOVA_TIMEZONE`, today's or else
+                          tomorrow's; an RFC 3339 timestamp works too) it
+                          sets the cook to start later instead: `201` with
+                          the `ScheduledStart` (`at`, `title`,
+                          `recipe_id`). Up to 24 hours ahead, and one cook
+                          at a time: `409` if one is already set, unless
+                          `"replace": true`. Give `"time_zone"` (the
+                          client's IANA zone) with `start_at` and it's
+                          refused (`422`) when that zone puts the time
+                          somewhere else from the oven's. The recipe is
+                          looked up when the cook starts. It starts once
+                          the oven is connected and idle, up to 10 minutes
+                          late; it never replaces a running cook or a
+                          descale. One that
+                          can't start is dropped and announced as
+                          `command_failed` (`scheduled_start`).
+- `GET /scheduled`      — local mode: the `ScheduledStart`, or `204`. Also
+                          on `/status` as `scheduled_start`.
+- `DELETE /scheduled`   — drop the scheduled cook; `204` either way.
+- `POST /scheduled/start` — start the scheduled cook now: `204`, or `409`
+                          if there's none or the oven is cooking.
 - `POST /stop`          — sends `CMD_APO_STOP`; fire-and-forget `204`.
                           In both modes the oven keeps holding the last
                           stage when its timer ends; nothing stops it but
@@ -676,7 +724,12 @@ deserialization.
 - `recipes`       — `GET /recipes`
 - `history`       — `GET /history`
 - `current-cook`  — `GET /current-cook`
-- `start --recipe-id <id>` — `POST /start`
+- `start --recipe-id <id>` — `POST /start`; with `--in 25m` or
+  `--at 16:30` (local mode), set it to start later, `--replace` to replace
+  a cook already set
+- `scheduled`, `cancel-scheduled`, `start-scheduled` — the cook set to
+  start later (local mode): `GET`/`DELETE /scheduled`,
+  `POST /scheduled/start`
 - `stop`          — `POST /stop`
 - `update-recipes` — `POST /update-recipes`; in local mode, re-reads the
   recipes directory after an edit

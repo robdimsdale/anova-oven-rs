@@ -15,11 +15,12 @@ mod discovery;
 mod manual;
 mod milestones;
 mod recipes;
+mod start_later;
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use anova_oven_api::{CookProgress, OvenStatus, Recipe};
+use anova_oven_api::{CookProgress, OvenStatus, Recipe, ScheduledStart};
 use rumqttc::{AsyncClient, Event, LastWill, MqttOptions, Packet, QoS};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tracing::{debug, info, warn};
@@ -27,6 +28,7 @@ use tracing::{debug, info, warn};
 use crate::liveness::Liveness;
 use crate::read_model::ReadModel;
 use crate::runtime::types::{CommandFailure, ControlRequest, StateMachineCommand};
+use crate::schedule::ScheduledCook;
 
 pub use discovery::Topics;
 use milestones::{Milestone, Snapshot};
@@ -50,6 +52,8 @@ pub struct MqttConfig {
     /// server on the same broker (a test run beside the real one) needs
     /// its own.
     pub client_id: String,
+    /// Where the oven is, which "Start at 16:30" is read in.
+    pub time_zone: Option<jiff::tz::TimeZone>,
 }
 
 /// `ANOVA_MQTT_CLIENT_ID`, or `anova-oven-server` when it's unset or blank.
@@ -63,7 +67,7 @@ fn client_id(value: Option<&str>) -> String {
 
 impl MqttConfig {
     /// From `ANOVA_MQTT_*`; `None` when `ANOVA_MQTT_URL` isn't set.
-    pub fn from_env(local: bool) -> Option<Self> {
+    pub fn from_env(local: bool, time_zone: Option<jiff::tz::TimeZone>) -> Option<Self> {
         let url = std::env::var("ANOVA_MQTT_URL").ok()?;
         Some(Self {
             url,
@@ -77,6 +81,7 @@ impl MqttConfig {
             },
             local,
             client_id: client_id(std::env::var("ANOVA_MQTT_CLIENT_ID").ok().as_deref()),
+            time_zone,
         })
     }
 
@@ -131,11 +136,15 @@ pub async fn run(config: MqttConfig, mut sources: Sources) {
         client,
         topics: config.topics,
         local: config.local,
+        time_zone: config.time_zone,
         recipes: Vec::new(),
         options: Vec::new(),
         selected: None,
         manual: manual::Draft::default(),
         last_manual: None,
+        start_later: start_later::Draft::default(),
+        last_start_later: None,
+        last_scheduled: None,
         last_state: None,
         unit: None,
         discovered_unit: None,
@@ -213,6 +222,7 @@ struct Processor {
     client: AsyncClient,
     topics: Topics,
     local: bool,
+    time_zone: Option<jiff::tz::TimeZone>,
     recipes: Vec<Recipe>,
     /// The select's options, each with its recipe ID.
     options: Vec<(String, String)>,
@@ -222,6 +232,13 @@ struct Processor {
     /// The manual cook being set up. Here for the same reasons.
     manual: manual::Draft,
     last_manual: Option<String>,
+    /// The values the "Start in" and "Start at" buttons use. Here for the
+    /// same reasons.
+    start_later: start_later::Draft,
+    last_start_later: Option<String>,
+    /// `None` until the first snapshot, so a schedule from before a restart
+    /// isn't announced again.
+    last_scheduled: Option<Option<ScheduledStart>>,
     last_state: Option<String>,
     /// The oven's display unit, from the last status that had one: the
     /// temperature numbers' unit, and the summaries'. Kept while the oven
@@ -262,6 +279,7 @@ impl Processor {
         self.publish_recipes().await;
         self.last_state = None;
         self.last_manual = None;
+        self.last_start_later = None;
         self.next_stage_ready = None;
         self.on_change(sources, true).await;
     }
@@ -330,6 +348,16 @@ impl Processor {
         }
     }
 
+    /// The "Start in" and "Start at" values, if they changed.
+    async fn publish_start_later(&mut self) {
+        let state = self.start_later.state().to_string();
+        if self.last_start_later.as_deref() != Some(state.as_str()) {
+            self.publish(self.topics.start_later(), true, state.clone())
+                .await;
+            self.last_start_later = Some(state);
+        }
+    }
+
     fn unit(&self) -> String {
         self.unit.clone().unwrap_or_else(|| "C".into())
     }
@@ -368,7 +396,13 @@ impl Processor {
             }
         }
 
-        let state = state_json(status.as_ref(), model.current_cook.as_ref(), connected).to_string();
+        let state = state_json(
+            status.as_ref(),
+            model.current_cook.as_ref(),
+            connected,
+            model.scheduled_start.as_ref(),
+        )
+        .to_string();
         if force || self.last_state.as_deref() != Some(state.as_str()) {
             self.publish(self.topics.state(), true, state.clone()).await;
             self.last_state = Some(state);
@@ -395,7 +429,31 @@ impl Processor {
             }
         }
         self.last_snapshot = Some(snapshot);
+
+        // A new or moved scheduled cook. Not its start or cancellation: the
+        // cook's own events, or a `command_failed`, say what happened.
+        let scheduled = model.scheduled_start;
+        if let Some(prev) = &self.last_scheduled {
+            let moved = |s: &&ScheduledStart| {
+                prev.as_ref()
+                    .is_none_or(|p| (&p.at, &p.recipe_id) != (&s.at, &s.recipe_id))
+            };
+            if let Some(s) = scheduled.as_ref().filter(moved) {
+                info!(event = "cook_scheduled", at = %s.at, "[mqtt] milestone");
+                let payload = serde_json::json!({
+                    "event_type": "cook_scheduled",
+                    "recipe_title": s.title,
+                    "recipe_id": s.recipe_id,
+                    "at": s.at,
+                });
+                self.publish(self.topics.event(), false, payload.to_string())
+                    .await;
+            }
+        }
+        self.last_scheduled = Some(scheduled);
+
         self.publish_manual().await;
+        self.publish_start_later().await;
     }
 
     async fn event(&self, milestone: Milestone, payload: serde_json::Value) {
@@ -482,6 +540,28 @@ impl Processor {
                 self.publish_manual().await;
                 return;
             }
+            "start_later/in_minutes" | "start_later/at_time" => {
+                let result = if name.ends_with("in_minutes") {
+                    self.start_later.set_in_minutes(&text)
+                } else {
+                    self.start_later.set_at_time(&text)
+                };
+                if let Err(e) = result {
+                    self.command_failed(&name, &e).await;
+                }
+                // Republished either way, so a refused value snaps back.
+                self.last_start_later = None;
+                self.publish_start_later().await;
+                return;
+            }
+            "start_in" | "start_at" => {
+                self.schedule_start(&name, &text, sources).await;
+                return;
+            }
+            "cancel_scheduled_start" => {
+                StateMachineCommand::CancelScheduledStart { reply: reply_tx }
+            }
+            "start_scheduled_now" => StateMachineCommand::StartScheduledNow { reply: reply_tx },
             "stop" => StateMachineCommand::StopCook { reply: reply_tx },
             other => {
                 let request = match control_request(other, &text) {
@@ -505,6 +585,47 @@ impl Processor {
             Ok(Err(e)) => self.command_failed(&name, &e.to_string()).await,
             Err(_) => {
                 self.command_failed(&name, "state machine dropped the reply")
+                    .await
+            }
+        }
+    }
+}
+
+impl Processor {
+    /// `cmd/start_in` or `cmd/start_at`: set a recipe to start later.
+    async fn schedule_start(&mut self, name: &str, text: &str, sources: &Sources) {
+        let request = start_later::Request::parse(text);
+        let Some(recipe_id) = request.recipe_id.clone().or_else(|| self.selected.clone()) else {
+            self.command_failed(name, "no recipe selected").await;
+            return;
+        };
+        let when = self.start_later.when(name, &request);
+        let at = match crate::schedule::resolve(
+            &when,
+            self.time_zone.as_ref(),
+            jiff::Timestamp::now(),
+        ) {
+            Ok(at) => at,
+            Err(e) => {
+                self.command_failed(name, &e).await;
+                return;
+            }
+        };
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let cmd = StateMachineCommand::ScheduleStart {
+            at,
+            cook: ScheduledCook::Recipe { recipe_id },
+            replace: request.replace,
+            reply: reply_tx,
+        };
+        if sources.sm_cmd_tx.send(cmd).await.is_err() {
+            return;
+        }
+        match reply_rx.await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => self.command_failed(name, &e.to_string()).await,
+            Err(_) => {
+                self.command_failed(name, "state machine dropped the reply")
                     .await
             }
         }
@@ -596,20 +717,28 @@ async fn publish_within(
 /// The state topic: the `/status` JSON plus what Home Assistant can't
 /// work out without templating every field: `connected`, `phase`,
 /// `recipe_title`, `timer_remaining_secs` and `stage_ends_at` (so the phone
-/// counts down without an update every second).
+/// counts down without an update every second). `scheduled_start` is there
+/// (`null` when there's none) even before the oven first reports.
 fn state_json(
     status: Option<&OvenStatus>,
     cook: Option<&anova_oven_api::CurrentCook>,
     connected: bool,
+    scheduled: Option<&ScheduledStart>,
 ) -> serde_json::Value {
+    let scheduled = serde_json::to_value(scheduled).unwrap_or_default();
     let Some(status) = status else {
-        return serde_json::json!({ "connected": connected, "mode": "unknown" });
+        return serde_json::json!({
+            "connected": connected,
+            "mode": "unknown",
+            "scheduled_start": scheduled,
+        });
     };
     let mut state = serde_json::to_value(status).unwrap_or_default();
     let remaining = status.timer_remaining_secs();
     state["connected"] = connected.into();
     state["phase"] = status.phase().into();
     state["recipe_title"] = cook.map(|c| c.display_name().to_string()).into();
+    state["scheduled_start"] = scheduled;
     state["timer_remaining_secs"] = remaining.into();
     state["stage_ends_at"] = remaining
         .map(|secs| {
@@ -667,8 +796,16 @@ mod tests {
 
     #[test]
     fn state_without_a_status_is_still_published() {
-        let v = state_json(None, None, false);
+        let v = state_json(None, None, false, None);
         assert_eq!(v["connected"], false);
+        assert_eq!(v["scheduled_start"], serde_json::Value::Null);
+        let scheduled = ScheduledStart {
+            at: "2026-11-07T16:30:00Z".into(),
+            title: "Bread".into(),
+            recipe_id: Some("r1".into()),
+        };
+        let v = state_json(None, None, false, Some(&scheduled));
+        assert_eq!(v["scheduled_start"]["at"], "2026-11-07T16:30:00Z");
     }
 
     #[test]
@@ -698,6 +835,7 @@ mod tests {
             },
             local: true,
             client_id: "anova-oven-test".into(),
+            time_zone: None,
         };
         let options = config.options().unwrap();
         assert_eq!(options.broker_address(), ("broker.lan".to_string(), 1883));

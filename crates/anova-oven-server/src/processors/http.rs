@@ -23,6 +23,7 @@ use crate::cook_progress::CookProgressMsg;
 use crate::liveness::Liveness;
 use crate::processors::local_store::{RecipeDraft, RecipeError, RecipeFiles, RecipePatch};
 use crate::runtime::types::{ControlRequest, SmError, StateMachineCommand};
+use crate::schedule::{ScheduledCook, When};
 use crate::telemetry;
 
 mod ui;
@@ -36,6 +37,9 @@ pub struct HttpState {
     /// The recipe files, in local mode. `None` in cloud mode, where recipes
     /// come from Anova's cloud and can't be edited here.
     pub recipe_files: Option<RecipeFiles>,
+    /// Where the oven is, which "Start at 16:30" is read in. `None` in
+    /// cloud mode, or when it isn't known.
+    pub time_zone: Option<jiff::tz::TimeZone>,
     pub metrics: PrometheusHandle,
     pub cook_timeline: Arc<telemetry::CookTimeline>,
 }
@@ -57,6 +61,11 @@ pub(crate) fn router(state: HttpState) -> Router {
         .route("/history", routing::get(handle_history))
         .route("/stop", routing::post(handle_stop))
         .route("/start", routing::post(handle_start))
+        .route(
+            "/scheduled",
+            routing::get(handle_get_scheduled).delete(handle_cancel_scheduled),
+        )
+        .route("/scheduled/start", routing::post(handle_start_scheduled))
         .route("/next-stage", routing::post(handle_next_stage))
         .route("/timer", routing::post(handle_timer))
         .route("/temperature", routing::post(handle_temperature))
@@ -381,7 +390,8 @@ async fn handle_stop(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
 }
 
 /// `POST /start`: a saved recipe by `recipe_id`, or a manual cook from
-/// `stages` (and an optional `title`).
+/// `stages` (and an optional `title`). Now, or later with `start_in_minutes`
+/// or `start_at` (local mode).
 #[derive(Serialize, Deserialize)]
 struct StartRequest {
     #[serde(default)]
@@ -390,6 +400,19 @@ struct StartRequest {
     title: Option<String>,
     #[serde(default)]
     stages: Option<Vec<anova_oven_api::Stage>>,
+    /// "Start in": minutes from now.
+    #[serde(default)]
+    start_in_minutes: Option<u32>,
+    /// "Start at": `HH:MM` where the oven is, or an RFC 3339 timestamp.
+    #[serde(default)]
+    start_at: Option<String>,
+    /// The client's IANA time zone, to check `start_at` means the same to
+    /// it as to the oven.
+    #[serde(default)]
+    time_zone: Option<String>,
+    /// Replace a cook already scheduled, rather than refuse.
+    #[serde(default)]
+    replace: bool,
 }
 
 const MANUAL_COOK_TITLE: &str = "Manual cook";
@@ -510,6 +533,20 @@ async fn handle_start(
     State(state): State<Arc<HttpState>>,
     Json(req): Json<StartRequest>,
 ) -> Response {
+    let when = match (req.start_in_minutes, req.start_at) {
+        (None, None) => None,
+        (Some(minutes), None) => Some(When::In { minutes }),
+        (None, Some(time)) => Some(When::At {
+            time,
+            time_zone: req.time_zone,
+        }),
+        (Some(_), Some(_)) => {
+            return text_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "give start_in_minutes or start_at, not both",
+            )
+        }
+    };
     let (cmd_for, progress_seed) = match (req.recipe_id, req.stages) {
         (Some(recipe_id), _) => {
             debug!(recipe_id = %recipe_id, "[http] POST /start");
@@ -546,6 +583,13 @@ async fn handle_start(
             )
         }
     };
+    if let Some(when) = when {
+        let cook = match cmd_for {
+            StartFrom::Recipe(recipe_id) => ScheduledCook::Recipe { recipe_id },
+            StartFrom::Manual(title, stages) => ScheduledCook::Manual { title, stages },
+        };
+        return schedule_start(&state, &when, cook, req.replace).await;
+    }
 
     let (reply_tx, reply_rx) = oneshot::channel();
     let cmd = match cmd_for {
@@ -593,6 +637,113 @@ async fn handle_start(
 enum StartFrom {
     Recipe(String),
     Manual(String, Vec<anova_oven_api::Stage>),
+}
+
+/// The scheduling half of `POST /start`: `201` with the scheduled cook.
+async fn schedule_start(
+    state: &HttpState,
+    when: &When,
+    cook: ScheduledCook,
+    replace: bool,
+) -> Response {
+    let at = match crate::schedule::resolve(when, state.time_zone.as_ref(), jiff::Timestamp::now())
+    {
+        Ok(at) => at,
+        Err(e) => return text_response(StatusCode::UNPROCESSABLE_ENTITY, e),
+    };
+    debug!(at = %at, cook = ?cook, "[http] POST /start (scheduled)");
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let cmd = StateMachineCommand::ScheduleStart {
+        at,
+        cook,
+        replace,
+        reply: reply_tx,
+    };
+    if let Err(msg) = send_cmd(state, cmd).await {
+        warn!("[http] POST /start -> INTERNAL_SERVER_ERROR ({msg})");
+        return text_response(StatusCode::INTERNAL_SERVER_ERROR, msg);
+    }
+    match reply_rx.await {
+        Ok(Ok(scheduled)) => {
+            info!(at = %at, "[http] POST /start -> CREATED (scheduled)");
+            json_response(StatusCode::CREATED, &scheduled)
+        }
+        Ok(Err(err)) => map_sm_error(err),
+        Err(_) => text_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "State machine dropped reply",
+        ),
+    }
+}
+
+/// `GET /scheduled`: the cook set to start later, or `204`.
+async fn handle_get_scheduled(State(state): State<Arc<HttpState>>) -> Response {
+    trace!("[http] GET /scheduled");
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let cmd = StateMachineCommand::GetScheduledStart { reply: reply_tx };
+    if let Err(msg) = send_cmd(&state, cmd).await {
+        return text_response(StatusCode::INTERNAL_SERVER_ERROR, msg);
+    }
+    match reply_rx.await {
+        Ok(Ok(Some(scheduled))) => json_response(StatusCode::OK, &scheduled),
+        Ok(Ok(None)) => empty_response(StatusCode::NO_CONTENT),
+        Ok(Err(err)) => map_sm_error(err),
+        Err(_) => text_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "State machine dropped reply",
+        ),
+    }
+}
+
+/// `DELETE /scheduled`: drop the scheduled cook. `204` whether or not
+/// there was one.
+async fn handle_cancel_scheduled(State(state): State<Arc<HttpState>>) -> Response {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    unit_command(
+        &state,
+        "DELETE /scheduled",
+        StateMachineCommand::CancelScheduledStart { reply: reply_tx },
+        reply_rx,
+    )
+    .await
+}
+
+/// `POST /scheduled/start`: start the scheduled cook now. `409` if there
+/// isn't one, or the oven is cooking.
+async fn handle_start_scheduled(State(state): State<Arc<HttpState>>) -> Response {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    unit_command(
+        &state,
+        "POST /scheduled/start",
+        StateMachineCommand::StartScheduledNow { reply: reply_tx },
+        reply_rx,
+    )
+    .await
+}
+
+/// Send `cmd` and answer `204` when it succeeds.
+async fn unit_command(
+    state: &HttpState,
+    route: &str,
+    cmd: StateMachineCommand,
+    reply_rx: oneshot::Receiver<Result<(), SmError>>,
+) -> Response {
+    debug!("[http] {route}");
+    if let Err(msg) = send_cmd(state, cmd).await {
+        warn!("[http] {route} -> INTERNAL_SERVER_ERROR ({msg})");
+        return text_response(StatusCode::INTERNAL_SERVER_ERROR, msg);
+    }
+    match reply_rx.await {
+        Ok(Ok(())) => {
+            info!("[http] {route} -> NO_CONTENT");
+            empty_response(StatusCode::NO_CONTENT)
+        }
+        Ok(Err(err)) => map_sm_error(err),
+        Err(_) => text_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "State machine dropped reply",
+        ),
+    }
 }
 
 /// Best-effort lookup so cook-progress can be seeded the moment a recipe
