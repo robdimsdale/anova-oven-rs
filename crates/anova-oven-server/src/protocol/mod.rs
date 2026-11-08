@@ -295,7 +295,6 @@ pub fn cook_done(oven: &OvenState) -> bool {
     cook.stage_transition_pending_user_action && oven.nodes.timer.mode == "idle" && on_last_stage
 }
 
-/// Convert a parsed [`OvenState`] into the simplified `OvenStatus` type.
 /// The faults the oven reports, as short names, in a fixed order.
 pub fn faults(oven: &OvenState) -> Vec<String> {
     let n = &oven.nodes;
@@ -331,6 +330,7 @@ pub fn faults(oven: &OvenState) -> Vec<String> {
     .collect()
 }
 
+/// Convert a parsed [`OvenState`] into the simplified `OvenStatus` type.
 pub fn to_oven_status(oven: &OvenState) -> anova_oven_api::OvenStatus {
     let nodes = &oven.nodes;
     let sg = &nodes.steam_generators;

@@ -171,7 +171,7 @@
     },
     "device_class": "problem",
     "has_entity_name": true,
-    "json_attributes_template": "{{ {'faults': value_json.faults} | tojson }}",
+    "json_attributes_template": "{{ {'faults': value_json.get('faults', [])} | tojson }}",
     "json_attributes_topic": "anova/oven/state",
     "name": "Problem",
     "origin": {
@@ -180,7 +180,7 @@
     },
     "state_topic": "anova/oven/state",
     "unique_id": "anova_oven_problem",
-    "value_template": "{{ 'ON' if value_json.faults else 'OFF' }}"
+    "value_template": "{{ 'ON' if value_json.get('faults') else 'OFF' }}"
   },
   "homeassistant/binary_sensor/anova_oven/water_tank_empty/config": {
     "availability": [
@@ -855,7 +855,7 @@
     },
     "state_topic": "anova/oven/state",
     "unique_id": "anova_oven_firmware",
-    "value_template": "{{ value_json.firmware_version }}"
+    "value_template": "{{ value_json.get('firmware_version') }}"
   },
   "homeassistant/sensor/anova_oven/manual_cook/config": {
     "availability": [
