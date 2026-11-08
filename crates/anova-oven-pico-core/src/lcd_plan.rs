@@ -210,9 +210,11 @@ fn plan_cook(status: &OvenStatus, cook: &CurrentCook, timer_age_secs: u64) -> Lc
 
     let mut slots = Vec::new();
 
+    // "Step", the user's word, though it names the oven stage that's
+    // running: while a step preheats, that's the preheat's own title.
     match stage_title {
         Some(title) => slots.push(format!("Step: {title}")),
-        // A manual cook has no recipe, so every stage in it is manual and
+        // A manual cook has no recipe, so every step in it is manual and
         // naming one tells the user nothing row 0's "Manual cook" hasn't.
         // Drop the slot rather than spend a rotation on it.
         None if cook.recipe_title == "[manual]" => {}
@@ -877,7 +879,7 @@ mod tests {
     #[test]
     fn a_manual_cook_spends_no_slot_naming_its_stage() {
         // "[manual]" is the server's marker for a cook with no recipe behind
-        // it. Every stage in one is manual, so "Step: Cooking" would only
+        // it. Every step in one is manual, so "Step: Cooking" would only
         // repeat what row 0 already says.
         let plan = plan_lcd(
             &status_view(Some(cooking_oven()), Some(cook("[manual]", NO_STAGES))),
@@ -946,7 +948,7 @@ mod tests {
             &status_view(Some(status), Some(cook("Roast Chicken", stage))),
             0,
         );
-        // The stage slot is still worth spending, it just can't name the
+        // The step slot is still worth spending, it just can't name the
         // stage — and with no stage resolved there is no probe target either.
         // Degraded rows, not wrong ones.
         assert_eq!(plan.row1_slots, ["Step: Cooking", "212F", "P:140F"]);

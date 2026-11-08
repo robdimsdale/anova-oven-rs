@@ -1,6 +1,6 @@
 //! A manual cook from Home Assistant: one step, set up field by field in
 //! number and select entities, then started with a button. It's the web
-//! UI's manual cook with a single stage: a cook stage, optionally led by a
+//! UI's manual cook with a single step: a cook stage, optionally led by a
 //! preheat with the same settings.
 //!
 //! The draft lives here, like the selected recipe, so every dashboard sees
@@ -63,7 +63,7 @@ pub struct Draft {
 }
 
 impl Default for Draft {
-    /// The web UI's new stage, with a timer that's ready to go.
+    /// The web UI's new step, with a timer that's ready to go.
     fn default() -> Self {
         Self {
             temperature_c: 180.0,
@@ -107,13 +107,13 @@ impl Draft {
         Ok(())
     }
 
-    /// Whether the oven goes off at the end: only a stage that ends on its
+    /// Whether the oven goes off at the end: only a step that ends on its
     /// own can.
     fn turns_off(&self) -> bool {
         self.at_end == TURN_OFF && (self.ends == ENDS_TIMER || self.ends == ENDS_PROBE)
     }
 
-    /// The stages to send, as the web UI's stage editor builds them.
+    /// The stages to send, as the web UI's step editor builds them.
     pub fn stages(&self) -> Vec<Stage> {
         let (top, rear, bottom) = ELEMENTS_ON[self.elements];
         let (timer, probe) = (self.ends == ENDS_TIMER, self.ends == ENDS_PROBE);
@@ -128,7 +128,7 @@ impl Draft {
             probe_target_c: probe.then_some(self.probe_target_c),
             steam_pct: self.steam_pct,
             fan_speed: 100,
-            // After a preheat that waits: the food goes in, then Next stage.
+            // After a preheat that waits: the food goes in, then Next step.
             user_action_required: Some(self.preheat == PREHEAT_WAIT),
             rack_position: None,
             heating_element_top: Some(top),

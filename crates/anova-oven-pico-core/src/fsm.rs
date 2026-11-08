@@ -449,9 +449,10 @@ pub fn optimistic_idle_view(snap: &ApiSnapshot) -> ViewSpec {
     }
 }
 
-/// If the server has flagged that the next stage is ready (multi-stage
+/// If the server has flagged that the next stage is ready (multi-step
 /// recipes), return the description to prompt the user with. Falls back
-/// to "Next step" if the server didn't supply a description.
+/// to "Next step", the user's word for it, if the server didn't supply a
+/// description.
 pub fn next_stage_prompt(snap: &ApiSnapshot) -> Option<String> {
     let progress = snap.status.as_ref()?.cook_progress.as_ref()?;
     if !progress.next_stage_ready {

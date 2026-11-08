@@ -2,7 +2,7 @@
 //!
 //! Every config is retained under
 //! `<discovery prefix>/<component>/anova_oven/<object>/config`. Entities
-//! only local mode can drive (next stage, lamp, set temperature, set timer)
+//! only local mode can drive (next step, lamp, set temperature, set timer)
 //! get an empty retained config in cloud mode, which removes them, so Home
 //! Assistant never shows a control the cloud will refuse.
 //!
@@ -69,7 +69,7 @@ enum Needs {
     Server,
     /// The server and the oven.
     Oven,
-    /// The server, the oven, and a stage waiting for the user.
+    /// The server, the oven, and a step waiting for the user.
     WaitingStage,
 }
 

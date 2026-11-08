@@ -326,7 +326,7 @@ mod tests {
         let p = cooking(0).payload("cook_started");
         assert_eq!(p["event_type"], "cook_started");
         assert_eq!(p["cook_id"], "cook-1");
-        // Preheat, cook, cook: the preheat and its cook are one stage to
+        // Preheat, cook, cook: the preheat and its cook are one step to
         // the user, described by the cook.
         assert_eq!(p["step_index"], 0);
         assert_eq!(p["step_count"], 2);

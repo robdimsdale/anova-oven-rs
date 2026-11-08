@@ -1,4 +1,4 @@
-// The stage editor, shared by the recipe editor and the manual cook on the
+// The step editor, shared by the recipe editor and the manual cook on the
 // status page. Needs common.js.
 //
 // It works in steps: a cook stage, optionally led by a preheat with the same
@@ -159,7 +159,7 @@ function readNumber(input) {
   return input.value === "" || Number.isNaN(value) ? null : value;
 }
 
-// A stage editor in `container`. `name` keeps its radio groups apart from
+// A step editor in `container`. `name` keeps its radio groups apart from
 // any other editor's; `onChange(valid)` runs after every edit.
 function createStepEditor(container, { name, onChange = () => {} }) {
   let steps = [];

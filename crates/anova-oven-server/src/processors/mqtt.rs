@@ -71,7 +71,7 @@ impl MqttConfig {
             options.set_credentials(user, pass);
         }
         options.set_keep_alive(Duration::from_secs(30));
-        // Discovery for the recipe select and the selected recipe's stages
+        // Discovery for the recipe select and the selected recipe's steps
         // can outgrow rumqttc's 10 KiB default.
         options.set_max_packet_size(256 * 1024, 256 * 1024);
         options.set_last_will(LastWill::new(
