@@ -11,8 +11,8 @@
 //!
 //! In local mode the oven's own state is complete, so none of that is
 //! inferred: the stage is `activeStageIndex`, and `next_stage_ready` is
-//! `stageTransitionPendingUserAction` with a stage still to come (see
-//! [`follow_oven`]).
+//! `stageTransitionPendingUserAction` with a stage still to come, or a stage
+//! that holds until the user moves on (see [`follow_oven`]).
 
 use std::time::{Duration, Instant};
 
@@ -369,8 +369,12 @@ impl CookProgressTask {
 /// Take the stage and `next_stage_ready` from the oven's own state. A set
 /// `stageTransitionPendingUserAction` on the last stage means the cook is
 /// done (or `START_NEXT_STAGE` was sent on it), not that a stage waits, so
-/// it only counts with a stage still to come. Returns whether anything
-/// changed.
+/// it only counts with a stage still to come.
+///
+/// A cook stage with neither timer nor probe ("when I say") never ends, so
+/// the oven never sets the flag on it: it holds until the next stage is
+/// started. That is the oven waiting for the user too, from the moment the
+/// stage starts. Returns whether anything changed.
 fn follow_oven(tracker: &mut Tracker, status: &OvenStatus) -> bool {
     let before = (tracker.current_stage_index, tracker.next_stage_ready);
     if let Some(index) = status
@@ -381,9 +385,15 @@ fn follow_oven(tracker: &mut Tracker, status: &OvenStatus) -> bool {
             tracker.advance_to(index);
         }
     }
+    let holds = tracker.current_stage().is_some_and(holds_until_told);
     tracker.next_stage_ready =
-        status.stage_transition_pending_user_action && tracker.next_stage().is_some();
+        (status.stage_transition_pending_user_action || holds) && tracker.next_stage().is_some();
     before != (tracker.current_stage_index, tracker.next_stage_ready)
+}
+
+/// A cook stage that only ends when the next one is started.
+fn holds_until_told(stage: &Stage) -> bool {
+    stage.kind != "preheat" && stage.timer_added != Some(true) && stage.probe_added != Some(true)
 }
 
 fn build_cook_progress(tracker: &Tracker) -> CookProgress {
@@ -574,11 +584,21 @@ mod tests {
         (p.current_stage_index, p.next_stage_ready)
     }
 
+    /// Three stages that each end on a timer.
+    fn timed_cook() -> CurrentCook {
+        let mut cook = stale_cook();
+        for stage in &mut cook.stages {
+            stage.timer_added = Some(true);
+            stage.duration_secs = Some(600);
+        }
+        cook
+    }
+
     #[test]
     fn local_mode_follows_the_ovens_stage_and_waiting_flag() {
         let (mut task, rx) = local_task_with_rx();
         let status = oven_status(0, false);
-        task.on_current_cook(Some(stale_cook()), Some(&status));
+        task.on_current_cook(Some(timed_cook()), Some(&status));
         task.on_status(Some(&status));
         assert_eq!(progress(&rx), (0, false));
 
@@ -594,7 +614,7 @@ mod tests {
     #[test]
     fn a_waiting_stage_passes_on_its_prompt() {
         let (mut task, rx) = local_task_with_rx();
-        let mut cook = stale_cook();
+        let mut cook = timed_cook();
         cook.stages[1].prompt = Some("Rotate the pan".into());
         task.on_current_cook(Some(cook), Some(&oven_status(0, false)));
         let prompt = |rx: &watch::Receiver<Option<CookProgress>>| {
@@ -610,8 +630,33 @@ mod tests {
     #[test]
     fn local_mode_waiting_flag_on_the_last_stage_is_not_a_next_stage() {
         let (mut task, rx) = local_task_with_rx();
-        task.on_current_cook(Some(stale_cook()), Some(&oven_status(2, false)));
+        task.on_current_cook(Some(timed_cook()), Some(&oven_status(2, false)));
         task.on_status(Some(&oven_status(2, true)));
+        assert_eq!(progress(&rx), (2, false));
+        // Nor is a last stage that holds until told.
+        let (mut task, rx) = local_task_with_rx();
+        task.on_current_cook(Some(stale_cook()), Some(&oven_status(2, false)));
+        assert_eq!(progress(&rx), (2, false));
+    }
+
+    #[test]
+    fn a_stage_that_holds_until_told_waits_for_the_user_from_its_start() {
+        let (mut task, rx) = local_task_with_rx();
+        let mut cook = timed_cook();
+        cook.stages[0].kind = "preheat".into();
+        cook.stages[0].timer_added = Some(false);
+        cook.stages[1].timer_added = Some(false);
+        cook.stages[2].prompt = Some("Load the loaf".into());
+        task.on_current_cook(Some(cook), Some(&oven_status(0, false)));
+        assert_eq!(progress(&rx), (0, false), "a preheat ends by itself");
+
+        // Preheated: the hold starts, and the oven never says it waits.
+        task.on_status(Some(&oven_status(1, false)));
+        assert_eq!(progress(&rx), (1, true));
+        let prompt = rx.borrow().clone().and_then(|p| p.next_stage_prompt);
+        assert_eq!(prompt.as_deref(), Some("Load the loaf"));
+
+        task.on_status(Some(&oven_status(2, false)));
         assert_eq!(progress(&rx), (2, false));
     }
 

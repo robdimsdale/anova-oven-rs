@@ -47,7 +47,10 @@ function toSteps(stages) {
 
 function toStages(steps) {
   const stages = [];
-  for (const step of steps) {
+  steps.forEach((step, n) => {
+    // After a step that holds until you say, the next one always waits for
+    // you: say so to the oven, so its note is kept.
+    const afterHold = n > 0 && !endingOf(steps[n - 1]);
     if (step.preheat && step.cook) {
       for (const field of SHARED) {
         if (step.cook[field] === undefined) delete step.preheat[field];
@@ -57,13 +60,14 @@ function toStages(steps) {
     for (const stage of [step.preheat, step.cook]) {
       if (!stage) continue;
       const copy = { ...stage };
+      if (afterHold && stage === firstStage(step)) copy.user_action_required = true;
       if (!copy.timer_added) delete copy.duration_secs;
       if (!copy.probe_added) delete copy.probe_target_c;
       if (copy.user_action_required && copy.prompt && copy.prompt.trim()) copy.prompt = copy.prompt.trim();
       else delete copy.prompt;
       stages.push(copy);
     }
-  }
+  });
   // Only the last stage turns the oven off, and only once it ends on its own.
   stages.forEach((stage, i) => {
     const last = i === stages.length - 1;
@@ -204,7 +208,11 @@ function createStepEditor(container, { name, onChange = () => {} }) {
     const prev = steps[i - 1];
     const ending = endingOf(prev);
     if (!ending) {
-      return `<div class="between"><p class="hint">Stage ${i} keeps going until you press Next stage, then stage ${i + 1} starts.</p></div>`;
+      return `
+      <div class="between">
+        <p class="hint">Stage ${i} keeps going until you press Next stage, then stage ${i + 1} starts.</p>
+        ${promptHtml(firstStage(steps[i]), i, "first")}
+      </div>`;
     }
     const wait = !!firstStage(steps[i]).user_action_required;
     return `

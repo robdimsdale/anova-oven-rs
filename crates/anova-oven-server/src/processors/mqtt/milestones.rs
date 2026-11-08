@@ -5,7 +5,8 @@
 //! fires nothing, so a server restart mid-cook doesn't announce
 //! `cook_started` again. One edge, one event: a preheat whose next stage
 //! waits for the user ends with `stage_waiting`, and `preheat_done` follows
-//! only when the user starts that stage.
+//! only when the user starts that stage. A stage that holds until the user
+//! moves on waits from its start, so moving into it is `stage_waiting` too.
 //!
 //! The stage comes from the server's cook progress, which in local mode
 //! follows the oven's own `activeStageIndex` and
@@ -31,6 +32,8 @@ pub struct Snapshot {
     pub stage_index: Option<usize>,
     pub stages: Vec<Stage>,
     pub next_stage_ready: bool,
+    /// The note for the user while the next stage waits.
+    pub next_stage_prompt: Option<String>,
     pub cook_done: bool,
     /// The oven's display unit, for the stage summaries.
     pub unit: String,
@@ -51,6 +54,7 @@ impl Snapshot {
                 .or_else(|| status.and_then(|s| s.active_stage_index)),
             stages: cook.map(|c| c.stages.clone()).unwrap_or_default(),
             next_stage_ready: progress.is_some_and(|p| p.next_stage_ready),
+            next_stage_prompt: progress.and_then(|p| p.next_stage_prompt.clone()),
             cook_done: status.is_some_and(|s| s.cook_done),
             unit: status.map_or_else(|| "C".into(), |s| s.temperature_unit.clone()),
         }
@@ -73,6 +77,7 @@ impl Snapshot {
             "next_stage": self
                 .stage(self.stage_index.map(|i| i + 1))
                 .map(|s| recipes::summary(s, &self.unit)),
+            "next_stage_prompt": self.next_stage_prompt.clone().filter(|_| self.next_stage_ready),
         })
     }
 }
@@ -148,8 +153,9 @@ pub fn milestones(prev: &Snapshot, next: &Snapshot) -> Vec<Milestone> {
                 out.push(Milestone::CookStarted);
                 return out;
             }
+            let waiting = !prev.next_stage_ready && next.next_stage_ready;
             if let (Some(before), Some(after)) = (prev.stage_index, next.stage_index) {
-                if before != after {
+                if before != after && !waiting {
                     let was_preheat = prev
                         .stage(Some(before))
                         .is_some_and(|s| s.kind == "preheat");
@@ -160,7 +166,7 @@ pub fn milestones(prev: &Snapshot, next: &Snapshot) -> Vec<Milestone> {
                     });
                 }
             }
-            if !prev.next_stage_ready && next.next_stage_ready {
+            if waiting {
                 out.push(Milestone::StageWaiting);
             }
             if !prev.cook_done && next.cook_done {
@@ -248,6 +254,22 @@ mod tests {
             sequence(&[cooking(0), waiting, cooking(1)]),
             ["stage_waiting", "preheat_done"]
         );
+    }
+
+    #[test]
+    fn moving_into_a_stage_that_holds_until_told_is_only_waiting() {
+        let holding = Snapshot {
+            next_stage_ready: true,
+            next_stage_prompt: Some("Load the loaf".into()),
+            ..cooking(1)
+        };
+        assert_eq!(
+            sequence(&[cooking(0), holding.clone(), cooking(2)]),
+            ["stage_waiting", "stage_started"]
+        );
+        let p = holding.payload("stage_waiting");
+        assert_eq!(p["next_stage_prompt"], "Load the loaf");
+        assert_eq!(p["next_stage"], "Cook · 220 °C dry");
     }
 
     #[test]

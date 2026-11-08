@@ -332,11 +332,13 @@ are always sent as Celsius.
   steps, when the first ends on its own (timer, probe, or a preheat-only
   step at temperature), a radio picks whether the next goes straight on or
   waits for you; it's the next step's first stage's `user_action_required`.
-  The first step's flag isn't shown and is kept as saved. Each "wait for
-  you" choice (between steps, or preheat then wait) has an optional note
-  for while it waits: that stage's `prompt`, shown on the status page by
-  Start next stage (and served as `cook_progress.next_stage_prompt` for the
-  panels). Under the last
+  After a step that ends when you say, the next always waits for you, and
+  its first stage is saved with `user_action_required` set. The first step's
+  flag isn't shown and is kept as saved. Each "wait for you" (between steps,
+  after a step that ends when you say, or preheat then wait) has an optional
+  note for while it waits: that stage's `prompt`, shown on the status page by
+  Start next stage, served as `cook_progress.next_stage_prompt` for the
+  panels, and sent on MQTT's `stage_waiting` event as `next_stage_prompt`. Under the last
   step, when it ends on a timer or probe, a radio picks whether the oven
   keeps holding until you press Stop (the oven's own behaviour) or turns off:
   the last stage's `turn_off_at_end`. Each choice has a
@@ -560,6 +562,9 @@ without the prefix: `GET /status` is `GET /api/status`. (The pico's own
                           stage's id, whether or not the oven is waiting.
                           `/status` has `stage_transition_pending_user_action`
                           (and `cook_progress.next_stage_ready`) when it is.
+                          A stage with no timer or probe never sets the
+                          flag, but `next_stage_ready` is on throughout it:
+                          it only ends when the next one is started.
 - `POST /timer`         — local mode, body `{ "seconds": 90 }`: restart the
                           current stage's countdown.
 - `POST /temperature`   — local mode, body `{ "celsius": 180 }` (25–250):

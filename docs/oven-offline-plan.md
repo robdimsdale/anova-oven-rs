@@ -327,7 +327,9 @@ All under `ANOVA_DATA_DIR`.
 - `/status` carries `stage_transition_pending_user_action`. In local mode
   `CookProgressTask` takes the stage from `activeStageIndex` and
   `next_stage_ready` from that flag, with a stage still to come (on the last
-  stage the flag means done). Cloud mode keeps the inference.
+  stage the flag means done). A cook stage with no timer or probe counts as
+  waiting from its start, since the oven holds it until told and never sets
+  the flag. Cloud mode keeps the inference.
 - **Pico:** pressing the encoder on the "Next stage?" screen sends
   `POST /next-stage`. The screen stays until the server clears
   `next_stage_ready`. Under cloud mode the press gets a `501`, logged.
