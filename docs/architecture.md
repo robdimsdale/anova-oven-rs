@@ -447,8 +447,9 @@ cargo run -p anova-oven-server
   updates, and the client reconnects with backoff, republishing discovery
   and the retained topics on every connect. Topics under the prefix:
   `availability` (last-will), `state` (the `/status` JSON plus `connected`,
-  `phase`, `recipe_title`, `timer_remaining_secs`, `stage_ends_at`),
-  `next_stage/availability`, `recipes`, `recipe/selected` and its
+  `phase`, `recipe_title`, `timer_remaining_secs`, `stage_ends_at`,
+  `stage_started_at`), `next_stage/availability`, `recipes`,
+  `recipe/selected` and its
   `/attributes`, `manual` (the manual cook being set up), `start_later`
   (the values the Start in and Start at buttons use), `event`
   (milestones, not retained) and `cmd/<name>` (`start`, `stop`,
