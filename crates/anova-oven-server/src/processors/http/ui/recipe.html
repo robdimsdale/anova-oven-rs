@@ -23,7 +23,10 @@
   <main>
     <div class="row spread" style="margin-bottom: 16px;">
       <h1 id="heading" style="margin: 0;">Recipe</h1>
-      <button type="button" id="start" class="primary" hidden>Start</button>
+      <div class="row">
+        <button type="button" id="copy" hidden>Copy</button>
+        <button type="button" id="start" class="primary" hidden>Start</button>
+      </div>
     </div>
     <div id="message" class="message"></div>
 
@@ -78,6 +81,7 @@
       const dirty = saved !== null && snapshot() !== saved;
       $("start").disabled = dirty;
       $("start").textContent = dirty ? "Save first" : "Start";
+      $("copy").disabled = dirty;
     }
 
     function markSaved() {
@@ -119,6 +123,19 @@
       }
     };
 
+    // Save a copy of the saved recipe and open it, to rename and change.
+    // Its stages get fresh IDs, so the two recipes don't share any.
+    $("copy").onclick = async () => {
+      clearMessage(message);
+      const stages = recipe.stages.map(({ id, ...stage }) => stage);
+      try {
+        const created = await api("POST", "/recipes", { title: `${recipe.title} (copy)`, stages });
+        location.href = `/recipes/${encodeURIComponent(created.id)}?copied=1`;
+      } catch (e) {
+        showMessage(message, e.message);
+      }
+    };
+
     $("delete").onclick = async () => {
       if (!confirm(`Delete “${recipe.title}”? This can't be undone.`)) return;
       try {
@@ -145,8 +162,14 @@
         ? "Bookmarked from Anova. Changes here only affect this copy" : "";
       $("delete").hidden = isNew;
       $("start").hidden = isNew;
+      $("copy").hidden = isNew;
       $("form").hidden = false;
-      if (new URLSearchParams(location.search).has("saved")) showMessage(message, "Saved", "ok");
+      const params = new URLSearchParams(location.search);
+      if (params.has("saved")) showMessage(message, "Saved", "ok");
+      if (params.has("copied")) {
+        showMessage(message, "Copied. Rename it and make your changes", "ok");
+        $("title").select();
+      }
       if (isNew) editor.reset();
       else {
         editor.setStages(recipe.stages);
