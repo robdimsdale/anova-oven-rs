@@ -189,14 +189,14 @@ function createStepEditor(container, { name, onChange = () => {} }) {
 
   function preheatHtml(step, i) {
     if (!step.cook) {
-      return `<p class="hint" style="margin: 16px 0 0;">Preheat only: this stage ends when the oven reaches temperature.</p>`;
+      return `<p class="hint" style="margin: 16px 0 0;">Preheat only: this step ends when the oven reaches temperature.</p>`;
     }
     return `
       <fieldset class="ends">
         <legend>Preheat</legend>
         ${radios(`${name}-preheat-${i}`, "data-preheat", preheatOf(step), [
           ["none", "No preheat", "Cooking starts straight away, while the oven heats up."],
-          ["wait", "Preheat, then wait for me", "The oven heats up, then holds at temperature until you press Next stage, e.g. once the food is in."],
+          ["wait", "Preheat, then wait for me", "The oven heats up, then holds at temperature until you press Next step, e.g. once the food is in."],
           ["go", "Preheat, then start cooking", "The oven heats up, then starts cooking on its own."],
         ])}
         ${preheatOf(step) === "wait" ? promptHtml(step.cook, i, "cook") : ""}
@@ -210,7 +210,7 @@ function createStepEditor(container, { name, onChange = () => {} }) {
     if (!ending) {
       return `
       <div class="between">
-        <p class="hint">Stage ${i} keeps going until you press Next stage, then stage ${i + 1} starts.</p>
+        <p class="hint">Step ${i} keeps going until you press Next step, then step ${i + 1} starts.</p>
         ${promptHtml(firstStage(steps[i]), i, "first")}
       </div>`;
     }
@@ -218,10 +218,10 @@ function createStepEditor(container, { name, onChange = () => {} }) {
     return `
       <div class="between">
         <fieldset class="ends" data-between="${i}">
-          <legend>When stage ${i}'s ${ending}</legend>
+          <legend>When step ${i}'s ${ending}</legend>
           ${radios(`${name}-between-${i}`, "data-between-choice", wait ? "wait" : "go", [
-            ["go", `Go straight on to stage ${i + 1}`],
-            ["wait", "Wait for me", `The oven keeps holding stage ${i}'s settings until you press Next stage.`],
+            ["go", `Go straight on to step ${i + 1}`],
+            ["wait", "Wait for me", `The oven keeps holding step ${i}'s settings until you press Next step.`],
           ])}
           ${wait ? promptHtml(firstStage(steps[i]), i, "first") : ""}
         </fieldset>
@@ -239,9 +239,9 @@ function createStepEditor(container, { name, onChange = () => {} }) {
     return `
       <div class="between">
         <fieldset class="ends">
-          <legend>When stage ${n}'s ${ending}</legend>
+          <legend>When step ${n}'s ${ending}</legend>
           ${radios(`${name}-finish`, "data-finish", last.cook.turn_off_at_end ? "off" : "hold", [
-            ["hold", "Keep holding until I stop", `The oven keeps holding stage ${n}'s settings until you press Stop.`],
+            ["hold", "Keep holding until I stop", `The oven keeps holding step ${n}'s settings until you press Stop.`],
             ["off", "Turn the oven off", "The cook stops and the light goes off, as if you'd pressed Stop."],
           ])}
         </fieldset>
@@ -264,14 +264,14 @@ function createStepEditor(container, { name, onChange = () => {} }) {
     const current = endsOf(step.cook);
     const timerHint = step.preheat
       ? "The timer starts once the oven is preheated."
-      : "The timer starts as soon as this stage does, while the oven is still heating up. Add a preheat to start it at temperature.";
+      : "The timer starts as soon as this step does, while the oven is still heating up. Add a preheat to start it at temperature.";
     return `
       <fieldset class="ends">
         <legend>Ends</legend>
         ${radios(`${name}-ends-${i}`, "data-ends", current, [
           ["timer", "Timer", timerHint],
           ["probe", "Probe", "Ends when the food reaches the probe target."],
-          ["none", "When I say", "Holds these settings until you press Next stage or Stop."],
+          ["none", "When I say", "Holds these settings until you press Next step or Stop."],
         ])}
         ${current === "timer" ? `
         <div class="fields">
@@ -303,10 +303,10 @@ function createStepEditor(container, { name, onChange = () => {} }) {
       <section class="card" data-index="${i}">
         <div class="stage-head">
           <span class="stage-number">${i + 1}</span>
-          <input data-field="title" placeholder="Stage title (optional)" value="${escapeHtml(s.title || "")}">
+          <input data-field="title" placeholder="Step title (optional)" value="${escapeHtml(s.title || "")}">
           <button type="button" class="icon" data-move="-1" ${i === 0 ? "disabled" : ""} aria-label="Move up">↑</button>
           <button type="button" class="icon" data-move="1" ${i === count - 1 ? "disabled" : ""} aria-label="Move down">↓</button>
-          <button type="button" class="icon danger" data-remove aria-label="Remove stage">✕</button>
+          <button type="button" class="icon danger" data-remove aria-label="Remove step">✕</button>
         </div>
         <div class="fields">
           <label>Mode

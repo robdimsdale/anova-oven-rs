@@ -32,11 +32,11 @@ There only because of Home Assistant:
 | Topic | Why it exists |
 |---|---|
 | `recipes` | Recipe titles, with suffixes for duplicates (`Bread (2)`), because a select's options are strings |
-| `recipe/selected`, `recipe/selected/attributes`, `cmd/select_recipe` | A selection kept on the server so the select has a state, and the dashboard has the selected recipe's stages and summaries |
+| `recipe/selected`, `recipe/selected/attributes`, `cmd/select_recipe` | A selection kept on the server so the select has a state, and the dashboard has the selected recipe's steps and summaries |
 | `cmd/start` with any other payload | Starts that server-side selection (a button's `PRESS`) |
 | `manual`, `cmd/manual/<field>` | A one-stage manual cook built up field by field, because entities can't edit a structured cook |
 | `cmd/start_manual` with any other payload | Starts that draft |
-| `next_stage/availability` | `online` only while a stage waits, so the Next stage button shows only then |
+| `next_stage/availability` | `online` only while a stage waits, so the Next step button shows only then |
 
 Plus, Home Assistant only: the discovery configs under
 `ANOVA_MQTT_DISCOVERY_PREFIX`, and their templates (the `"None"` that

@@ -451,7 +451,7 @@ pub fn optimistic_idle_view(snap: &ApiSnapshot) -> ViewSpec {
 
 /// If the server has flagged that the next stage is ready (multi-stage
 /// recipes), return the description to prompt the user with. Falls back
-/// to "Next stage" if the server didn't supply a description.
+/// to "Next step" if the server didn't supply a description.
 pub fn next_stage_prompt(snap: &ApiSnapshot) -> Option<String> {
     let progress = snap.status.as_ref()?.cook_progress.as_ref()?;
     if !progress.next_stage_ready {
@@ -461,7 +461,7 @@ pub fn next_stage_prompt(snap: &ApiSnapshot) -> Option<String> {
         progress
             .next_stage_description
             .clone()
-            .unwrap_or_else(|| String::from("Next stage")),
+            .unwrap_or_else(|| String::from("Next step")),
     )
 }
 
@@ -1088,7 +1088,7 @@ mod tests {
         let mut status = idle_status();
         status.cook_progress = Some(cook_progress(true, None, "r"));
         snap.status = Some(status);
-        assert_eq!(next_stage_prompt(&snap).as_deref(), Some("Next stage"));
+        assert_eq!(next_stage_prompt(&snap).as_deref(), Some("Next step"));
     }
 
     // --- active_recipe_title ---

@@ -581,13 +581,15 @@ pub fn normalize(mut recipe: Recipe) -> Result<Recipe, RecipeError> {
         return invalid("title can't be empty".into());
     }
     if recipe.stages.is_empty() {
-        return invalid("a recipe needs at least one stage".into());
+        return invalid("a recipe needs at least one step".into());
     }
     let last = recipe.stages.len() - 1;
+    // Errors name the step, as the editor numbers them, not the oven's stage.
+    let steps = anova_oven_api::steps(&recipe.stages);
     for (i, stage) in recipe.stages.iter_mut().enumerate() {
-        let n = i + 1;
+        let n = steps.iter().position(|r| r.contains(&i)).unwrap_or(i) + 1;
         if stage.kind != "preheat" && stage.kind != "cook" {
-            return invalid(format!("stage {n}: kind must be preheat or cook"));
+            return invalid(format!("step {n}: kind must be preheat or cook"));
         }
         let wet = stage.temperature_bulbs_mode.as_deref() == Some("wet");
         // Sous vide tops out at 100 °C on the original Precision Oven.
@@ -600,52 +602,52 @@ pub fn normalize(mut recipe: Recipe) -> Result<Recipe, RecipeError> {
             (25.0..=250.0, "temperature must be within 25–250 °C")
         };
         if !range.contains(&stage.temperature_c) {
-            return invalid(format!("stage {n}: {what}"));
+            return invalid(format!("step {n}: {what}"));
         }
         if !(0.0..=100.0).contains(&stage.steam_pct) {
-            return invalid(format!("stage {n}: steam must be within 0–100 %"));
+            return invalid(format!("step {n}: steam must be within 0–100 %"));
         }
         if stage.fan_speed > 100 {
-            return invalid(format!("stage {n}: fan must be within 0–100 %"));
+            return invalid(format!("step {n}: fan must be within 0–100 %"));
         }
         if stage.rack_position.is_some_and(|r| !(1..=5).contains(&r)) {
-            return invalid(format!("stage {n}: rack must be within 1–5"));
+            return invalid(format!("step {n}: rack must be within 1–5"));
         }
         if stage.timer_added == Some(true) && !stage.duration_secs.is_some_and(|d| d > 0) {
-            return invalid(format!("stage {n}: a timer needs a duration"));
+            return invalid(format!("step {n}: a timer needs a duration"));
         }
         if stage.probe_added == Some(true) && stage.probe_target_c.is_none() {
-            return invalid(format!("stage {n}: a probe stage needs a target"));
+            return invalid(format!("step {n}: a probe step needs a target"));
         }
         if stage
             .probe_target_c
             .is_some_and(|t| !(1.0..=100.0).contains(&t))
         {
             return invalid(format!(
-                "stage {n}: the probe target must be within 1–100 °C"
+                "step {n}: the probe target must be within 1–100 °C"
             ));
         }
         if stage.timer_added == Some(true) && stage.probe_added == Some(true) {
             return invalid(format!(
-                "stage {n}: a stage takes a timer or a probe, not both"
+                "step {n}: a step takes a timer or a probe, not both"
             ));
         }
         if stage.kind == "preheat"
             && (stage.timer_added == Some(true) || stage.probe_added == Some(true))
         {
             return invalid(format!(
-                "stage {n}: a preheat ends at temperature, without a timer or probe"
+                "step {n}: a preheat ends at temperature, without a timer or probe"
             ));
         }
         if stage.turn_off_at_end == Some(true) {
             if i != last {
                 return invalid(format!(
-                    "stage {n}: only the last stage can turn the oven off"
+                    "step {n}: only the last step can turn the oven off"
                 ));
             }
             if stage.timer_added != Some(true) && stage.probe_added != Some(true) {
                 return invalid(format!(
-                    "stage {n}: turning the oven off needs a timer or probe to end on"
+                    "step {n}: turning the oven off needs a timer or probe to end on"
                 ));
             }
         } else {
@@ -659,12 +661,12 @@ pub fn normalize(mut recipe: Recipe) -> Result<Recipe, RecipeError> {
         if let Some(prompt) = &stage.prompt {
             if prompt.chars().count() > PROMPT_MAX_CHARS {
                 return invalid(format!(
-                    "stage {n}: the note for when it waits must be at most {PROMPT_MAX_CHARS} characters"
+                    "step {n}: the note for when it waits must be at most {PROMPT_MAX_CHARS} characters"
                 ));
             }
             if stage.user_action_required != Some(true) {
                 return invalid(format!(
-                    "stage {n}: only a stage that waits for you can have a note for when it waits"
+                    "step {n}: only a step that waits for you can have a note for when it waits"
                 ));
             }
         }
@@ -676,7 +678,7 @@ pub fn normalize(mut recipe: Recipe) -> Result<Recipe, RecipeError> {
         // Any one or two, never all three or none (Anova's oven-commands docs).
         let on = elements.iter().filter(|e| **e == Some(true)).count();
         if !(1..=2).contains(&on) {
-            return invalid(format!("stage {n}: use one or two heating elements"));
+            return invalid(format!("step {n}: use one or two heating elements"));
         }
         // The firmware won't run the rear (convection) element, or steam,
         // with the fan off.

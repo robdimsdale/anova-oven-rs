@@ -346,7 +346,7 @@ fn entities(topics: &Topics, options: &[String], unit: &str) -> Vec<Entity> {
         entity(
             "sensor",
             "stage_ends_at",
-            "Stage ends at",
+            "Step ends at",
             Needs::Oven,
             reading(
                 topics,
@@ -364,7 +364,7 @@ fn entities(topics: &Topics, options: &[String], unit: &str) -> Vec<Entity> {
         entity(
             "sensor",
             "stage",
-            "Stage",
+            "Step",
             Needs::Oven,
             json!({
                 "state_topic": topics.state(),
@@ -376,7 +376,7 @@ fn entities(topics: &Topics, options: &[String], unit: &str) -> Vec<Entity> {
         entity(
             "sensor",
             "stage_description",
-            "Stage description",
+            "Step description",
             Needs::Oven,
             json!({
                 "state_topic": topics.state(),
@@ -427,7 +427,7 @@ fn entities(topics: &Topics, options: &[String], unit: &str) -> Vec<Entity> {
         entity(
             "binary_sensor",
             "next_stage_ready",
-            "Next stage ready",
+            "Next step ready",
             Needs::Oven,
             on_off(
                 topics,
@@ -593,7 +593,7 @@ fn entities(topics: &Topics, options: &[String], unit: &str) -> Vec<Entity> {
         local(
             "button",
             "next_stage",
-            "Next stage",
+            "Next step",
             Needs::WaitingStage,
             json!({ "command_topic": topics.command("next_stage") }),
         ),

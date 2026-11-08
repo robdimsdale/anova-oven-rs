@@ -298,7 +298,7 @@ where
         }
         ViewSpec::NextStagePrompt { recipe_title } => {
             let mut lines = Vec::new();
-            lines.push(planline(FontRole::Title, String::from("Next stage?")));
+            lines.push(planline(FontRole::Title, String::from("Next step?")));
             push_wrapped(
                 &mut lines,
                 FontRole::Body,

@@ -137,7 +137,7 @@ pub fn plan_lcd(view: &ViewSpec, timer_age_secs: u64) -> LcdPlan {
             } else {
                 recipe_title.as_str()
             };
-            rows(row0, "Next stage ready")
+            rows(row0, "Next step ready")
         }
         ViewSpec::Recovery {
             reset_count,
@@ -211,12 +211,12 @@ fn plan_cook(status: &OvenStatus, cook: &CurrentCook, timer_age_secs: u64) -> Lc
     let mut slots = Vec::new();
 
     match stage_title {
-        Some(title) => slots.push(format!("Stage: {title}")),
+        Some(title) => slots.push(format!("Step: {title}")),
         // A manual cook has no recipe, so every stage in it is manual and
         // naming one tells the user nothing row 0's "Manual cook" hasn't.
         // Drop the slot rather than spend a rotation on it.
         None if cook.recipe_title == "[manual]" => {}
-        None => slots.push(format!("Stage: {phase}")),
+        None => slots.push(format!("Step: {phase}")),
     }
 
     // The temperature is the one slot that is always present.
@@ -787,7 +787,7 @@ mod tests {
             0,
         );
         assert_eq!(named.row0, "Sourdough");
-        assert_eq!(named.row1_slots, ["Next stage ready"]);
+        assert_eq!(named.row1_slots, ["Next step ready"]);
 
         let unnamed = plan_lcd(
             &ViewSpec::NextStagePrompt {
@@ -865,7 +865,7 @@ mod tests {
         assert_eq!(
             plan.row1_slots,
             [
-                "Stage: Roast",
+                "Step: Roast",
                 "212F>230F",
                 "Phase: Cooking",
                 // 300s on the clock, read the instant it was fetched.
@@ -877,7 +877,7 @@ mod tests {
     #[test]
     fn a_manual_cook_spends_no_slot_naming_its_stage() {
         // "[manual]" is the server's marker for a cook with no recipe behind
-        // it. Every stage in one is manual, so "Stage: Cooking" would only
+        // it. Every stage in one is manual, so "Step: Cooking" would only
         // repeat what row 0 already says.
         let plan = plan_lcd(
             &status_view(Some(cooking_oven()), Some(cook("[manual]", NO_STAGES))),
@@ -895,7 +895,7 @@ mod tests {
         );
         // No stage title to show, but this *is* a recipe cook, so the slot is
         // still worth spending — it says which part of the recipe is running.
-        assert_eq!(plan.row1_slots[0], "Stage: Cooking");
+        assert_eq!(plan.row1_slots[0], "Step: Cooking");
     }
 
     #[test]
@@ -928,7 +928,7 @@ mod tests {
             &status_view(Some(status), Some(cook("Roast Chicken", stages))),
             0,
         );
-        assert_eq!(plan.row1_slots[0], "Stage: Rest");
+        assert_eq!(plan.row1_slots[0], "Step: Rest");
     }
 
     #[test]
@@ -949,7 +949,7 @@ mod tests {
         // The stage slot is still worth spending, it just can't name the
         // stage — and with no stage resolved there is no probe target either.
         // Degraded rows, not wrong ones.
-        assert_eq!(plan.row1_slots, ["Stage: Cooking", "212F", "P:140F"]);
+        assert_eq!(plan.row1_slots, ["Step: Cooking", "212F", "P:140F"]);
     }
 
     #[test]
@@ -961,8 +961,8 @@ mod tests {
             0,
         );
         // Case-insensitively the same word, so a "Phase: Cooking" slot would
-        // just be a second turn for "Stage: cooking".
-        assert_eq!(plan.row1_slots, ["Stage: cooking", "212F", "Timer: 05:00"]);
+        // just be a second turn for "Step: cooking".
+        assert_eq!(plan.row1_slots, ["Step: cooking", "212F", "Timer: 05:00"]);
     }
 
     #[test]
@@ -1004,7 +1004,7 @@ mod tests {
         );
         assert_eq!(
             plan.row1_slots,
-            ["Stage: Roast", "212F", "Phase: Cooking", "P:140F>167F"]
+            ["Step: Roast", "212F", "Phase: Cooking", "P:140F>167F"]
         );
     }
 
@@ -1017,7 +1017,7 @@ mod tests {
             &status_view(Some(status), Some(cook("Roast Chicken", ROAST_STAGE))),
             0,
         );
-        assert_eq!(plan.row1_slots, ["Stage: Roast", "212F", "Phase: Cooking"]);
+        assert_eq!(plan.row1_slots, ["Step: Roast", "212F", "Phase: Cooking"]);
     }
 
     // --- LcdAnimator ---
@@ -1187,16 +1187,16 @@ mod tests {
         let mut p = Panel::new();
         let plan = LcdPlan {
             row0: String::from("Roast Chicken"),
-            row1_slots: alloc::vec![String::from("Stage: Roast"), String::from("Stage: Rests"),],
+            row1_slots: alloc::vec![String::from("Step: Roast"), String::from("Step: Rests"),],
         };
         p.tick(&plan, 0);
         p.tick(&plan, 3000);
 
-        // The slots share their "Stage: " prefix, so handing over costs only
+        // The slots share their "Step: " prefix, so handing over costs only
         // the cells that actually differ.
         let frame = p.tick(&plan, 3050);
-        assert_eq!(frame.row1, [span(8, "ests")]);
-        assert_eq!(p.row(1), "Stage: Rests    ");
+        assert_eq!(frame.row1, [span(7, "ests")]);
+        assert_eq!(p.row(1), "Step: Rests     ");
     }
 
     #[test]

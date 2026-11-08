@@ -287,7 +287,7 @@ mod tests {
         d.set("mode", "Sous vide (wet bulb)").unwrap();
         assert_eq!(
             d.state("C")["problem"],
-            "stage 1: sous vide temperature must be within 25–100 °C"
+            "step 1: sous vide temperature must be within 25–100 °C"
         );
     }
 }

@@ -185,14 +185,17 @@ All types derive `serde::Serialize` + `serde::Deserialize` with
 
 **Key design decisions:**
 - Temperatures are always Celsius; the CLI/Pico convert for display.
-- **The user's stages aren't the oven's.** The oven runs a preheat and the
-  cook after it as two stages; the recipe editor shows them as one.
-  `anova_oven_api::steps` groups them the same way as the editor's
-  `toSteps`, and anything shown to the user counts and names those: the
-  status page, the recipes list, the MQTT events' `stage_index` and
-  `stage_count`, the HA Stage sensor and the selected recipe's `stages`.
-  The API's own stage indices and counts (`current_stage_index`,
-  `stage_count` on `Recipe`, `activeStageIndex`) stay the oven's.
+- **The user sees steps; stages are the oven's.** The oven runs a preheat
+  and the cook after it as two stages; the recipe editor shows them as one
+  step. `anova_oven_api::steps` groups them the same way as the editor's
+  `toSteps`, and anything shown to the user counts and names steps: the
+  web UI, recipe validation errors, the panels, the MQTT events'
+  `step_index`, `step_count`, `current_step`, `next_step` and
+  `next_step_prompt`, the HA Step sensor and entity names, and the selected
+  recipe's `steps`. "Stage" is kept for the oven's own representation: the
+  API's `Stage`, `current_stage_index`, `stage_count` on `Recipe`,
+  `activeStageIndex`, and identifiers HA already holds (entity IDs such as
+  `button.anova_oven_next_stage`, event types such as `stage_waiting`).
 - Stages are pre-filtered to `stepType == "stage"` (directions stripped).
 - `stage_count` is included at the top of `Recipe` for list views that
   don't need to decode the full `stages` array.

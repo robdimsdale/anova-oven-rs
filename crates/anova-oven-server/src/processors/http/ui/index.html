@@ -48,7 +48,7 @@
       <ol id="cook-steps" class="cook-steps" hidden></ol>
       <p id="cook-prompt" style="margin: 10px 0 0;" hidden></p>
       <div class="row" style="margin-top: 14px;">
-        <button id="next-stage" class="primary" hidden>Start next stage</button>
+        <button id="next-stage" class="primary" hidden>Start next step</button>
         <button id="save-recipe" hidden>Save as recipe</button>
         <button id="stop" class="danger">Stop cook</button>
       </div>
@@ -63,7 +63,7 @@
       </div>
       <div id="manual-steps"></div>
       <div class="row" style="margin-bottom: 16px;">
-        <button type="button" id="manual-add">Add stage</button>
+        <button type="button" id="manual-add">Add step</button>
         <button type="button" id="manual-start" class="primary">Start cook</button>
       </div>
     </section>
@@ -125,8 +125,8 @@
         $("cook-title").textContent = progress.recipe_title;
         const step = renderCookSteps(progress);
         $("cook-stage").textContent = step
-          ? `Stage ${step.number} of ${step.count}: ${step.title}`
-          : `Stage ${progress.current_step_index + 1} of ${progress.step_count}: ${stageDescription(progress)}`;
+          ? `Step ${step.number} of ${step.count}: ${step.title}`
+          : `Step ${progress.current_step_index + 1} of ${progress.step_count}: ${stageDescription(progress)}`;
         $("next-stage").hidden = !progress.next_stage_ready;
         // The step list shows the note where it waits.
         $("cook-prompt").textContent = progress.next_stage_prompt || "";
@@ -142,10 +142,10 @@
       }
     }
 
-    // The whole cook, as the editor's stages (a preheat and the cook after
-    // it are one, though the oven runs them as two): done, now and to come,
-    // with each place it waits for you and its note between them. Returns
-    // the current one, or null if the stages aren't known.
+    // The whole cook, as the editor's steps (a preheat and the cook after it
+    // are one step, though the oven runs them as two stages): done, now and
+    // to come, with each place it waits for you and its note between them.
+    // Returns the current step, or null if the stages aren't known.
     function renderCookSteps(progress) {
       const list = $("cook-steps");
       if (!cookStages || cookStages.length !== progress.total_stage_count) {
@@ -167,7 +167,7 @@
         const before = n > 0 && (holdsBefore || firstStage(step).user_action_required)
           ? waitHtml(firstStage(step), waiting === first, "li") : "";
         const state = last < active ? "done" : first <= active ? "now" : "next";
-        const title = mainStage(step).title || `Stage ${n + 1}`;
+        const title = mainStage(step).title || `Step ${n + 1}`;
         if (state === "now") current = { number: n + 1, count: steps.length, title };
         // A preheat that waits for you before its cook.
         const inside = step.preheat && step.cook && step.cook.user_action_required

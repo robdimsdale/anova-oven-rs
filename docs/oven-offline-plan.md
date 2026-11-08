@@ -330,7 +330,7 @@ All under `ANOVA_DATA_DIR`.
   stage the flag means done). A cook stage with no timer or probe counts as
   waiting from its start, since the oven holds it until told and never sets
   the flag. Cloud mode keeps the inference.
-- **Pico:** pressing the encoder on the "Next stage?" screen sends
+- **Pico:** pressing the encoder on the "Next step?" screen sends
   `POST /next-stage`. The screen stays until the server clears
   `next_stage_ready`. Under cloud mode the press gets a `501`, logged.
 - A failed control ack is logged; there's nothing to roll back, since the
@@ -541,12 +541,13 @@ So:
   suffix (`Bread (2)`) so every option maps to one recipe. The server keeps the
   title → ID map; Home Assistant only ever sees titles.
 - When the selection changes, the server publishes the recipe to the selected
-  recipe sensor's attributes topic: title, source (own or bookmarked), stage
-  count, total timed duration, and a `stages` list. Each stage has its kind,
-  title, temperature (°C), bulb mode, steam, fan, timer or probe target,
-  elements, and whether it waits for the user.
-- Each stage also carries a one-line `summary` the server formats, e.g.
-  `Cook · 220 °C dry · 30% steam · 25 min · waits for you`. A dashboard
+  recipe sensor's attributes topic: title, source (own or bookmarked),
+  `step_count`, total timed duration, and a `steps` list (a preheat and its
+  cook are one step). Each step has its kind, title, temperature (°C), bulb
+  mode, steam, fan, timer or probe target, elements, whether it preheats
+  first, and whether it waits for the user.
+- Each step also carries a one-line `summary` the server formats, e.g.
+  `Bake · 220 °C dry · preheat first · 25 min · waits for you`. A dashboard
   markdown card can then list a recipe without templating every field. The
   summary uses the oven's display unit, as the temperature numbers do.
 
@@ -576,9 +577,10 @@ One edge, one event: a preheat whose next stage waits for the user (to put the
 food in) ends with `stage_waiting`, and `preheat_done` or `stage_started`
 follows only when the user starts the stage.
 
-Each payload carries `event_type`, `cook_id`, `recipe_title`, `stage_index`,
-`stage_count`, the current and next stages' `summary`, all counting stages as
-the recipe editor does (a preheat and its cook are one), and for
+Each payload carries `event_type`, `cook_id`, `recipe_title`, `step_index`,
+`step_count`, `current_step` and `next_step` (summaries), and
+`next_step_prompt` (the note while it waits), all counting steps as the
+recipe editor does (a preheat and its cook are one), and for
 `command_failed`, the command and reason. `cook_id` lets a notification use it
 as a tag, so each milestone replaces the previous one for that cook instead of
 piling up.
