@@ -397,6 +397,15 @@ fn start(
     mut recipe: Recipe,
     from: StartedFrom,
 ) -> (Result<(), SmError>, Vec<SmEffect>) {
+    // A start ends the oven's descale program, as a stop would.
+    if state.status.as_ref().is_some_and(|s| s.is_descaling()) {
+        return (
+            Err(SmError::Conflict(
+                "the oven is descaling; start the cook once it's done".into(),
+            )),
+            Vec::new(),
+        );
+    }
     crate::recipe::rewrite_preheat_stage_ids(&mut recipe.stages);
     // The IDs the oven will report the stages by, which the cook's extras
     // are kept under.
@@ -2412,6 +2421,21 @@ mod tests {
         );
         assert!(saved_none(&effects));
         assert!(state.scheduled.is_none());
+    }
+
+    #[test]
+    fn a_start_never_ends_a_descale() {
+        let mut state = local_state();
+        let _ = apply_apo_state(&mut state, oven_status("descale", 0));
+        state.recipes = vec![recipe(vec![stage(Some("s1"), "cook", false, Some(600))])];
+        let (result, effects) = start_cook(&mut state, "r");
+        assert!(matches!(result, Err(SmError::Conflict(ref e)) if e.contains("descaling")));
+        assert!(effects.is_empty());
+        assert_eq!(state.lifecycle, Lifecycle::Idle);
+        let stages = vec![stage(Some("m1"), "cook", false, Some(300))];
+        let (result, effects) = start_manual_cook(&mut state, "Toast".into(), stages);
+        assert!(result.is_err());
+        assert!(effects.is_empty());
     }
 
     #[test]

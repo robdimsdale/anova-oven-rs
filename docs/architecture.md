@@ -595,7 +595,9 @@ without the prefix: `GET /status` is `GET /api/status`. (The pico's own
                           over the WebSocket, and seeds the cook-progress
                           tracker with the recipe stages so the next
                           `/status` already carries `cook_progress`.
-                          Fire-and-forget `204` once queued.
+                          Fire-and-forget `204` once queued. `409` while
+                          the oven runs its descale program, which a start
+                          would end.
                           Local mode: with `"start_in_minutes": 25`
                           ("Start in") or `"start_at": "16:30"` ("Start
                           at", read in `ANOVA_TIMEZONE`, today's or else
