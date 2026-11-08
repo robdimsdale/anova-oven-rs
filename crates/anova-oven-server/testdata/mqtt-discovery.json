@@ -213,6 +213,35 @@
     "unique_id": "anova_oven_water_tank_empty",
     "value_template": "{{ 'ON' if value_json.water_tank_empty else 'OFF' }}"
   },
+  "homeassistant/button/anova_oven/cancel_scheduled_start/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      },
+      {
+        "topic": "anova/oven/state",
+        "value_template": "{{ 'online' if value_json.scheduled_start else 'offline' }}"
+      }
+    ],
+    "availability_mode": "all",
+    "command_topic": "anova/oven/cmd/cancel_scheduled_start",
+    "default_entity_id": "button.anova_oven_cancel_scheduled_start",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "has_entity_name": true,
+    "name": "Cancel scheduled start",
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "unique_id": "anova_oven_cancel_scheduled_start"
+  },
   "homeassistant/button/anova_oven/next_stage/config": {
     "availability": [
       {
@@ -274,6 +303,56 @@
     },
     "unique_id": "anova_oven_start"
   },
+  "homeassistant/button/anova_oven/start_at/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      }
+    ],
+    "availability_mode": "all",
+    "command_topic": "anova/oven/cmd/start_at",
+    "default_entity_id": "button.anova_oven_start_at",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "has_entity_name": true,
+    "name": "Start at",
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "unique_id": "anova_oven_start_at"
+  },
+  "homeassistant/button/anova_oven/start_in/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      }
+    ],
+    "availability_mode": "all",
+    "command_topic": "anova/oven/cmd/start_in",
+    "default_entity_id": "button.anova_oven_start_in",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "has_entity_name": true,
+    "name": "Start in",
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "unique_id": "anova_oven_start_in"
+  },
   "homeassistant/button/anova_oven/start_manual/config": {
     "availability": [
       {
@@ -302,6 +381,35 @@
       "sw_version": "x"
     },
     "unique_id": "anova_oven_start_manual"
+  },
+  "homeassistant/button/anova_oven/start_scheduled_now/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      },
+      {
+        "topic": "anova/oven/state",
+        "value_template": "{{ 'online' if value_json.connected and value_json.scheduled_start else 'offline' }}"
+      }
+    ],
+    "availability_mode": "all",
+    "command_topic": "anova/oven/cmd/start_scheduled_now",
+    "default_entity_id": "button.anova_oven_start_scheduled_now",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "has_entity_name": true,
+    "name": "Start scheduled cook now",
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "unique_id": "anova_oven_start_scheduled_now"
   },
   "homeassistant/button/anova_oven/stop/config": {
     "availability": [
@@ -356,7 +464,8 @@
       "cook_done",
       "cook_stopped",
       "command_failed",
-      "oven_lost"
+      "oven_lost",
+      "cook_scheduled"
     ],
     "has_entity_name": true,
     "name": "Cook",
@@ -603,6 +712,38 @@
     "unique_id": "anova_oven_set_timer",
     "unit_of_measurement": "min",
     "value_template": "{% set s = value_json.timer_total_secs %}{{ [(s / 60) | round(0) | int, 1] | max if s else 'None' }}"
+  },
+  "homeassistant/number/anova_oven/start_in_minutes/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      }
+    ],
+    "availability_mode": "all",
+    "command_topic": "anova/oven/cmd/start_later/in_minutes",
+    "default_entity_id": "number.anova_oven_start_in_minutes",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "has_entity_name": true,
+    "max": 1440,
+    "min": 1,
+    "mode": "box",
+    "name": "Start in minutes",
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "state_topic": "anova/oven/start_later",
+    "step": 1,
+    "unique_id": "anova_oven_start_in_minutes",
+    "unit_of_measurement": "min",
+    "value_template": "{{ value_json.in_minutes }}"
   },
   "homeassistant/select/anova_oven/manual_at_end/config": {
     "availability": [
@@ -949,6 +1090,61 @@
     "unit_of_measurement": "°C",
     "value_template": "{{ value_json.get('probe_temperature_c') }}"
   },
+  "homeassistant/sensor/anova_oven/scheduled_recipe/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      }
+    ],
+    "availability_mode": "all",
+    "default_entity_id": "sensor.anova_oven_scheduled_recipe",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "has_entity_name": true,
+    "name": "Scheduled recipe",
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "state_topic": "anova/oven/state",
+    "unique_id": "anova_oven_scheduled_recipe",
+    "value_template": "{% set s = value_json.get('scheduled_start') %}{{ s.title if s else None }}"
+  },
+  "homeassistant/sensor/anova_oven/scheduled_start/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      }
+    ],
+    "availability_mode": "all",
+    "default_entity_id": "sensor.anova_oven_scheduled_start",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "device_class": "timestamp",
+    "has_entity_name": true,
+    "json_attributes_template": "{{ (value_json.get('scheduled_start') or {}) | tojson }}",
+    "json_attributes_topic": "anova/oven/state",
+    "name": "Scheduled start",
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "state_topic": "anova/oven/state",
+    "unique_id": "anova_oven_scheduled_start",
+    "value_template": "{% set s = value_json.get('scheduled_start') %}{{ s.at if s else None }}"
+  },
   "homeassistant/sensor/anova_oven/selected_recipe/config": {
     "availability": [
       {
@@ -1232,5 +1428,36 @@
     "unique_id": "anova_oven_wet_bulb_temperature",
     "unit_of_measurement": "°C",
     "value_template": "{{ value_json.get('wet_bulb_temperature_c') }}"
+  },
+  "homeassistant/text/anova_oven/start_at_time/config": {
+    "availability": [
+      {
+        "topic": "anova/oven/availability"
+      }
+    ],
+    "availability_mode": "all",
+    "command_template": "{\"time\": \"{{ value }}\", \"time_zone\": \"{{ now().tzinfo }}\"}",
+    "command_topic": "anova/oven/cmd/start_later/at_time",
+    "default_entity_id": "text.anova_oven_start_at_time",
+    "device": {
+      "identifiers": [
+        "anova_oven"
+      ],
+      "manufacturer": "Anova",
+      "model": "Precision Oven",
+      "name": "Anova Oven"
+    },
+    "has_entity_name": true,
+    "max": 5,
+    "min": 4,
+    "name": "Start at time",
+    "origin": {
+      "name": "anova-oven-server",
+      "sw_version": "x"
+    },
+    "pattern": "^([01]?[0-9]|2[0-3]):[0-5][0-9]$",
+    "state_topic": "anova/oven/start_later",
+    "unique_id": "anova_oven_start_at_time",
+    "value_template": "{{ value_json.at_time }}"
   }
 }

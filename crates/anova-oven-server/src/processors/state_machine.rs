@@ -13,7 +13,9 @@
 
 use std::time::{Duration, Instant};
 
-use anova_oven_api::{CookProgress, CurrentCook, HistoryEntry, OvenStatus, Recipe, Stage};
+use anova_oven_api::{
+    CookProgress, CurrentCook, HistoryEntry, OvenStatus, Recipe, ScheduledStart, Stage,
+};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -24,6 +26,7 @@ use crate::runtime::types::{
     OvenCook, SmError, StartedFrom, StateMachineCommand, StateMachineEvent, StoreCommand,
     StoreError, StoreEvent, TransitionOrigin, WsCommand, WsEvent,
 };
+use crate::schedule::{Scheduled, ScheduledCook};
 
 // ─── Canonical state ─────────────────────────────────────────────────────────
 
@@ -52,6 +55,11 @@ pub struct SmState {
     /// The cook the server stopped because it was done and its recipe said
     /// to turn the oven off, so it's stopped once.
     pub turned_off: Option<String>,
+    /// Local mode: the cook set to start later.
+    pub scheduled: Option<Scheduled>,
+    /// The recipes have been read at least once, so a scheduled recipe
+    /// missing from them is really gone.
+    pub recipes_loaded: bool,
 }
 
 /// How long a preheat must stay within [`SmState::preheat_tolerance_c`] of
@@ -135,7 +143,29 @@ impl SmState {
             recipes: self.recipes.clone(),
             history: self.history.clone(),
             last_transition_origin: self.last_origin,
+            scheduled_start: self.scheduled_start(),
         }
+    }
+
+    /// The scheduled cook as clients see it, titled from the recipe as it is
+    /// now.
+    pub fn scheduled_start(&self) -> Option<ScheduledStart> {
+        let scheduled = self.scheduled.as_ref()?;
+        let (title, recipe_id) = match &scheduled.cook {
+            ScheduledCook::Recipe { recipe_id } => (
+                self.recipes
+                    .iter()
+                    .find(|r| &r.id == recipe_id)
+                    .map_or_else(|| recipe_id.clone(), |r| r.title.clone()),
+                Some(recipe_id.clone()),
+            ),
+            ScheduledCook::Manual { title, .. } => (title.clone(), None),
+        };
+        Some(ScheduledStart {
+            at: scheduled.at.to_string(),
+            title,
+            recipe_id,
+        })
     }
 
     fn set_lifecycle(&mut self, next: Lifecycle, origin: TransitionOrigin) {
@@ -175,7 +205,11 @@ pub enum SmEffect {
 pub fn reduce_command(state: &mut SmState, cmd: StateMachineCommand) -> CommandOutcome {
     match cmd {
         StateMachineCommand::GetStatus { reply } => {
-            CommandOutcome::reply_status(reply, state.status.clone().ok_or(SmError::Disconnected))
+            let status = state.status.clone().map(|mut status| {
+                status.scheduled_start = state.scheduled_start();
+                status
+            });
+            CommandOutcome::reply_status(reply, status.ok_or(SmError::Disconnected))
         }
         StateMachineCommand::GetCurrentCook { reply } => {
             CommandOutcome::reply_current_cook(reply, Ok(state.current_cook.clone()))
@@ -212,6 +246,35 @@ pub fn reduce_command(state: &mut SmState, cmd: StateMachineCommand) -> CommandO
             reply,
         } => {
             let (result, effects) = link_current_cook(state, recipe_id, title);
+            CommandOutcome::reply_unit_with_effects(reply, result, effects)
+        }
+        StateMachineCommand::ScheduleStart {
+            at,
+            cook,
+            replace,
+            reply,
+        } => {
+            let (result, effects) = schedule_start(state, at, cook, replace);
+            CommandOutcome::reply_scheduled(reply, result, effects)
+        }
+        StateMachineCommand::GetScheduledStart { reply } => {
+            CommandOutcome::reply_scheduled(reply, Ok(state.scheduled_start()), Vec::new())
+        }
+        StateMachineCommand::CancelScheduledStart { reply } => {
+            let effects = match state.scheduled.take() {
+                Some(scheduled) => {
+                    info!(target: "sm", at = %scheduled.at, "scheduled cook cancelled");
+                    scheduled_start_changed(None)
+                }
+                None => Vec::new(),
+            };
+            CommandOutcome::reply_unit_with_effects(reply, Ok(()), effects)
+        }
+        StateMachineCommand::StartScheduledNow { reply } => {
+            let (result, effects) = match start_scheduled(state) {
+                Ok(effects) => (Ok(()), effects),
+                Err(Blocked::Wait(e) | Blocked::Fail(e)) => (Err(e), Vec::new()),
+            };
             CommandOutcome::reply_unit_with_effects(reply, result, effects)
         }
         StateMachineCommand::Control { request, reply } => {
@@ -253,6 +316,9 @@ pub fn reduce_event(state: &mut SmState, evt: StateMachineEvent) -> Vec<SmEffect
                 })]
             }
             crate::runtime::types::TickKind::PendingTimeout => Vec::new(),
+            crate::runtime::types::TickKind::ScheduledStart => {
+                run_scheduled_start(state, jiff::Timestamp::now())
+            }
         },
     }
 }
@@ -383,6 +449,145 @@ fn start(
     ];
 
     (Ok(()), effects)
+}
+
+// ─── Scheduled starts ────────────────────────────────────────────────────────
+
+/// Set `cook` to start at `at`. The caller has worked out `at` (see
+/// [`crate::schedule::resolve`]) and checked a manual cook's stages. The
+/// oven needn't be connected: it only has to be by `at`.
+fn schedule_start(
+    state: &mut SmState,
+    at: jiff::Timestamp,
+    cook: ScheduledCook,
+    replace: bool,
+) -> (Result<Option<ScheduledStart>, SmError>, Vec<SmEffect>) {
+    if !state.local {
+        return (
+            Err(SmError::Unsupported(
+                "scheduled starts are only available in local mode".into(),
+            )),
+            Vec::new(),
+        );
+    }
+    if let (Some(existing), false) = (state.scheduled_start(), replace) {
+        return (
+            Err(SmError::Conflict(format!(
+                "{} is already set to start at {}; cancel it first",
+                existing.title, existing.at
+            ))),
+            Vec::new(),
+        );
+    }
+    if let ScheduledCook::Recipe { recipe_id } = &cook {
+        if !state.recipes.iter().any(|r| &r.id == recipe_id) {
+            return (Err(SmError::RecipeNotFound(recipe_id.clone())), Vec::new());
+        }
+    }
+    let scheduled = Scheduled { at, cook };
+    info!(target: "sm", at = %at, cook = ?scheduled.cook, "cook scheduled");
+    state.scheduled = Some(scheduled.clone());
+    (
+        Ok(state.scheduled_start()),
+        scheduled_start_changed(Some(scheduled)),
+    )
+}
+
+/// Keep the scheduled cook (or its absence) and tell the clients.
+fn scheduled_start_changed(scheduled: Option<Scheduled>) -> Vec<SmEffect> {
+    vec![
+        SmEffect::Store(StoreCommand::SaveScheduledStart { scheduled }),
+        SmEffect::PublishReadModel,
+    ]
+}
+
+/// Why the scheduled cook can't start now.
+#[derive(Debug)]
+enum Blocked {
+    /// Not yet, but it may soon: the oven is away, or busy starting or
+    /// stopping a cook.
+    Wait(SmError),
+    /// Not at all: the oven is cooking something else, or the recipe is
+    /// gone.
+    Fail(SmError),
+}
+
+/// On the scheduled-start tick: start the scheduled cook if its time has
+/// come. One that can't start is dropped with a `command_failed`, at once
+/// if it never could and after [`crate::schedule::GRACE`] if it's waiting
+/// for the oven. A cook already cooking, or a descale, is never replaced.
+fn run_scheduled_start(state: &mut SmState, now: jiff::Timestamp) -> Vec<SmEffect> {
+    let Some(at) = state.scheduled.as_ref().map(|s| s.at) else {
+        return Vec::new();
+    };
+    if now < at {
+        return Vec::new();
+    }
+    let reason = match start_scheduled(state) {
+        Ok(effects) => return effects,
+        Err(Blocked::Wait(e)) if now <= at + crate::schedule::GRACE => {
+            debug!(target: "sm", reason = %e, "scheduled cook waiting");
+            return Vec::new();
+        }
+        Err(Blocked::Wait(e)) => format!("it couldn't start within 10 minutes of its time: {e}"),
+        Err(Blocked::Fail(e)) => e.to_string(),
+    };
+    let title = state.scheduled_start().map(|s| s.title).unwrap_or_default();
+    warn!(target: "sm", title, reason, "scheduled cook didn't start; dropping it");
+    state.scheduled = None;
+    let mut effects = scheduled_start_changed(None);
+    effects.push(command_failed(
+        "scheduled_start",
+        &format!("{title} didn't start: {reason}"),
+    ));
+    effects
+}
+
+/// Start the scheduled cook and drop it, if the oven can take it now.
+fn start_scheduled(state: &mut SmState) -> Result<Vec<SmEffect>, Blocked> {
+    let Some(scheduled) = state.scheduled.clone() else {
+        return Err(Blocked::Fail(SmError::Conflict(
+            "no cook is scheduled".into(),
+        )));
+    };
+    if state.connectivity.cooker_id().is_none() {
+        return Err(Blocked::Wait(SmError::Disconnected));
+    }
+    let Some(status) = &state.status else {
+        return Err(Blocked::Wait(SmError::Disconnected));
+    };
+    if status.is_cooking() {
+        return Err(Blocked::Fail(SmError::Conflict(
+            "the oven was already cooking".into(),
+        )));
+    }
+    // Not a cook, but a start would end it.
+    if status.is_descaling() {
+        return Err(Blocked::Fail(SmError::Conflict(
+            "the oven was descaling".into(),
+        )));
+    }
+    if state.lifecycle != Lifecycle::Idle {
+        return Err(Blocked::Wait(SmError::Conflict(
+            "the oven is busy starting or stopping a cook".into(),
+        )));
+    }
+    let (result, mut effects) = match scheduled.cook {
+        ScheduledCook::Recipe { recipe_id } => {
+            if !state.recipes_loaded {
+                return Err(Blocked::Wait(SmError::Conflict(
+                    "the recipes haven't been read yet".into(),
+                )));
+            }
+            start_cook(state, &recipe_id)
+        }
+        ScheduledCook::Manual { title, stages } => start_manual_cook(state, title, stages),
+    };
+    result.map_err(Blocked::Fail)?;
+    info!(target: "sm", at = %scheduled.at, "starting the scheduled cook");
+    state.scheduled = None;
+    effects.extend(scheduled_start_changed(None));
+    Ok(effects)
 }
 
 /// Turn a client's control request into a command for the oven.
@@ -871,6 +1076,7 @@ fn reduce_store_event(state: &mut SmState, event: StoreEvent) -> Vec<SmEffect> {
     match event {
         StoreEvent::RecipesRefreshed(Ok(recipes)) => {
             state.recipes = recipes;
+            state.recipes_loaded = true;
             vec![SmEffect::PublishReadModel]
         }
         StoreEvent::RecipesRefreshed(Err(e)) => {
@@ -967,6 +1173,10 @@ pub enum ReplyChannel {
         Result<Vec<HistoryEntry>, SmError>,
     ),
     Unit(oneshot::Sender<Result<(), SmError>>, Result<(), SmError>),
+    Scheduled(
+        oneshot::Sender<Result<Option<ScheduledStart>, SmError>>,
+        Result<Option<ScheduledStart>, SmError>,
+    ),
 }
 
 impl CommandOutcome {
@@ -1018,6 +1228,17 @@ impl CommandOutcome {
         }
     }
 
+    fn reply_scheduled(
+        tx: oneshot::Sender<Result<Option<ScheduledStart>, SmError>>,
+        result: Result<Option<ScheduledStart>, SmError>,
+        effects: Vec<SmEffect>,
+    ) -> Self {
+        Self {
+            reply: ReplyChannel::Scheduled(tx, result),
+            effects,
+        }
+    }
+
     pub fn deliver(self) -> Vec<SmEffect> {
         match self.reply {
             ReplyChannel::Status(tx, r) => {
@@ -1033,6 +1254,9 @@ impl CommandOutcome {
                 let _ = tx.send(r);
             }
             ReplyChannel::Unit(tx, r) => {
+                let _ = tx.send(r);
+            }
+            ReplyChannel::Scheduled(tx, r) => {
                 let _ = tx.send(r);
             }
         }
@@ -1079,6 +1303,15 @@ impl StateMachineProcessor {
                 ..SmState::new()
             },
         }
+    }
+
+    /// Start with the scheduled cook kept from before a restart.
+    pub fn with_scheduled_start(mut self, scheduled: Option<Scheduled>) -> Self {
+        if let Some(scheduled) = &scheduled {
+            info!(target: "sm", at = %scheduled.at, "scheduled cook kept from before the restart");
+        }
+        self.state.scheduled = scheduled;
+        self
     }
 
     pub async fn run(mut self) {
@@ -1180,6 +1413,7 @@ mod tests {
             stage_transition_pending_user_action: false,
             cook_progress: None,
             upstream: None,
+            scheduled_start: None,
         }
     }
 
@@ -2034,5 +2268,250 @@ mod tests {
             state.last_origin,
             Some(TransitionOrigin::WsExternal)
         ));
+    }
+
+    // ─── Scheduled starts ────────────────────────────────────────────────
+
+    fn ts(s: &str) -> jiff::Timestamp {
+        s.parse().unwrap()
+    }
+
+    const AT: &str = "2026-11-07T16:30:00Z";
+
+    /// Local mode, the oven idle and the recipes read, with recipe `r` set
+    /// to start at [`AT`].
+    fn scheduled_state() -> SmState {
+        let mut state = local_state();
+        let _ = apply_apo_state(&mut state, oven_status("idle", 0));
+        state.recipes = vec![recipe(vec![stage(Some("s1"), "cook", false, Some(600))])];
+        state.recipes_loaded = true;
+        let (result, _) = schedule_start(
+            &mut state,
+            ts(AT),
+            ScheduledCook::Recipe {
+                recipe_id: "r".into(),
+            },
+            false,
+        );
+        assert!(result.is_ok());
+        state
+    }
+
+    fn failure(effects: &[SmEffect]) -> Option<&CommandFailure> {
+        effects.iter().find_map(|e| match e {
+            SmEffect::CommandFailed(f) => Some(f),
+            _ => None,
+        })
+    }
+
+    fn saved_none(effects: &[SmEffect]) -> bool {
+        store_cmds(effects)
+            .iter()
+            .any(|c| matches!(c, StoreCommand::SaveScheduledStart { scheduled: None }))
+    }
+
+    #[test]
+    fn scheduling_keeps_it_and_shows_it() {
+        let mut state = local_state();
+        state.recipes = vec![recipe(vec![stage(Some("s1"), "cook", false, Some(600))])];
+        let (result, effects) = schedule_start(
+            &mut state,
+            ts(AT),
+            ScheduledCook::Recipe {
+                recipe_id: "r".into(),
+            },
+            false,
+        );
+        let shown = result.unwrap().unwrap();
+        assert_eq!(shown.at, AT);
+        assert_eq!(shown.title, "Recipe");
+        assert_eq!(shown.recipe_id.as_deref(), Some("r"));
+        assert!(matches!(
+            store_cmds(&effects)[..],
+            [StoreCommand::SaveScheduledStart { scheduled: Some(_) }]
+        ));
+        assert!(effects
+            .iter()
+            .any(|e| matches!(e, SmEffect::PublishReadModel)));
+        assert_eq!(state.to_read_model().scheduled_start, Some(shown));
+        // Nothing goes to the oven, which needn't be connected yet.
+        assert!(effect_ws(&effects).is_none());
+    }
+
+    #[test]
+    fn scheduling_refuses_an_unknown_recipe_cloud_mode_and_a_second_cook() {
+        let mut state = SmState::new();
+        let cook = || ScheduledCook::Recipe {
+            recipe_id: "r".into(),
+        };
+        let (result, _) = schedule_start(&mut state, ts(AT), cook(), false);
+        assert!(matches!(result, Err(SmError::Unsupported(_))));
+
+        let mut state = local_state();
+        let (result, _) = schedule_start(&mut state, ts(AT), cook(), false);
+        assert!(matches!(result, Err(SmError::RecipeNotFound(_))));
+
+        let mut state = scheduled_state();
+        let later = ts("2026-11-07T18:00:00Z");
+        let (result, _) = schedule_start(&mut state, later, cook(), false);
+        assert!(matches!(result, Err(SmError::Conflict(_))));
+        assert_eq!(state.scheduled.as_ref().unwrap().at, ts(AT));
+        let (result, _) = schedule_start(&mut state, later, cook(), true);
+        assert!(result.is_ok());
+        assert_eq!(state.scheduled.as_ref().unwrap().at, later);
+    }
+
+    #[test]
+    fn a_scheduled_cook_waits_for_its_time_then_starts() {
+        let mut state = scheduled_state();
+        assert!(run_scheduled_start(&mut state, ts("2026-11-07T16:29:59Z")).is_empty());
+        assert!(state.scheduled.is_some());
+
+        let effects = run_scheduled_start(&mut state, ts("2026-11-07T16:30:03Z"));
+        assert!(matches!(
+            effect_ws(&effects),
+            Some(WsCommand::SendStart { recipe_id, .. }) if recipe_id == "r"
+        ));
+        assert!(saved_none(&effects));
+        assert!(failure(&effects).is_none());
+        assert!(state.scheduled.is_none());
+        assert_eq!(state.lifecycle, Lifecycle::StartPending);
+    }
+
+    #[test]
+    fn a_scheduled_manual_cook_starts_its_own_stages() {
+        let mut state = local_state();
+        let _ = apply_apo_state(&mut state, oven_status("idle", 0));
+        let stages = vec![stage(Some("m1"), "cook", false, Some(300))];
+        let cook = ScheduledCook::Manual {
+            title: "Toast".into(),
+            stages,
+        };
+        let (result, _) = schedule_start(&mut state, ts(AT), cook, false);
+        assert_eq!(result.unwrap().unwrap().title, "Toast");
+        let effects = run_scheduled_start(&mut state, ts(AT));
+        assert!(matches!(
+            effect_ws(&effects),
+            Some(WsCommand::SendStart { stages, .. }) if stages.len() == 1
+        ));
+        assert_eq!(state.current_cook.as_ref().unwrap().recipe_title, "Toast");
+    }
+
+    #[test]
+    fn a_scheduled_cook_never_replaces_a_running_one() {
+        let mut state = scheduled_state();
+        let _ = apply_apo_state(&mut state, oven_status("cook", 600));
+        let effects = run_scheduled_start(&mut state, ts(AT));
+        assert!(effect_ws(&effects).is_none());
+        let failed = failure(&effects).expect("a command_failed");
+        assert_eq!(failed.command, "scheduled_start");
+        assert!(
+            failed.reason.contains("already cooking"),
+            "{}",
+            failed.reason
+        );
+        assert!(saved_none(&effects));
+        assert!(state.scheduled.is_none());
+    }
+
+    #[test]
+    fn a_scheduled_cook_never_ends_a_descale() {
+        let mut state = scheduled_state();
+        let _ = apply_apo_state(&mut state, oven_status("descale", 0));
+        assert_eq!(state.lifecycle, Lifecycle::Idle);
+        let effects = run_scheduled_start(&mut state, ts(AT));
+        assert!(effect_ws(&effects).is_none());
+        let failed = failure(&effects).expect("a command_failed");
+        assert!(failed.reason.contains("descaling"), "{}", failed.reason);
+        assert!(state.scheduled.is_none());
+    }
+
+    #[test]
+    fn a_scheduled_cook_waits_for_the_oven_until_its_grace_runs_out() {
+        let mut state = scheduled_state();
+        state.connectivity = Connectivity::Disconnected;
+        assert!(run_scheduled_start(&mut state, ts("2026-11-07T16:39:00Z")).is_empty());
+        assert!(state.scheduled.is_some());
+
+        // Back in time: it starts.
+        let mut back = state.clone();
+        back.connectivity = Connectivity::Connected {
+            cooker_id: Some("oven".into()),
+        };
+        let effects = run_scheduled_start(&mut back, ts("2026-11-07T16:39:30Z"));
+        assert!(effect_ws(&effects).is_some());
+
+        // Not back: dropped, loudly.
+        let effects = run_scheduled_start(&mut state, ts("2026-11-07T16:40:01Z"));
+        assert!(effect_ws(&effects).is_none());
+        assert!(failure(&effects).is_some());
+        assert!(state.scheduled.is_none());
+    }
+
+    #[test]
+    fn a_scheduled_cook_waits_for_the_recipes_to_be_read() {
+        let mut state = scheduled_state();
+        state.recipes_loaded = false;
+        state.recipes.clear();
+        assert!(run_scheduled_start(&mut state, ts(AT)).is_empty());
+        assert!(state.scheduled.is_some());
+    }
+
+    #[test]
+    fn a_scheduled_recipe_since_deleted_is_dropped() {
+        let mut state = scheduled_state();
+        state.recipes.clear();
+        let effects = run_scheduled_start(&mut state, ts(AT));
+        assert!(effect_ws(&effects).is_none());
+        let failed = failure(&effects).expect("a command_failed");
+        assert!(
+            failed.reason.contains("recipe not found"),
+            "{}",
+            failed.reason
+        );
+        assert!(state.scheduled.is_none());
+    }
+
+    #[test]
+    fn a_scheduled_cook_can_start_now_or_be_cancelled() {
+        let mut state = scheduled_state();
+        let (result, effects) = match start_scheduled(&mut state) {
+            Ok(effects) => (Ok(()), effects),
+            Err(e) => (Err(e), Vec::new()),
+        };
+        assert!(result.is_ok());
+        assert!(effect_ws(&effects).is_some());
+        assert!(matches!(
+            start_scheduled(&mut state),
+            Err(Blocked::Fail(SmError::Conflict(_)))
+        ));
+
+        let mut state = scheduled_state();
+        let (tx, _rx) = oneshot::channel();
+        let effects = reduce_command(
+            &mut state,
+            StateMachineCommand::CancelScheduledStart { reply: tx },
+        )
+        .deliver();
+        assert!(saved_none(&effects));
+        assert!(state.scheduled.is_none());
+        // Again, with nothing to cancel: fine, and nothing to save.
+        let (tx, rx) = oneshot::channel();
+        let effects = reduce_command(
+            &mut state,
+            StateMachineCommand::CancelScheduledStart { reply: tx },
+        )
+        .deliver();
+        assert!(effects.is_empty());
+        assert!(matches!(rx.blocking_recv(), Ok(Ok(()))));
+    }
+
+    #[test]
+    fn status_shows_the_scheduled_cook() {
+        let mut state = scheduled_state();
+        let (tx, rx) = oneshot::channel();
+        let _ = reduce_command(&mut state, StateMachineCommand::GetStatus { reply: tx }).deliver();
+        let status = rx.blocking_recv().unwrap().unwrap();
+        assert_eq!(status.scheduled_start.unwrap().at, AT);
     }
 }

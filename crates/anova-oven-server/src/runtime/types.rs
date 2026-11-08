@@ -8,11 +8,12 @@
 
 use std::collections::BTreeMap;
 
-use anova_oven_api::{CurrentCook, HistoryEntry, OvenStatus, Recipe, Stage};
+use anova_oven_api::{CurrentCook, HistoryEntry, OvenStatus, Recipe, ScheduledStart, Stage};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use crate::firestore::FirestoreError;
+use crate::schedule::{Scheduled, ScheduledCook};
 
 // ─── State-machine facing ────────────────────────────────────────────────────
 
@@ -87,6 +88,26 @@ pub enum StateMachineCommand {
         title: String,
         reply: oneshot::Sender<Result<(), SmError>>,
     },
+    /// Start `cook` at `at`, already worked out from "Start in" or "Start
+    /// at". Replaces a cook already scheduled only with `replace`. Local
+    /// mode only.
+    ScheduleStart {
+        at: jiff::Timestamp,
+        cook: ScheduledCook,
+        replace: bool,
+        reply: oneshot::Sender<Result<Option<ScheduledStart>, SmError>>,
+    },
+    GetScheduledStart {
+        reply: oneshot::Sender<Result<Option<ScheduledStart>, SmError>>,
+    },
+    /// Drop the scheduled cook. Fine when there isn't one.
+    CancelScheduledStart {
+        reply: oneshot::Sender<Result<(), SmError>>,
+    },
+    /// Start the scheduled cook now instead of at its time.
+    StartScheduledNow {
+        reply: oneshot::Sender<Result<(), SmError>>,
+    },
     /// A control the cloud refused or never offered; local mode only.
     Control {
         request: ControlRequest,
@@ -98,8 +119,9 @@ pub enum StateMachineCommand {
 /// with no oven connected. Published to Home Assistant as `command_failed`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CommandFailure {
-    /// `start`, `stop`, `next_stage`, `timer`, `temperature`, `lamp` or
-    /// `temperature_unit`.
+    /// `start`, `stop`, `next_stage`, `timer`, `temperature`, `lamp`,
+    /// `temperature_unit`, or `scheduled_start` for a scheduled cook that
+    /// didn't start.
     pub command: String,
     pub reason: String,
 }
@@ -178,6 +200,8 @@ pub enum TickKind {
     RecipesRefresh,
     HistoryRefresh,
     PendingTimeout,
+    /// Time to look at the scheduled cook (local mode).
+    ScheduledStart,
 }
 
 // ─── WebSocket processor ─────────────────────────────────────────────────────
@@ -316,6 +340,12 @@ pub enum StoreCommand {
     },
     ResolveManualCookTitle {
         cook: CurrentCook,
+    },
+    /// Keep the scheduled cook, or drop it with `None`. The local store
+    /// writes it to `scheduled-start.json`; Firestore ignores it, since
+    /// scheduling is local mode only.
+    SaveScheduledStart {
+        scheduled: Option<Scheduled>,
     },
     /// The cook in flight was saved as recipe `recipe_id`. The local store
     /// journals it as that recipe's cook; Firestore ignores it, since saving

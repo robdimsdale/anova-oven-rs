@@ -148,6 +148,26 @@ pub struct OvenStatus {
     /// it otherwise cannot, since a stale `/status` is still a 200.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream: Option<UpstreamHealth>,
+
+    /// The cook set to start later, if there is one (local mode). Served
+    /// whether or not the oven is cooking, since the oven may be busy when
+    /// it's set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduled_start: Option<ScheduledStart>,
+}
+
+/// A cook set to start later, with "Start in" or "Start at" (local mode).
+/// Served by `GET /scheduled` and on [`OvenStatus::scheduled_start`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ScheduledStart {
+    /// When it starts, RFC 3339 in UTC (e.g. `2026-11-07T16:30:00Z`).
+    pub at: String,
+    /// The recipe's title, or the manual cook's.
+    pub title: String,
+    /// The saved recipe it starts, looked up when it starts. `None` for a
+    /// manual cook, whose stages were given when it was set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipe_id: Option<String>,
 }
 
 /// Health of the server→Anova WebSocket link, surfaced on `GET /status` so a
@@ -617,6 +637,7 @@ mod tests {
             stage_transition_pending_user_action: false,
             cook_progress: None,
             upstream: None,
+            scheduled_start: None,
         }
     }
 

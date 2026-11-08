@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use anova_oven_api::{Recipe, Stage};
 
 use super::{
-    recipe_file_name, write_recipes, LocalStore, RecipeDraft, RecipeError, RecipeFiles,
-    RecipePatch, MANUAL_TITLE,
+    load_scheduled_start, recipe_file_name, save_scheduled_start, write_recipes, LocalStore,
+    RecipeDraft, RecipeError, RecipeFiles, RecipePatch, MANUAL_TITLE,
 };
 use crate::runtime::types::{OvenCook, StoreError};
 
@@ -637,4 +637,29 @@ fn a_cook_saved_as_a_recipe_goes_to_history_under_it() {
         .oven_reported(None, ts("2026-10-15T18:10:00Z"))
         .unwrap();
     assert_eq!(store.history().unwrap()[0].recipe_title, "Sunday roast");
+}
+
+#[test]
+fn the_scheduled_cook_is_kept_until_dropped() {
+    use crate::schedule::{Scheduled, ScheduledCook};
+
+    let dir = TempDir::new();
+    assert!(load_scheduled_start(&dir.0).is_none());
+    let scheduled = Scheduled {
+        at: "2026-11-07T16:30:00Z".parse().unwrap(),
+        cook: ScheduledCook::Recipe {
+            recipe_id: "r1".into(),
+        },
+    };
+    save_scheduled_start(&dir.0, Some(&scheduled)).unwrap();
+    let loaded = load_scheduled_start(&dir.0).unwrap();
+    assert_eq!(loaded.at, scheduled.at);
+    assert!(matches!(loaded.cook, ScheduledCook::Recipe { ref recipe_id } if recipe_id == "r1"));
+    save_scheduled_start(&dir.0, None).unwrap();
+    assert!(load_scheduled_start(&dir.0).is_none());
+    // Dropping one that isn't there is fine.
+    save_scheduled_start(&dir.0, None).unwrap();
+
+    std::fs::write(dir.0.join("scheduled-start.json"), "not json").unwrap();
+    assert!(load_scheduled_start(&dir.0).is_none());
 }

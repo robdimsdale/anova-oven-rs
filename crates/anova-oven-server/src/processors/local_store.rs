@@ -12,6 +12,9 @@
 //!   rewritten in place on every report of that cook, and removed when the
 //!   cook goes to history. Never more than one small file.
 //! - `history.jsonl`: one [`HistoryEntry`] per line.
+//! - `scheduled-start.json`: the cook set to start later, if there is one
+//!   ([`Scheduled`]). Read once at startup ([`load_scheduled_start`]);
+//!   written when one is set and removed when it starts or is dropped.
 //!
 //! The oven's own `cook` block is the authority on the running cook: its
 //! stages come from there, not from the recipe.
@@ -35,6 +38,7 @@ use tracing::{info, warn};
 use crate::runtime::types::{
     CookExtras, OvenCook, StartedFrom, StoreCommand, StoreError, StoreEvent,
 };
+use crate::schedule::Scheduled;
 
 /// How many history entries `GET /history` returns, as the Firestore store.
 const HISTORY_LIMIT: usize = 50;
@@ -154,6 +158,12 @@ impl LocalStore {
             StoreCommand::LinkCookToRecipe { recipe_id, title } => {
                 if let Err(e) = self.link_cook(recipe_id, title) {
                     warn!(error = %e, "[store] couldn't link the cook to its saved recipe");
+                }
+                return Vec::new();
+            }
+            StoreCommand::SaveScheduledStart { scheduled } => {
+                if let Err(e) = save_scheduled_start(&self.dir, scheduled.as_ref()) {
+                    warn!(error = %e, "[store] couldn't save the scheduled cook");
                 }
                 return Vec::new();
             }
@@ -692,6 +702,47 @@ pub fn normalize(mut recipe: Recipe) -> Result<Recipe, RecipeError> {
     }
     recipe.stage_count = cook_stage_count(&recipe.stages);
     Ok(recipe)
+}
+
+fn scheduled_start_path(dir: &Path) -> PathBuf {
+    dir.join("scheduled-start.json")
+}
+
+/// The scheduled cook kept under data directory `dir`, if there is one. One
+/// that can't be read is logged and dropped, rather than started wrong.
+pub fn load_scheduled_start(dir: &Path) -> Option<Scheduled> {
+    let path = scheduled_start_path(dir);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            warn!(error = %io_error(&path, e), "[store] couldn't read the scheduled cook");
+            return None;
+        }
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(scheduled) => Some(scheduled),
+        Err(e) => {
+            warn!(path = %path.display(), error = %e, "[store] couldn't parse the scheduled cook; ignoring it");
+            None
+        }
+    }
+}
+
+/// Keep `scheduled` under data directory `dir`, or remove it with `None`.
+pub fn save_scheduled_start(dir: &Path, scheduled: Option<&Scheduled>) -> Result<(), StoreError> {
+    let path = scheduled_start_path(dir);
+    match scheduled {
+        Some(scheduled) => {
+            let json = serde_json::to_vec_pretty(scheduled)
+                .map_err(|e| StoreError::Other(e.to_string()))?;
+            write_atomically(&path, &json)
+        }
+        None => match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(io_error(&path, e)),
+            _ => Ok(()),
+        },
+    }
 }
 
 /// Write each recipe to `<dir>/recipes/<id>.json`, replacing a file with the

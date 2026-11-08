@@ -25,6 +25,8 @@
       <h1 id="heading" style="margin: 0;">Recipe</h1>
       <div class="row">
         <button type="button" id="copy" hidden>Copy</button>
+        <button type="button" id="start-in" hidden>Start in…</button>
+        <button type="button" id="start-at" hidden>Start at…</button>
         <button type="button" id="start" class="primary" hidden>Start</button>
       </div>
     </div>
@@ -81,6 +83,8 @@
       const dirty = saved !== null && snapshot() !== saved;
       $("start").disabled = dirty;
       $("start").textContent = dirty ? "Save first" : "Start";
+      $("start-in").disabled = dirty;
+      $("start-at").disabled = dirty;
       $("copy").disabled = dirty;
     }
 
@@ -123,6 +127,18 @@
       }
     };
 
+    const later = (kind) => async () => {
+      clearMessage(message);
+      try {
+        const scheduled = await startLater(kind, recipe.title, { recipe_id: recipe.id });
+        if (scheduled) location.href = "/";
+      } catch (e) {
+        showMessage(message, e.message);
+      }
+    };
+    $("start-in").onclick = later("in");
+    $("start-at").onclick = later("at");
+
     // Save a copy of the saved recipe and open it, to rename and change.
     // Its stages get fresh IDs, so the two recipes don't share any.
     $("copy").onclick = async () => {
@@ -162,6 +178,8 @@
         ? "Bookmarked from Anova. Changes here only affect this copy" : "";
       $("delete").hidden = isNew;
       $("start").hidden = isNew;
+      $("start-in").hidden = isNew;
+      $("start-at").hidden = isNew;
       $("copy").hidden = isNew;
       $("form").hidden = false;
       const params = new URLSearchParams(location.search);

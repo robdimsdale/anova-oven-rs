@@ -23,6 +23,20 @@
   <main>
     <div id="message" class="message"></div>
 
+    <section id="scheduled" class="card" hidden>
+      <div class="row spread">
+        <div>
+          <h2 id="scheduled-title" style="margin: 0;"></h2>
+          <p id="scheduled-when" class="muted" style="margin: 4px 0 0;"></p>
+          <p id="scheduled-busy" class="hint" style="margin: 4px 0 0;" hidden>It won't start if the oven is still cooking or descaling then.</p>
+        </div>
+        <div class="row">
+          <button type="button" id="scheduled-start">Start now</button>
+          <button type="button" id="scheduled-cancel" class="danger">Cancel</button>
+        </div>
+      </div>
+    </section>
+
     <section class="card">
       <div class="row spread">
         <span id="phase" class="badge">—</span>
@@ -64,6 +78,8 @@
       <div id="manual-steps"></div>
       <div class="row" style="margin-bottom: 16px;">
         <button type="button" id="manual-add">Add step</button>
+        <button type="button" id="manual-start-in">Start in…</button>
+        <button type="button" id="manual-start-at">Start at…</button>
         <button type="button" id="manual-start" class="primary">Start cook</button>
       </div>
     </section>
@@ -234,9 +250,23 @@
       return `${name} · ${formatTemp(stage.temperature_c)}${wet}`;
     }
 
+    // The cook set to start later, from the status or, while the oven
+    // hasn't reported, on its own.
+    let scheduled = null;
+
+    function renderScheduled() {
+      $("scheduled").hidden = !scheduled;
+      if (!scheduled) return;
+      $("scheduled-title").textContent = `Scheduled: ${scheduled.title}`;
+      $("scheduled-when").textContent = `Starts at ${formatStartsAt(scheduled.at)}`;
+      $("scheduled-busy").hidden = !status || status.mode === "idle";
+    }
+
     async function poll() {
       try {
         status = await api("GET", "/status");
+        scheduled = status.scheduled_start || null;
+        renderScheduled();
         if (status.mode !== "idle") {
           try {
             const cook = await api("GET", "/current-cook");
@@ -259,6 +289,10 @@
       } catch (e) {
         showMessage(message, e.message);
         message.dataset.fromPoll = "1";
+        try {
+          scheduled = await api("GET", "/scheduled");
+        } catch (_) {}
+        renderScheduled();
       }
     }
 
@@ -274,7 +308,11 @@
 
     const manual = createStepEditor($("manual-steps"), {
       name: "manual",
-      onChange: (ok) => { $("manual-start").disabled = !ok; },
+      onChange: (ok) => {
+        $("manual-start").disabled = !ok;
+        $("manual-start-in").disabled = !ok;
+        $("manual-start-at").disabled = !ok;
+      },
     });
     manual.reset();
     $("manual-add").onclick = () => manual.addStep();
@@ -288,6 +326,37 @@
         $("manual-title").value = "";
         manual.reset();
         setTimeout(poll, 800);
+      } catch (e) {
+        showMessage(message, e.message);
+      }
+    };
+
+    const manualLater = (kind) => async () => {
+      const title = $("manual-title").value.trim();
+      clearMessage(message);
+      try {
+        const done = await startLater(kind, title || "Manual cook", { title: title || undefined, stages: manual.stages() });
+        if (!done) return;
+        showMessage(message, `${done.title} starts at ${formatStartsAt(done.at)}`, "ok");
+        $("manual-title").value = "";
+        manual.reset();
+        poll();
+      } catch (e) {
+        showMessage(message, e.message);
+      }
+    };
+    $("manual-start-in").onclick = manualLater("in");
+    $("manual-start-at").onclick = manualLater("at");
+
+    $("scheduled-start").onclick = () => {
+      if (confirm(`Start ${scheduled.title} now?`)) act("/scheduled/start");
+    };
+    $("scheduled-cancel").onclick = async () => {
+      if (!confirm(`Cancel the scheduled ${scheduled.title}?`)) return;
+      clearMessage(message);
+      try {
+        await api("DELETE", "/scheduled");
+        poll();
       } catch (e) {
         showMessage(message, e.message);
       }

@@ -7,7 +7,7 @@
 
 #![allow(dead_code)]
 
-use anova_oven_api::{CurrentCook, HistoryEntry, OvenStatus, Recipe};
+use anova_oven_api::{CurrentCook, HistoryEntry, OvenStatus, Recipe, ScheduledStart};
 
 use crate::runtime::types::TransitionOrigin;
 
@@ -18,4 +18,7 @@ pub struct ReadModel {
     pub recipes: Vec<Recipe>,
     pub history: Vec<HistoryEntry>,
     pub last_transition_origin: Option<TransitionOrigin>,
+    /// The cook set to start later. Not on `status`, which is `None` until
+    /// the oven first reports.
+    pub scheduled_start: Option<ScheduledStart>,
 }

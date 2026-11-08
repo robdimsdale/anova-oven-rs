@@ -407,6 +407,7 @@ pub fn to_oven_status(oven: &OvenState) -> anova_oven_api::OvenStatus {
         // Populated by the HTTP layer from the live Liveness tracker when this
         // status is served; the protocol layer has no view of link health.
         upstream: None,
+        scheduled_start: None,
     }
 }
 

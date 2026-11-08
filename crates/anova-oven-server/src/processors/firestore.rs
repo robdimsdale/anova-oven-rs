@@ -100,6 +100,7 @@ impl FirestoreProcessor {
                 StoreCommand::OvenReported { oven_cook: _ } => {}
                 // Cooks are only saved as recipes in local mode.
                 StoreCommand::LinkCookToRecipe { .. } => {}
+                StoreCommand::SaveScheduledStart { .. } => {}
                 StoreCommand::ResolveManualCookTitle { cook } => {
                     let out = instrumented(
                         "resolve_manual_cook_title",

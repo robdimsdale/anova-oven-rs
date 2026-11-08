@@ -188,5 +188,15 @@ div.cook-wait { margin: 6px 0 0; }
 
 @media (max-width: 520px) {
   .big { font-size: 2.4rem; }
-  td.hide-narrow, th.hide-narrow { display: none; }
+  td.hide-narrow, th.hide-narrow, button.hide-narrow { display: none; }
 }
+/* "Start in" and "Start at". */
+dialog.start-later {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  padding: 16px;
+  width: min(360px, calc(100vw - 32px));
+}
+dialog.start-later::backdrop { background: rgb(0 0 0 / 0.4); }

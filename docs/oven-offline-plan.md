@@ -572,6 +572,7 @@ server publishes them to an MQTT event entity, not retained:
 | `cook_stopped` | The cook ends before its last stage did |
 | `command_failed` | A start, stop or next stage wasn't acked or was refused |
 | `oven_lost` | The oven's connection drops while a cook is running |
+| `cook_scheduled` | A cook is set to start later (local mode), or its time changes |
 
 One edge, one event: a preheat whose next stage waits for the user (to put the
 food in) ends with `stage_waiting`, and `preheat_done` or `stage_started`
@@ -617,6 +618,13 @@ anova/oven/cmd/select_recipe title
 anova/oven/cmd/lamp          ON | OFF
 anova/oven/cmd/timer         seconds
 anova/oven/cmd/temperature   °C
+anova/oven/start_later                                 Start in/at values, retained
+anova/oven/cmd/start_in      {"recipe_id", "minutes"}, or empty for the selected recipe and Start in minutes
+anova/oven/cmd/start_at      {"recipe_id", "at", "time_zone"}, or empty for the selected recipe and Start at time
+anova/oven/cmd/start_later/in_minutes   minutes
+anova/oven/cmd/start_later/at_time      {"time": "HH:MM", "time_zone": "…"} or HH:MM
+anova/oven/cmd/start_scheduled_now
+anova/oven/cmd/cancel_scheduled_start
 ```
 
 `state` is published on every oven report and after every command. Commands

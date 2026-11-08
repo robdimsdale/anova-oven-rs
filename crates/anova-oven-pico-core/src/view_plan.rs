@@ -569,6 +569,7 @@ mod tests {
             stage_transition_pending_user_action: false,
             cook_progress: None,
             upstream: None,
+            scheduled_start: None,
         }
     }
 

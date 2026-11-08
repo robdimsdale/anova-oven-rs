@@ -47,6 +47,9 @@ impl Topics {
     pub fn manual(&self) -> String {
         self.under("manual")
     }
+    pub fn start_later(&self) -> String {
+        self.under("start_later")
+    }
     pub fn event(&self) -> String {
         self.under("event")
     }
@@ -71,6 +74,10 @@ enum Needs {
     Oven,
     /// The server, the oven, and a step waiting for the user.
     WaitingStage,
+    /// The server and a scheduled cook.
+    Scheduled,
+    /// The server, the oven and a scheduled cook.
+    OvenScheduled,
 }
 
 struct Entity {
@@ -117,10 +124,17 @@ pub fn select_config(topics: &Topics, options: &[String]) -> (String, String) {
 
 fn config(topics: &Topics, e: &Entity) -> Value {
     let mut availability = vec![json!({ "topic": topics.availability() })];
-    if matches!(e.needs, Needs::Oven | Needs::WaitingStage) {
+    // One entry per topic: Home Assistant keeps only the last for a topic.
+    let on_state = match e.needs {
+        Needs::Server => None,
+        Needs::Oven | Needs::WaitingStage => Some("value_json.connected"),
+        Needs::Scheduled => Some("value_json.scheduled_start"),
+        Needs::OvenScheduled => Some("value_json.connected and value_json.scheduled_start"),
+    };
+    if let Some(condition) = on_state {
         availability.push(json!({
             "topic": topics.state(),
-            "value_template": "{{ 'online' if value_json.connected else 'offline' }}",
+            "value_template": format!("{{{{ 'online' if {condition} else 'offline' }}}}"),
         }));
     }
     if matches!(e.needs, Needs::WaitingStage) {
@@ -283,6 +297,7 @@ fn entities(topics: &Topics, options: &[String], unit: &str) -> Vec<Entity> {
         options.to_vec()
     };
     let progress = "value_json.get('cook_progress')";
+    let scheduled = "value_json.get('scheduled_start')";
 
     vec![
         // Sensors.
@@ -616,6 +631,91 @@ fn entities(topics: &Topics, options: &[String], unit: &str) -> Vec<Entity> {
             json!({ "state_topic": topics.event(), "event_types": EVENT_TYPES }),
         ),
         // Local mode only.
+        // Starting the selected recipe later, and the cook set to.
+        local(
+            "sensor",
+            "scheduled_start",
+            "Scheduled start",
+            Needs::Server,
+            json!({
+                "state_topic": topics.state(),
+                "value_template": format!("{{% set s = {scheduled} %}}{{{{ s.at if s else None }}}}"),
+                "device_class": "timestamp",
+                "json_attributes_topic": topics.state(),
+                "json_attributes_template": format!("{{{{ ({scheduled} or {{}}) | tojson }}}}"),
+            }),
+        ),
+        local(
+            "sensor",
+            "scheduled_recipe",
+            "Scheduled recipe",
+            Needs::Server,
+            json!({
+                "state_topic": topics.state(),
+                "value_template": format!("{{% set s = {scheduled} %}}{{{{ s.title if s else None }}}}"),
+            }),
+        ),
+        local(
+            "number",
+            "start_in_minutes",
+            "Start in minutes",
+            Needs::Server,
+            json!({
+                "state_topic": topics.start_later(),
+                "value_template": "{{ value_json.in_minutes }}",
+                "command_topic": topics.command("start_later/in_minutes"),
+                "min": 1,
+                "max": crate::schedule::MAX_MINUTES,
+                "step": 1,
+                "mode": "box",
+                "unit_of_measurement": "min",
+            }),
+        ),
+        local(
+            "button",
+            "start_in",
+            "Start in",
+            Needs::Server,
+            json!({ "command_topic": topics.command("start_in") }),
+        ),
+        local(
+            "text",
+            "start_at_time",
+            "Start at time",
+            Needs::Server,
+            json!({
+                "state_topic": topics.start_later(),
+                "value_template": "{{ value_json.at_time }}",
+                "command_topic": topics.command("start_later/at_time"),
+                // Home Assistant's zone goes with it, so a server whose zone
+                // is set wrong refuses rather than start at the wrong time.
+                "command_template": "{\"time\": \"{{ value }}\", \"time_zone\": \"{{ now().tzinfo }}\"}",
+                "pattern": "^([01]?[0-9]|2[0-3]):[0-5][0-9]$",
+                "min": 4,
+                "max": 5,
+            }),
+        ),
+        local(
+            "button",
+            "start_at",
+            "Start at",
+            Needs::Server,
+            json!({ "command_topic": topics.command("start_at") }),
+        ),
+        local(
+            "button",
+            "start_scheduled_now",
+            "Start scheduled cook now",
+            Needs::OvenScheduled,
+            json!({ "command_topic": topics.command("start_scheduled_now") }),
+        ),
+        local(
+            "button",
+            "cancel_scheduled_start",
+            "Cancel scheduled start",
+            Needs::Scheduled,
+            json!({ "command_topic": topics.command("cancel_scheduled_start") }),
+        ),
         local(
             "button",
             "next_stage",
@@ -739,10 +839,18 @@ mod tests {
         assert_eq!(
             removed,
             [
+                "homeassistant/button/anova_oven/cancel_scheduled_start/config",
                 "homeassistant/button/anova_oven/next_stage/config",
+                "homeassistant/button/anova_oven/start_at/config",
+                "homeassistant/button/anova_oven/start_in/config",
+                "homeassistant/button/anova_oven/start_scheduled_now/config",
                 "homeassistant/light/anova_oven/lamp/config",
                 "homeassistant/number/anova_oven/set_temperature/config",
                 "homeassistant/number/anova_oven/set_timer/config",
+                "homeassistant/number/anova_oven/start_in_minutes/config",
+                "homeassistant/sensor/anova_oven/scheduled_recipe/config",
+                "homeassistant/sensor/anova_oven/scheduled_start/config",
+                "homeassistant/text/anova_oven/start_at_time/config",
             ]
         );
     }
