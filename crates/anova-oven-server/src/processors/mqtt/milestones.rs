@@ -64,19 +64,31 @@ impl Snapshot {
         self.stages.get(index?)
     }
 
+    /// The step (see [`anova_oven_api::steps`]) the oven's stage `index` is
+    /// in: its number and its stages.
+    fn step(&self, index: Option<usize>) -> Option<(usize, &[Stage])> {
+        let index = index?;
+        let steps = anova_oven_api::steps(&self.stages);
+        let n = steps.iter().position(|r| r.contains(&index))?;
+        Some((n, &self.stages[steps[n].clone()]))
+    }
+
     /// The event's payload: what a notification needs to say which cook and
-    /// stage it's about.
+    /// stage it's about. Stages are counted and described as the user knows
+    /// them (steps): a preheat and its cook are one.
     pub fn payload(&self, kind: &str) -> serde_json::Value {
+        let summary = |index| {
+            self.step(index)
+                .map(|(_, s)| recipes::step_summary(s, &self.unit))
+        };
         serde_json::json!({
             "event_type": kind,
             "cook_id": self.cook_key,
             "recipe_title": self.recipe_title,
-            "stage_index": self.stage_index,
-            "stage_count": self.stages.len(),
-            "current_stage": self.stage(self.stage_index).map(|s| recipes::summary(s, &self.unit)),
-            "next_stage": self
-                .stage(self.stage_index.map(|i| i + 1))
-                .map(|s| recipes::summary(s, &self.unit)),
+            "stage_index": self.step(self.stage_index).map(|(n, _)| n),
+            "stage_count": anova_oven_api::steps(&self.stages).len(),
+            "current_stage": summary(self.stage_index),
+            "next_stage": summary(self.stage_index.map(|i| i + 1)),
             "next_stage_prompt": self.next_stage_prompt.clone().filter(|_| self.next_stage_ready),
         })
     }
@@ -314,8 +326,13 @@ mod tests {
         let p = cooking(0).payload("cook_started");
         assert_eq!(p["event_type"], "cook_started");
         assert_eq!(p["cook_id"], "cook-1");
-        assert_eq!(p["stage_count"], 3);
-        assert_eq!(p["current_stage"], "Preheat · 220 °C dry");
-        assert_eq!(p["next_stage"], "Cook · 220 °C dry");
+        // Preheat, cook, cook: the preheat and its cook are one stage to
+        // the user, described by the cook.
+        assert_eq!(p["stage_index"], 0);
+        assert_eq!(p["stage_count"], 2);
+        assert_eq!(p["current_stage"], "Cook · 220 °C dry · preheat first");
+        let p = cooking(2).payload("stage_started");
+        assert_eq!(p["stage_index"], 1);
+        assert_eq!(p["next_stage"], serde_json::Value::Null);
     }
 }

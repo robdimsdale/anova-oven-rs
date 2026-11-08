@@ -938,7 +938,7 @@
     },
     "state_topic": "anova/oven/state",
     "unique_id": "anova_oven_stage",
-    "value_template": "{% set p = value_json.get('cook_progress') %}{{ (p.current_stage_index + 1) ~ ' of ' ~ p.total_stage_count if p else none }}"
+    "value_template": "{% set p = value_json.get('cook_progress') %}{{ (p.current_step_index + 1) ~ ' of ' ~ p.step_count if p else none }}"
   },
   "homeassistant/sensor/anova_oven/stage_description/config": {
     "availability": [

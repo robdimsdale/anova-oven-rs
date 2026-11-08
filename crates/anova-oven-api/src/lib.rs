@@ -191,6 +191,35 @@ pub struct CookProgress {
     /// and the stage has one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_stage_prompt: Option<String>,
+    /// Zero-based index of the current stage as the user counts them (see
+    /// [`steps`]), which is what anything shown to the user should number.
+    #[serde(default)]
+    pub current_step_index: usize,
+    /// How many stages the cook has as the user counts them (see [`steps`]).
+    #[serde(default)]
+    pub step_count: usize,
+}
+
+/// A recipe's stages as its user sees them, as ranges of the oven's stages.
+/// The oven runs a preheat and the cook stage after it as two stages, but
+/// they are one stage in the recipe editor, so they are one step here.
+/// Anything shown to the user counts steps, and calls them stages.
+pub fn steps(stages: &[Stage]) -> Vec<core::ops::Range<usize>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < stages.len() {
+        let paired =
+            stages[i].kind == "preheat" && stages.get(i + 1).is_some_and(|s| s.kind != "preheat");
+        let end = i + if paired { 2 } else { 1 };
+        out.push(i..end);
+        i = end;
+    }
+    out
+}
+
+/// The step (see [`steps`]) that the oven's stage `index` belongs to.
+pub fn step_of(stages: &[Stage], index: usize) -> Option<usize> {
+    steps(stages).iter().position(|r| r.contains(&index))
 }
 
 impl OvenStatus {
@@ -636,7 +665,29 @@ mod tests {
             next_stage_ready: false,
             next_stage_description: None,
             next_stage_prompt: None,
+            current_step_index: index,
+            step_count: 3,
         }
+    }
+
+    #[test]
+    fn a_preheat_and_its_cook_are_one_step() {
+        let stages = [
+            stage("preheat", "Preheat"),
+            stage("cook", "Hold"),
+            stage("cook", "Steam"),
+            stage("preheat", "Heat"),
+            stage("preheat", "Alone"),
+            stage("cook", "Bake"),
+        ];
+        assert_eq!(steps(&stages), [0..2, 2..3, 3..4, 4..6]);
+        let of: Vec<_> = (0..7).map(|i| step_of(&stages, i)).collect();
+        assert_eq!(
+            of,
+            [Some(0), Some(0), Some(1), Some(2), Some(3), Some(3), None]
+        );
+        // A preheat that ends the recipe is a step of its own.
+        assert_eq!(steps(&stages[..5]), [0..2, 2..3, 3..4, 4..5]);
     }
 
     /// Preheat, then *two* cook stages — the shape the old kind-matching

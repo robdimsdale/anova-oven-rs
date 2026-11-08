@@ -159,9 +159,11 @@ types, not every field):
 - **`CookProgress`** — server-derived cook progression (recipe title,
   current stage index, total stage count, current/next stage description
   and kind, `next_stage_ready` flag for manual-advance prompts, and
-  `next_stage_prompt`, the waiting stage's note for the user). Included
-  inline on `GET /status` while a cook is active rather than requiring the
-  pico to re-decode `CurrentCook` every tick.
+  `next_stage_prompt`, the waiting stage's note for the user), and the
+  current stage and count as the user knows them (`current_step_index`,
+  `step_count`; see below). Included inline on `GET /status` while a cook
+  is active rather than requiring the pico to re-decode `CurrentCook` every
+  tick.
 - **`Recipe` + `Stage`** — saved recipe with stages. `Stage` carries
   Firestore stage id (used as `stageId` for `CMD_APO_START_STAGE` — see
   exploration note below), kind, target temperature, optional bulb mode,
@@ -183,6 +185,14 @@ All types derive `serde::Serialize` + `serde::Deserialize` with
 
 **Key design decisions:**
 - Temperatures are always Celsius; the CLI/Pico convert for display.
+- **The user's stages aren't the oven's.** The oven runs a preheat and the
+  cook after it as two stages; the recipe editor shows them as one.
+  `anova_oven_api::steps` groups them the same way as the editor's
+  `toSteps`, and anything shown to the user counts and names those: the
+  status page, the recipes list, the MQTT events' `stage_index` and
+  `stage_count`, the HA Stage sensor and the selected recipe's `stages`.
+  The API's own stage indices and counts (`current_stage_index`,
+  `stage_count` on `Recipe`, `activeStageIndex`) stay the oven's.
 - Stages are pre-filtered to `stepType == "stage"` (directions stripped).
 - `stage_count` is included at the top of `Recipe` for list views that
   don't need to decode the full `stages` array.
@@ -314,7 +324,9 @@ with the switch in the header (°F until changed, remembered per browser), and
 are always sent as Celsius.
 
 - `/` — status (temperatures, timer, steam, probe, door, water, light, link),
-  the running cook's stage with stop and next-stage, and the light. While
+  the running cook in full (every stage, done, current and to come, with
+  each place it waits for you and its note) with stop and next-stage, and
+  the light. While
   nothing is cooking, a manual cook: a title and stages in the same editor as
   recipes, started with `POST /start`.
 - `/recipes` — the recipe list, own first then bookmarked, each by title,

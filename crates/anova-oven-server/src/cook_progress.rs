@@ -405,6 +405,7 @@ fn build_cook_progress(tracker: &Tracker) -> CookProgress {
         .map(|s| s.kind.clone())
         .unwrap_or_else(|| "cook".into());
     let next = tracker.next_stage().filter(|_| tracker.next_stage_ready);
+    let steps = anova_oven_api::steps(&tracker.stages);
 
     CookProgress {
         recipe_title: tracker.recipe_title.clone(),
@@ -415,6 +416,11 @@ fn build_cook_progress(tracker: &Tracker) -> CookProgress {
         next_stage_ready: tracker.next_stage_ready,
         next_stage_description: next.map(Stage::short_description),
         next_stage_prompt: next.and_then(|s| s.prompt.clone()),
+        current_step_index: steps
+            .iter()
+            .position(|r| r.contains(&tracker.current_stage_index))
+            .unwrap_or(0),
+        step_count: steps.len(),
     }
 }
 

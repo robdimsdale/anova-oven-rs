@@ -45,6 +45,7 @@
     <section id="cook" class="card" hidden>
       <h2 id="cook-title"></h2>
       <p id="cook-stage" class="muted" style="margin: 0;"></p>
+      <ol id="cook-steps" class="cook-steps" hidden></ol>
       <p id="cook-prompt" style="margin: 10px 0 0;" hidden></p>
       <div class="row" style="margin-top: 14px;">
         <button id="next-stage" class="primary" hidden>Start next stage</button>
@@ -122,19 +123,100 @@
       $("manual").hidden = s.mode !== "idle";
       if (progress) {
         $("cook-title").textContent = progress.recipe_title;
-        $("cook-stage").textContent =
-          `Stage ${progress.current_stage_index + 1} of ${progress.total_stage_count}: ${stageDescription(progress)}`;
+        const step = renderCookSteps(progress);
+        $("cook-stage").textContent = step
+          ? `Stage ${step.number} of ${step.count}: ${step.title}`
+          : `Stage ${progress.current_step_index + 1} of ${progress.step_count}: ${stageDescription(progress)}`;
         $("next-stage").hidden = !progress.next_stage_ready;
+        // The step list shows the note where it waits.
         $("cook-prompt").textContent = progress.next_stage_prompt || "";
-        $("cook-prompt").hidden = !progress.next_stage_prompt;
+        $("cook-prompt").hidden = !!step || !progress.next_stage_prompt;
         $("save-recipe").hidden = !cookCanSave;
       } else {
         $("cook-title").textContent = "Cooking";
         $("cook-stage").textContent = "";
+        $("cook-steps").hidden = true;
         $("next-stage").hidden = true;
         $("cook-prompt").hidden = true;
         $("save-recipe").hidden = !cookCanSave;
       }
+    }
+
+    // The whole cook, as the editor's stages (a preheat and the cook after
+    // it are one, though the oven runs them as two): done, now and to come,
+    // with each place it waits for you and its note between them. Returns
+    // the current one, or null if the stages aren't known.
+    function renderCookSteps(progress) {
+      const list = $("cook-steps");
+      if (!cookStages || cookStages.length !== progress.total_stage_count) {
+        list.hidden = true;
+        return null;
+      }
+      let at = 0;
+      const steps = toSteps(cookStages).map((step) => {
+        const first = at;
+        at += (step.preheat ? 1 : 0) + (step.cook ? 1 : 0);
+        return { step, first, last: at - 1 };
+      });
+      const active = progress.current_stage_index;
+      // The stage that waits to be started, while the oven waits.
+      const waiting = progress.next_stage_ready ? active + 1 : -1;
+      let current = null;
+      list.innerHTML = steps.map(({ step, first, last }, n) => {
+        const holdsBefore = n > 0 && !endingOf(steps[n - 1].step);
+        const before = n > 0 && (holdsBefore || firstStage(step).user_action_required)
+          ? waitHtml(firstStage(step), waiting === first, "li") : "";
+        const state = last < active ? "done" : first <= active ? "now" : "next";
+        const title = mainStage(step).title || `Stage ${n + 1}`;
+        if (state === "now") current = { number: n + 1, count: steps.length, title };
+        // A preheat that waits for you before its cook.
+        const inside = step.preheat && step.cook && step.cook.user_action_required
+          ? waitHtml(step.cook, waiting === last, "div") : "";
+        const doing = state === "now" ? `<span class="badge ok">${stepDoing(step, active - first, waiting >= 0)}</span>` : "";
+        return `${before}
+          <li class="cook-step ${state}"${state === "now" ? ' aria-current="step"' : ""}>
+            <span class="stage-number">${state === "done" ? "✓" : n + 1}</span>
+            <div>
+              <div class="row" style="gap: 8px;"><span class="cook-step-title">${escapeHtml(title)}</span>${doing}</div>
+              <div class="muted small">${stepDetails(step, n === steps.length - 1)}</div>
+              ${inside}
+            </div>
+          </li>`;
+      }).join("");
+      list.hidden = false;
+      return current;
+    }
+
+    function waitHtml(stage, now, tag) {
+      const note = stage.prompt ? `: ${escapeHtml(stage.prompt)}` : "";
+      return `<${tag} class="cook-wait${now ? " now" : ""}">${now ? "Waiting for you" : "Waits for you"}${note}</${tag}>`;
+    }
+
+    // What the current step is doing; `stage` is which of its stages runs.
+    function stepDoing(step, stage, waiting) {
+      if (step.preheat && stage === 0) return waiting ? "Preheated" : "Preheating";
+      if (!step.cook || endingOf(step)) return "Cooking";
+      return "Holding until you say";
+    }
+
+    function stepDetails(step, last) {
+      const s = mainStage(step);
+      const parts = [formatTemp(s.temperature_c) + (s.temperature_bulbs_mode === "wet" ? " sous vide" : "")];
+      if (s.steam_pct > 0) parts.push(`${Math.round(s.steam_pct)}% steam`);
+      if (!step.cook) parts.push("until preheated");
+      else {
+        if (step.preheat) parts.push("preheat first");
+        const ends = endsOf(step.cook);
+        if (ends === "timer") parts.push(minutes(step.cook.duration_secs));
+        else if (ends === "probe") parts.push(`probe to ${formatTemp(step.cook.probe_target_c)}`);
+        else parts.push("until you say");
+        if (last && step.cook.turn_off_at_end) parts.push("then off");
+      }
+      return parts.join(" · ");
+    }
+
+    function minutes(secs) {
+      return secs % 60 || secs >= 3600 ? formatDuration(secs) : `${secs / 60} min`;
     }
 
     // The running cook's stages, for describing the current one in the

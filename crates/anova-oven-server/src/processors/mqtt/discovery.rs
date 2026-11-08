@@ -369,7 +369,7 @@ fn entities(topics: &Topics, options: &[String], unit: &str) -> Vec<Entity> {
             json!({
                 "state_topic": topics.state(),
                 "value_template": format!(
-                    "{{% set p = {progress} %}}{{{{ (p.current_stage_index + 1) ~ ' of ' ~ p.total_stage_count if p else none }}}}"
+                    "{{% set p = {progress} %}}{{{{ (p.current_step_index + 1) ~ ' of ' ~ p.step_count if p else none }}}}"
                 ),
             }),
         ),

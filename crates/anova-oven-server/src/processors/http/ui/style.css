@@ -170,6 +170,15 @@ input[type="radio"] { width: 18px; height: 18px; accent-color: var(--accent); }
 .between .ends { margin: 0; }
 .between > .hint { margin: 0; }
 input:invalid, input[aria-invalid="true"] { border-color: var(--danger); }
+/* The running cook's steps on the status page. */
+.cook-steps { list-style: none; margin: 14px 0 0; padding: 0; }
+.cook-step { display: flex; gap: 10px; padding: 8px 10px; border-radius: 8px; }
+.cook-step.done { color: var(--muted); }
+.cook-step.now { background: var(--bg); box-shadow: inset 3px 0 0 var(--accent); }
+.cook-step-title { font-weight: 600; }
+.cook-wait { margin: 0 0 0 22px; padding: 2px 0 2px 14px; border-left: 2px solid var(--border); font-size: 0.85rem; color: var(--muted); }
+div.cook-wait { margin: 6px 0 0; }
+.cook-wait.now { color: var(--accent); border-left-color: var(--accent); font-weight: 600; }
 .stage-number { font-weight: 650; color: var(--muted); min-width: 1.5em; }
 
 @media (max-width: 400px) {

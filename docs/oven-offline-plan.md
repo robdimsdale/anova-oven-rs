@@ -577,7 +577,8 @@ food in) ends with `stage_waiting`, and `preheat_done` or `stage_started`
 follows only when the user starts the stage.
 
 Each payload carries `event_type`, `cook_id`, `recipe_title`, `stage_index`,
-`stage_count`, the current and next stages' `summary`, and for
+`stage_count`, the current and next stages' `summary`, all counting stages as
+the recipe editor does (a preheat and its cook are one), and for
 `command_failed`, the command and reason. `cook_id` lets a notification use it
 as a tag, so each milestone replaces the previous one for that cook instead of
 piling up.
