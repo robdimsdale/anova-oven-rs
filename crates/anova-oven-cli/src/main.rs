@@ -438,8 +438,16 @@ fn print_recipe(r: &Recipe) {
         }
     );
     println!("  Stages: {}", r.stage_count);
-    for (i, stage) in r.stages.iter().enumerate() {
-        print_stage(i, stage);
+    // Number stages as the recipe editor does: a preheat and the cook
+    // after it are one, described by the cook.
+    for (i, step) in anova_oven_api::steps(&r.stages).into_iter().enumerate() {
+        let stage = &r.stages[step.end - 1];
+        let kind = if step.len() > 1 {
+            "preheat, then cook"
+        } else {
+            &stage.kind
+        };
+        print_stage_as(i, stage, kind);
     }
     println!();
 }
@@ -497,6 +505,10 @@ fn print_current_cook(c: &CurrentCook, status: Option<&OvenStatus>) {
 }
 
 fn print_stage(index: usize, stage: &anova_oven_api::Stage) {
+    print_stage_as(index, stage, &stage.kind);
+}
+
+fn print_stage_as(index: usize, stage: &anova_oven_api::Stage, kind: &str) {
     let duration = stage
         .duration_secs
         .map(|s| format!(" for {}", format_duration(s)))
@@ -509,7 +521,7 @@ fn print_stage(index: usize, stage: &anova_oven_api::Stage) {
     println!(
         "    {}: {} at {:.0}°F ({mode}){duration}{probe}, steam {:.0}%, fan {}%",
         index + 1,
-        stage.kind,
+        kind,
         celcius_to_fahrenheit(stage.temperature_c),
         stage.steam_pct,
         stage.fan_speed,
