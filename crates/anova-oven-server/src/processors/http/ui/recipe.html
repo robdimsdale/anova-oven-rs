@@ -61,10 +61,10 @@
   <script>
     const $ = (id) => document.getElementById(id);
     const message = $("message");
-    // The part after "recipes/" in the path. Behind a reverse proxy, a
-    // prefix comes first, so look for "recipes", not at a fixed place.
-    const parts = location.pathname.split("/").filter(Boolean);
-    const segment = decodeURIComponent(parts[parts.lastIndexOf("recipes") + 1] || "new");
+    // The path after the base is "recipes/<id>". Behind a reverse proxy,
+    // the base holds the prefix, so the prefix may contain anything.
+    const local = location.pathname.slice(new URL(document.baseURI).pathname.length);
+    const segment = decodeURIComponent(local.split("/")[1] || "new");
     const isNew = segment === "new";
     let recipe = null;
 
