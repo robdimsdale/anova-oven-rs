@@ -3,9 +3,9 @@
 //! Off unless `ANOVA_MQTT_URL` is set. It reads what the HTTP API serves
 //! (the read model, cook progress and the oven's connection) and sends
 //! commands through the same state-machine paths, so the two can't drift
-//! apart. See "Home Assistant over MQTT" in `docs/oven-offline-plan.md`,
-//! and `docs/mqtt-ha-split.md` for which topics are generic and which are
-//! Home Assistant's, before adding one.
+//! apart. See `docs/home-assistant.md`, and `docs/mqtt-ha-split.md` for
+//! which topics are generic and which are Home Assistant's, before adding
+//! one.
 //!
 //! Not critical: a broker outage must not take the server down. The client
 //! reconnects with backoff, and every connect republishes discovery and the

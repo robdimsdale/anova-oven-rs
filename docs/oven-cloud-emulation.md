@@ -191,8 +191,12 @@ The answer is `CMD_APO_SET_TIME_ZONE` with
   on with no timezone (17:01 local at 23:01 UTC).
 - **`PST`/-28800 sets the clock an hour wrong in daylight time.** It is UTC−8
   and the date was in UTC−7. After the real cloud's answer and after ours the
-  oven read 13:34 and 15:04, an hour behind. Untested: whether
-  `gmt_offset: -25200` fixes it, or whether `id` drives daylight-saving rules.
+  oven read 13:34 and 15:04, an hour behind. The server computes
+  `gmt_offset` from the zone's offset at the time, including daylight
+  saving, and answers every request, so the oven keeps getting a current
+  offset. With that, an airgapped oven went through the end of daylight
+  saving (2026-11) with no trouble. Whether the oven applies the `id`'s
+  rules itself is still unknown, and no longer matters.
 - **It keeps asking after an answer:** a request came at 16:17:05, 12½
   minutes after ours. The console doesn't log outgoing messages, so the only
   known real-cloud answers are the `SET_TIME_ZONE` times 14:34, 14:50 and
@@ -239,8 +243,6 @@ as one text frame. The `id` should be unique: it is what comes back in
 
 Not tried: `CMD_APO_SET_STEAM_GENERATORS`, `_START_DESCALE`, `_ABORT_DESCALE`,
 `_OTA`, `_UPDATE_COOK_STAGE` (singular), `_SET_REPORT_STATE_RATE_DEFAULT`.
-Also untested: what the oven reports when the door opens (`door.closed`) or
-the water tank runs empty (`waterTank.empty`).
 
 **Lamp preference takes `{"on": bool}`, not `{"preference": "on"|"off"}`.**
 `{"preference": "off"}` did turn it off, but `{"preference": "on"}` twice did
@@ -349,3 +351,14 @@ only has to deliver commands and, at the end, `CMD_APO_STOP`.
 [tools/oven-cloud-probe.py](../tools/oven-cloud-probe.py) does 1–4 and forwards
 whatever is written to its control port. Everything above except the real
 cloud's own pre-redirect traffic was observed through it.
+
+## Open questions
+
+- **Door and water tank.** What the oven reports when the door opens
+  (`door.closed`) or the water tank runs empty (`waterTank.empty`) is
+  untested. Home Assistant's door and water tank sensors read them
+  ([home-assistant.md](home-assistant.md)).
+- **A 2s cooking report.** The server asks for 5s idle and cooking
+  (`REPORT_RATE_*_SECS` in `processors::device`). A 2s cooking rate seemed
+  to work in use, but the probe's test above saw 10s; check the log cadence
+  before relying on it.

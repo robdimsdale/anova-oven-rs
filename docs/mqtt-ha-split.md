@@ -83,7 +83,7 @@ Home Assistant-shaped parts of its API in a breaking release.
 3. **Optional discovery.** An empty `ANOVA_MQTT_DISCOVERY_PREFIX` (or a
    separate switch) turns the adapter off, leaving the plain API.
 4. **Docs.** The neutral topics get their own section in
-   `oven-offline-plan.md` (or a doc of their own) as the contract, apart
+   `home-assistant.md` (or a doc of their own) as the contract, apart
    from the Home Assistant section.
 
 What stays the same: every `unique_id` and `default_entity_id`, so

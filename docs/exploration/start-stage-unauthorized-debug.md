@@ -50,8 +50,9 @@ is unknown. Candidates, all untested:
   cook, or one with the app's session, change its stages.
 
 None of this matters with a local stand-in, since there's no cloud to refuse
-the command; [oven-offline-plan.md](../oven-offline-plan.md) brings stage
-advance back in local mode.
+the command: local mode
+([oven-cloud-emulation.md](../oven-cloud-emulation.md)) brings stage advance
+back.
 
 ## Decision
 
