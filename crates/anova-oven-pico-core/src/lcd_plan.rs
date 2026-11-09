@@ -928,6 +928,8 @@ mod tests {
             next_stage_prompt: None,
             current_step_index: 2,
             step_count: 3,
+            stage_started_at: None,
+            stage_ends_at: None,
         });
 
         let plan = plan_lcd(

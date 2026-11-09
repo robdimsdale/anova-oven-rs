@@ -161,11 +161,13 @@ types, not every field):
 - **`CookProgress`** — server-derived cook progression (recipe title,
   current stage index, total stage count, current/next stage description
   and kind, `next_stage_ready` flag for manual-advance prompts, and
-  `next_stage_prompt`, the waiting stage's note for the user), and the
+  `next_stage_prompt`, the waiting stage's note for the user), the
   current stage and count as the user knows them (`current_step_index`,
-  `step_count`; see below). Included inline on `GET /status` while a cook
-  is active rather than requiring the pico to re-decode `CurrentCook` every
-  tick.
+  `step_count`; see below), and when the oven's current stage started and
+  when its timer ends (`stage_started_at`, `stage_ends_at`, Unix seconds;
+  the start is `null` when the server didn't see it). Included inline on
+  `GET /status` while a cook is active rather than requiring the pico to
+  re-decode `CurrentCook` every tick.
 - **`Recipe` + `Stage`** — saved recipe with stages. `Stage` carries
   Firestore stage id (used as `stageId` for `CMD_APO_START_STAGE` — see
   exploration note below), kind, target temperature, optional bulb mode,
@@ -442,52 +444,57 @@ cargo run -p anova-oven-server
 - `processors::mqtt` (only with `ANOVA_MQTT_URL`) publishes the oven to
   Home Assistant through MQTT discovery and takes commands from it. It
   reads the same read model, cook progress and liveness the HTTP API
-  serves, and sends the same `StateMachineCommand`s, so the two can't drift
-  apart. Spawned outside `spawn_critical`: a broker outage only stops
-  updates, and the client reconnects with backoff, republishing discovery
-  and the retained topics on every connect. Topics under the prefix:
-  `availability` (last-will), `state` (the `/status` JSON plus `connected`,
-  `phase`, `recipe_title`, `timer_remaining_secs`, `stage_ends_at`,
-  `stage_started_at`), `next_stage/availability`, `recipes`,
-  `recipe/selected` and its
-  `/attributes`, `manual` (the manual cook being set up), `start_later`
-  (the values the Start in and Start at buttons use), `event`
-  (milestones, not retained) and `cmd/<name>` (`start`, `stop`,
-  `select_recipe`, `start_manual`, `manual/<field>`, and in local mode
-  `next_stage`, `lamp`, `timer`, `temperature`, `start_in`, `start_at`,
-  `start_later/<field>`, `start_scheduled_now`,
+  serves, and sends the same `StateMachineCommand`s, so the two can't
+  drift apart. Spawned outside `spawn_critical`: a broker outage only
+  stops updates, and the client reconnects with backoff, republishing
+  discovery and the retained topics on every connect. Topics under the
+  prefix: `availability` (last-will), `state` (the `/status` JSON plus
+  `connected`, `phase`, `recipe_title`, `timer_remaining_secs`,
+  `stage_ends_at` and `stage_started_at`, as ISO times from
+  `cook_progress`), `next_stage/availability`, `recipes`,
+  `recipe/selected` and its `/attributes`, `manual` (the manual cook being
+  set up), `start_later` (the values the Start in and Start at buttons
+  use), `event` (milestones, not retained) and `cmd/<name>` (`start`,
+  `stop`, `select_recipe`, `start_manual`, `manual/<field>`, and in local
+  mode `next_stage`, `lamp`, `timer`, `temperature`, `start_in`,
+  `start_at`, `start_later/<field>`, `start_scheduled_now`,
   `cancel_scheduled_start`). `state` carries `scheduled_start` (or
   `null`), which the Scheduled start sensor (a timestamp) and the
-  availability of Start scheduled cook now and Cancel scheduled start read.
-  The Start in and Start at buttons start the selected recipe after the
-  Start in minutes number, or at the Start at time text. The text sends
-  Home Assistant's zone with it, so a server in a different zone refuses
-  rather than start at the wrong time. `cmd/start_in` also takes
-  `{"recipe_id", "minutes", "replace"}` and `cmd/start_at`
-  `{"recipe_id", "at", "time_zone", "replace"}` (`at` is `HH:MM` or RFC
-  3339) from a script. A manual cook from Home
-  Assistant is one step, as the web UI's stage editor makes one (a cook
-  stage, optionally led by a preheat): its fields are number and select
-  entities over a draft the server keeps in memory (`mqtt::manual`), with a
-  sensor showing the summary and any `problem`, and the Start manual cook
-  button sends it through `StartManualCook`, checked by the same
-  `local_store::normalize` as `POST /start`. `cmd/start_manual` also takes
-  `{"title", "stages"}` for a cook given in full. Milestones (`cook_started`,
-  `preheat_done`, `stage_started`, `stage_waiting`, `cook_done`,
-  `cook_stopped`, `oven_lost`) are a pure function of successive snapshots
-  in `mqtt::milestones`, keyed by the oven's `cookId`; the first snapshot
-  is a baseline, so a restart announces nothing. `cook_scheduled` (with
+  availability of Start scheduled cook now and Cancel scheduled start
+  read. The Start in and Start at buttons start the selected recipe after
+  the Start in minutes number, or at the Start at time text. The text
+  sends Home Assistant's zone with it, so a server in a different zone
+  refuses rather than start at the wrong time. `cmd/start_in` also takes
+  `{"recipe_id", "minutes", "replace"}` and `cmd/start_at` `{"recipe_id",
+  "at", "time_zone", "replace"}` (`at` is `HH:MM` or RFC 3339) from a
+  script. A manual cook from Home Assistant is one step, as the web UI's
+  stage editor makes one (a cook stage, optionally led by a preheat): its
+  fields are number and select entities over a draft the server keeps in
+  memory (`mqtt::manual`), with a sensor showing the summary and any
+  `problem`, and the Start manual cook button sends it through
+  `StartManualCook`, checked by the same `local_store::normalize` as `POST
+  /start`. `cmd/start_manual` also takes `{"title", "stages"}` for a cook
+  given in full. Milestones (`cook_started`, `preheat_done`,
+  `stage_started`, `stage_waiting`, `cook_done`, `cook_stopped`,
+  `oven_lost`) are a pure function of successive snapshots in
+  `mqtt::milestones`, keyed by the oven's `cookId`; the first snapshot is
+  a baseline, so a restart announces nothing. `cook_scheduled` (with
   `recipe_title`, `recipe_id` and `at`) is sent when a cook is set to
-  start later, or its time changes. `command_failed` comes from
-  refusals and from the state machine's failed acks (a `broadcast` of
+  start later, or its time changes. `command_failed` comes from refusals
+  and from the state machine's failed acks (a `broadcast` of
   `CommandFailure`). The discovery set is pinned by
-  `testdata/mqtt-discovery.json`; regenerate it with
-  `UPDATE_SNAPSHOTS=1 cargo test -p anova-oven-server discovery` after
-  checking no `unique_id` changed.
+  `testdata/mqtt-discovery.json`; regenerate it with `UPDATE_SNAPSHOTS=1
+  cargo test -p anova-oven-server discovery` after checking no `unique_id`
+  changed.
 - `cook_progress::CookProgressTask` watches `(status, current_cook)`
   and derives `CookProgress` (current stage index, next-stage-ready
-  flag, descriptions). `GET /status` stitches the latest `CookProgress`
-  onto the `OvenStatus` before serializing.
+  flag, descriptions, stage times). `GET /status` stitches the latest
+  `CookProgress` onto the `OvenStatus` before serializing. The stage
+  times come from when the oven's reports arrived (`Liveness`): a stage
+  start counts only when the report before it came at most 60 s earlier,
+  so a start the server didn't see is `null`. "New cook" and "new stage"
+  follow one rule (`cook_progress::StageKey`), which the MQTT milestones
+  use too.
 
 **Task supervision:** the long-lived processors are spawned via
 `spawn_critical`, which watches each task's `JoinHandle`. If any of them
