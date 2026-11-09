@@ -241,7 +241,7 @@ processors over `tokio::sync::mpsc` channels.
 
 **Mode:** `ANOVA_MODE=cloud` (the default) follows the oven through Anova's
 cloud, as described below. `ANOVA_MODE=local` stands in for the oven's own
-cloud instead (see [oven-offline-plan.md](oven-offline-plan.md)): it listens
+cloud instead (see [oven-cloud-emulation.md](oven-cloud-emulation.md)): it listens
 for the oven on 443, and needs no credentials and no internet. Recipes,
 history and the current cook are files under `ANOVA_DATA_DIR`; fill the
 recipes once with `anova-oven-server export-recipes` while the internet is
@@ -375,7 +375,8 @@ are always sent as Celsius.
   An existing recipe's page also has Start, which starts the saved recipe;
   it reads "Save first" and stays disabled while there are unsaved edits.
 
-**Home Assistant over MQTT (off unless `ANOVA_MQTT_URL` is set):**
+**Home Assistant over MQTT (off unless `ANOVA_MQTT_URL` is set; see
+[home-assistant.md](home-assistant.md)):**
 - `ANOVA_MQTT_URL` — e.g. `mqtt://broker.lan:1883` (port defaults to 1883;
   `mqtts://` isn't supported yet)
 - `ANOVA_MQTT_USERNAME`, `ANOVA_MQTT_PASSWORD`
@@ -926,13 +927,13 @@ error-handling policy).
   `processors/ws.rs` sleeps a flat 5 s. Phase 4 should replace with
   exponential backoff (e.g. 1 s → 2 s → 4 s → … → 60 s).
 
-- **Start/stop are fire-and-forget:** the HTTP handlers return as soon
-  as the command is queued; they do not wait for the oven's
-  `RESPONSE { status: "ok" }` frame. The matching infrastructure
-  (`HashMap<Uuid, oneshot::Sender<_>>` of pending requests) is not yet
-  built. Clients should poll `/status` to confirm the new mode. In local
-  mode the state machine does get a real ack or a timeout from the oven,
-  and rolls back on failure, but the HTTP reply still doesn't wait for it.
+- **The HTTP reply doesn't wait for the oven:** start, stop and the
+  controls return as soon as the command is queued. In local mode the
+  state machine gets a real ack or a timeout from the oven
+  (`processedCommandIds`), rolls back a failed start or stop, and
+  announces the failure on MQTT as `command_failed`. In cloud mode
+  start and stop are fire-and-forget. Either way, clients should poll
+  `/status` to confirm the new mode.
 
 - **Cooker ID availability:** the cooker ID only arrives in
   `EVENT_APO_WIFI_LIST`, the first message the server receives after
@@ -945,10 +946,10 @@ error-handling policy).
   the Firestore REST API. Results are cached, so subsequent reads are
   free until the next refresh tick.
 
-- **`CMD_APO_START_STAGE` is rejected:** multi-stage cooks where later
-  stages have `user_action_required == false` (i.e. would normally
-  auto-advance) **will not auto-advance** through our software — the
-  phone app must be used for every stage transition. See
+- **`CMD_APO_START_STAGE` is rejected in cloud mode:** the cloud refuses
+  it as "unauthorized", so `/next-stage` and the controls return `501`
+  and the phone app must be used for stage transitions. Local mode
+  sends it to the oven directly. See
   [`docs/exploration/start-stage-unauthorized-debug.md`](exploration/start-stage-unauthorized-debug.md).
 
 - **Pico crash recovery is in-RAM:** the persist region lives in
@@ -963,6 +964,8 @@ error-handling policy).
 ## Reference Material
 
 - WebSocket protocol: [`docs/oven-websocket-api.md`](oven-websocket-api.md)
+- Device-side protocol (local mode): [`docs/oven-cloud-emulation.md`](oven-cloud-emulation.md)
+- Home Assistant over MQTT: [`docs/home-assistant.md`](home-assistant.md)
 - Cloud API (Firestore): [`docs/oven-cloud-api.md`](oven-cloud-api.md)
 - Pico display backends + wiring: [`docs/pico-displays.md`](pico-displays.md)
 - Pico crate drift map: [`docs/pico-crate-drift.md`](pico-crate-drift.md)
