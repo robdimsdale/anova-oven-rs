@@ -900,14 +900,29 @@ mod tests {
     fn the_end_time_stays_put_between_oven_reports() {
         let mut anchor = None;
         // 600 s left at t=1000: ends at 1600.
-        assert_eq!(EndAnchor::update(&mut anchor, Some(600), 900, 1000), Some(1600));
+        assert_eq!(
+            EndAnchor::update(&mut anchor, Some(600), 900, 1000),
+            Some(1600)
+        );
         // The same report, published again 5 s and 10 s later.
-        assert_eq!(EndAnchor::update(&mut anchor, Some(600), 900, 1005), Some(1600));
-        assert_eq!(EndAnchor::update(&mut anchor, Some(600), 900, 1010), Some(1600));
+        assert_eq!(
+            EndAnchor::update(&mut anchor, Some(600), 900, 1005),
+            Some(1600)
+        );
+        assert_eq!(
+            EndAnchor::update(&mut anchor, Some(600), 900, 1010),
+            Some(1600)
+        );
         // A new report: 588 s left at t=1012.
-        assert_eq!(EndAnchor::update(&mut anchor, Some(588), 900, 1012), Some(1600));
+        assert_eq!(
+            EndAnchor::update(&mut anchor, Some(588), 900, 1012),
+            Some(1600)
+        );
         // A timer set again from the UI: a new total, a new end.
-        assert_eq!(EndAnchor::update(&mut anchor, Some(1200), 1200, 1013), Some(2213));
+        assert_eq!(
+            EndAnchor::update(&mut anchor, Some(1200), 1200, 1013),
+            Some(2213)
+        );
         // No timer: no end, and the anchor goes.
         assert_eq!(EndAnchor::update(&mut anchor, None, 0, 1014), None);
         assert_eq!(anchor, None);
@@ -916,16 +931,34 @@ mod tests {
     #[test]
     fn the_stage_clock_starts_with_each_stage_it_sees() {
         let mut clock = StageClock::default();
-        assert_eq!(clock.update(Some(&oven("idle", None, None)), true, 100), None);
+        assert_eq!(
+            clock.update(Some(&oven("idle", None, None)), true, 100),
+            None
+        );
         // The cook starts; its ID arrives a moment later.
-        assert_eq!(clock.update(Some(&oven("cook", None, Some(0))), true, 110), Some(110));
-        assert_eq!(clock.update(Some(&oven("cook", Some("a"), Some(0))), true, 115), Some(110));
+        assert_eq!(
+            clock.update(Some(&oven("cook", None, Some(0))), true, 110),
+            Some(110)
+        );
+        assert_eq!(
+            clock.update(Some(&oven("cook", Some("a"), Some(0))), true, 115),
+            Some(110)
+        );
         // The preheat ends: stage 2 starts.
-        assert_eq!(clock.update(Some(&oven("cook", Some("a"), Some(1))), true, 400), Some(400));
-        assert_eq!(clock.update(Some(&oven("cook", Some("a"), Some(1))), true, 900), Some(400));
+        assert_eq!(
+            clock.update(Some(&oven("cook", Some("a"), Some(1))), true, 400),
+            Some(400)
+        );
+        assert_eq!(
+            clock.update(Some(&oven("cook", Some("a"), Some(1))), true, 900),
+            Some(400)
+        );
         // Offline: the last start stands.
         assert_eq!(clock.update(None, false, 920), Some(400));
-        assert_eq!(clock.update(Some(&oven("idle", None, None)), true, 950), None);
+        assert_eq!(
+            clock.update(Some(&oven("idle", None, None)), true, 950),
+            None
+        );
     }
 
     #[test]
@@ -934,20 +967,35 @@ mod tests {
         // Before the oven's first report: nothing is known.
         assert_eq!(clock.update(None, false, 90), None);
         // The server starts during a cook: the stage's start is unknown.
-        assert_eq!(clock.update(Some(&oven("cook", Some("a"), Some(1))), true, 100), None);
-        assert_eq!(clock.update(Some(&oven("cook", Some("a"), Some(1))), true, 200), None);
+        assert_eq!(
+            clock.update(Some(&oven("cook", Some("a"), Some(1))), true, 100),
+            None
+        );
+        assert_eq!(
+            clock.update(Some(&oven("cook", Some("a"), Some(1))), true, 200),
+            None
+        );
         // The next stage starts while it watches.
-        assert_eq!(clock.update(Some(&oven("cook", Some("a"), Some(2))), true, 300), Some(300));
+        assert_eq!(
+            clock.update(Some(&oven("cook", Some("a"), Some(2))), true, 300),
+            Some(300)
+        );
     }
 
     #[test]
     fn the_stage_clock_times_a_descale() {
         let mut clock = StageClock::default();
-        assert_eq!(clock.update(Some(&oven("idle", None, None)), true, 100), None);
+        assert_eq!(
+            clock.update(Some(&oven("idle", None, None)), true, 100),
+            None
+        );
         let descale = oven("descale", None, None);
         assert_eq!(clock.update(Some(&descale), true, 200), Some(200));
         assert_eq!(clock.update(Some(&descale), true, 900), Some(200));
-        assert_eq!(clock.update(Some(&oven("idle", None, None)), true, 3000), None);
+        assert_eq!(
+            clock.update(Some(&oven("idle", None, None)), true, 3000),
+            None
+        );
     }
 
     #[test]
