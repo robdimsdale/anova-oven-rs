@@ -22,9 +22,9 @@ Usable by any MQTT client:
 |---|---|
 | `availability` | The server's last will: `online` / `offline` |
 | `state` | The `/status` JSON, plus `connected`, `phase`, `recipe_title`, `timer_remaining_secs`, `stage_ends_at`, `stage_started_at` |
-| `event` | Milestones: `cook_started`, `preheat_done`, `stage_started`, `stage_waiting`, `cook_done`, `cook_stopped`, `oven_lost`, `command_failed`, `cook_scheduled` |
-| `cmd/start` | `{"recipe_id": "…"}` |
-| `cmd/start_manual` | `{"title": …, "stages": [...]}`, as `POST /start` takes |
+| `event` | Milestones: `cook_started`, `preheat_done`, `stage_started`, `stage_waiting`, `cook_done`, `cook_stopped`, `oven_lost`, `command_failed`, `cook_scheduled`, `temp_reached`, `water_empty`, `oven_fault`; each carries `started_by` |
+| `cmd/start` | `{"recipe_id": "…", "started_by": "…"}` (`started_by` optional) |
+| `cmd/start_manual` | `{"title": …, "stages": [...], "started_by": "…"}`, as `POST /start` takes |
 | `cmd/stop`, `cmd/next_stage`, `cmd/lamp`, `cmd/temperature`, `cmd/timer` | The controls (the last four local mode only) |
 | `cmd/start_in`, `cmd/start_at` | `{"recipe_id", "minutes"}` / `{"recipe_id", "at", "time_zone"}`: start later (local mode) |
 | `cmd/start_scheduled_now`, `cmd/cancel_scheduled_start` | The cook set to start later (local mode) |

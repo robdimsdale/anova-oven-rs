@@ -476,9 +476,11 @@ cargo run -p anova-oven-server
   `POST /start`. `cmd/start_manual` also takes `{"title", "stages"}` for a cook
   given in full. Milestones (`cook_started`, `preheat_done`,
   `stage_started`, `stage_waiting`, `cook_done`, `cook_stopped`,
-  `oven_lost`) are a pure function of successive snapshots in
-  `mqtt::milestones`, keyed by the oven's `cookId`; the first snapshot is
-  a baseline, so a restart announces nothing. `cook_scheduled` (with
+  `oven_lost`, `temp_reached`, `water_empty`, `oven_fault`) are a pure
+  function of successive snapshots in `mqtt::milestones`, keyed by the
+  oven's `cookId`; `Snapshot::carry` keeps what was already announced.
+  The oven's first report is a baseline, so a restart announces nothing.
+  Every event carries `started_by`, from the start command's JSON. `cook_scheduled` (with
   `recipe_title`, `recipe_id` and `at`) is sent when a cook is set to
   start later, or its time changes. `command_failed` comes from refusals
   and from the state machine's failed acks (a `broadcast` of
