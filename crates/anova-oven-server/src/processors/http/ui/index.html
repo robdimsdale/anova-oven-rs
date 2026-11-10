@@ -98,6 +98,9 @@
     const $ = (id) => document.getElementById(id);
     const message = $("message");
     let status = null;
+    // A lamp change waiting for the oven's confirmation: { on, until }.
+    let lampPending = null;
+    const LAMP_CONFIRM_MS = 15000;
 
     function render() {
       if (!status) return;
@@ -129,9 +132,20 @@
       $("probe").textContent = formatTemp(s.probe_temperature_c);
       $("door").textContent = s.door_open ? "Open" : "Closed";
       $("water").textContent = s.water_tank_empty ? "Empty" : "OK";
-      $("lamp-state").textContent = s.lamp_on ? "On" : "Off";
-      $("lamp-on").disabled = s.lamp_on;
-      $("lamp-off").disabled = !s.lamp_on;
+      // The oven confirms a lamp change only in its next state report, up to
+      // ~10s later. Until then, show the change as pending and lock both
+      // buttons, so a second press doesn't resend it.
+      if (lampPending && (s.lamp_on === lampPending.on || Date.now() > lampPending.until)) {
+        if (s.lamp_on !== lampPending.on) {
+          showMessage(message, `The oven did not turn the light ${lampPending.on ? "on" : "off"}`);
+        }
+        lampPending = null;
+      }
+      $("lamp-state").textContent = lampPending
+        ? (lampPending.on ? "Turning on…" : "Turning off…")
+        : (s.lamp_on ? "On" : "Off");
+      $("lamp-on").disabled = !!lampPending || s.lamp_on;
+      $("lamp-off").disabled = !!lampPending || !s.lamp_on;
 
       const progress = s.cook_progress;
       $("cook").hidden = s.mode === "idle";
@@ -363,8 +377,22 @@
       }
     };
 
-    $("lamp-on").onclick = () => act("/lamp", { on: true });
-    $("lamp-off").onclick = () => act("/lamp", { on: false });
+    async function setLamp(on) {
+      lampPending = { on, until: Date.now() + LAMP_CONFIRM_MS };
+      if (status) render();
+      clearMessage(message);
+      try {
+        await api("POST", "/lamp", { on });
+        setTimeout(poll, 800);
+      } catch (e) {
+        lampPending = null;
+        if (status) render();
+        showMessage(message, e.message);
+      }
+    }
+
+    $("lamp-on").onclick = () => setLamp(true);
+    $("lamp-off").onclick = () => setLamp(false);
     $("next-stage").onclick = () => act("/next-stage");
     $("save-recipe").onclick = async () => {
       const suggested = cookTitle && cookTitle !== "[manual]" ? cookTitle : "";
