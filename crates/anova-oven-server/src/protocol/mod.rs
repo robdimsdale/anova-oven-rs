@@ -263,11 +263,21 @@ pub struct WaterTank {
 
 /// The oven's own view of the running cook, for the store to build the
 /// current cook from. `None` when no cook is running or it has no `cookId`.
+/// The oven doesn't echo a stage's `timerAdded`/`probeAdded`, so they're
+/// restored: without them a timed stage reads as one that holds until told.
 pub fn to_oven_cook(oven: &OvenState) -> Option<crate::runtime::types::OvenCook> {
     let cook = oven.cook.as_ref()?;
     Some(crate::runtime::types::OvenCook {
         cook_id: cook.cook_id.clone()?,
-        stages: cook.stages.iter().map(stages::stage_from_json).collect(),
+        stages: cook
+            .stages
+            .iter()
+            .map(|s| {
+                let mut stage = stages::stage_from_json(s);
+                stages::restore_end_flags(&mut stage);
+                stage
+            })
+            .collect(),
         raw_stages: cook.stages.clone(),
         seconds_elapsed: cook.seconds_elapsed.unwrap_or(0),
     })
