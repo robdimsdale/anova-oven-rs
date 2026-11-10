@@ -21,7 +21,7 @@ Usable by any MQTT client:
 | Topic | What |
 |---|---|
 | `availability` | The server's last will: `online` / `offline` |
-| `state` | The `/status` JSON, plus `connected`, `phase`, `recipe_title`, `timer_remaining_secs`, `stage_ends_at` |
+| `state` | The `/status` JSON, plus `connected`, `phase`, `recipe_title`, `timer_remaining_secs`, `stage_ends_at`, `stage_started_at` |
 | `event` | Milestones: `cook_started`, `preheat_done`, `stage_started`, `stage_waiting`, `cook_done`, `cook_stopped`, `oven_lost`, `command_failed`, `cook_scheduled` |
 | `cmd/start` | `{"recipe_id": "…"}` |
 | `cmd/start_manual` | `{"title": …, "stages": [...]}`, as `POST /start` takes |

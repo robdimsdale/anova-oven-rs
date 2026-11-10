@@ -827,6 +827,8 @@ mod tests {
             next_stage_prompt: None,
             current_step_index: index,
             step_count: 3,
+            stage_started_at: None,
+            stage_ends_at: None,
         }
     }
 

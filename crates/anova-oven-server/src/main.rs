@@ -386,7 +386,8 @@ async fn main() {
     ));
 
     let cook_progress_task =
-        CookProgressTask::new(cook_progress_tx, mode == Mode::Local, preheat_tolerance_c);
+        CookProgressTask::new(cook_progress_tx, mode == Mode::Local, preheat_tolerance_c)
+            .with_liveness(liveness.clone());
     spawn_critical(
         "cook-progress",
         cook_progress_task.run(status_rx, current_cook_rx, cook_progress_msg_rx),

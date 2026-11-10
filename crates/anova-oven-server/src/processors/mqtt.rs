@@ -716,9 +716,12 @@ async fn publish_within(
 
 /// The state topic: the `/status` JSON plus what Home Assistant can't
 /// work out without templating every field: `connected`, `phase`,
-/// `recipe_title`, `timer_remaining_secs` and `stage_ends_at` (so the phone
-/// counts down without an update every second). `scheduled_start` is there
-/// (`null` when there's none) even before the oven first reports.
+/// `recipe_title`, `timer_remaining_secs`, `stage_ends_at` (so the phone
+/// counts down without an update every second) and `stage_started_at` (so it
+/// can count up through a stage with no timer). Both come from the cook
+/// progress (see `cook_progress`), as ISO times, and are `null` without it.
+/// `scheduled_start` is there (`null` when there's none) even before the
+/// oven first reports.
 fn state_json(
     status: Option<&OvenStatus>,
     cook: Option<&anova_oven_api::CurrentCook>,
@@ -740,14 +743,15 @@ fn state_json(
     state["recipe_title"] = cook.map(|c| c.display_name().to_string()).into();
     state["scheduled_start"] = scheduled;
     state["timer_remaining_secs"] = remaining.into();
-    state["stage_ends_at"] = remaining
-        .map(|secs| {
-            let now = jiff::Timestamp::now().as_second();
-            jiff::Timestamp::from_second(now + secs as i64)
-                .map(|t| t.to_string())
-                .unwrap_or_default()
-        })
-        .into();
+    let iso = |t: Option<i64>| {
+        t.and_then(|t| jiff::Timestamp::from_second(t).ok())
+            .map(|t| t.to_string())
+    };
+    // Without the cook's progress (no current cook yet), both are `null`:
+    // an end worked out from now would move at every publish.
+    let progress = status.cook_progress.as_ref();
+    state["stage_ends_at"] = iso(progress.and_then(|p| p.stage_ends_at)).into();
+    state["stage_started_at"] = iso(progress.and_then(|p| p.stage_started_at)).into();
     state
 }
 
@@ -768,6 +772,41 @@ mod tests {
             started.elapsed() < Duration::from_secs(5),
             "it must not wait for the broker"
         );
+    }
+
+    #[test]
+    fn the_state_carries_both_times_from_the_progress() {
+        let mut status = crate::cook_progress::tests::base_status();
+        status.cook_progress = Some(
+            serde_json::from_value(serde_json::json!({
+                "recipe_title": "Bread", "current_stage_index": 0, "total_stage_count": 1,
+                "current_stage_description": "200 °C", "current_stage_kind": "cook",
+                "next_stage_ready": false, "stage_started_at": 400, "stage_ends_at": 1600,
+            }))
+            .unwrap(),
+        );
+        let v = state_json(Some(&status), None, true, None);
+        assert_eq!(v["stage_ends_at"], "1970-01-01T00:26:40Z");
+        assert_eq!(v["stage_started_at"], "1970-01-01T00:06:40Z");
+        if let Some(p) = status.cook_progress.as_mut() {
+            p.stage_ends_at = None;
+            p.stage_started_at = None;
+        }
+        let v = state_json(Some(&status), None, true, None);
+        assert_eq!(v["stage_ends_at"], serde_json::Value::Null);
+        assert_eq!(v["stage_started_at"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn a_running_timer_without_the_progress_has_no_end() {
+        let mut status = crate::cook_progress::tests::base_status();
+        status.timer_mode = "running".into();
+        status.timer_total_secs = 600;
+        status.timer_current_secs = 600;
+        assert!(status.timer_remaining_secs().is_some());
+        let v = state_json(Some(&status), None, true, None);
+        assert_eq!(v["stage_ends_at"], serde_json::Value::Null);
+        assert_eq!(v["stage_started_at"], serde_json::Value::Null);
     }
 
     #[test]

@@ -17,6 +17,7 @@
 use anova_oven_api::{CurrentCook, OvenStatus, Stage};
 
 use super::recipes;
+use crate::cook_progress::StageKey;
 
 /// What the milestones are worked out from.
 #[derive(Clone, Debug, Default)]
@@ -57,6 +58,14 @@ impl Snapshot {
             next_stage_prompt: progress.and_then(|p| p.next_stage_prompt.clone()),
             cook_done: status.is_some_and(|s| s.cook_done),
             unit: status.map_or_else(|| "C".into(), |s| s.temperature_unit.clone()),
+        }
+    }
+
+    /// The cook and stage, for the one "new cook or stage?" rule.
+    fn key(&self) -> StageKey {
+        StageKey {
+            cook_id: self.cook_key.clone(),
+            stage_index: self.stage_index,
         }
     }
 
@@ -160,26 +169,21 @@ pub fn milestones(prev: &Snapshot, next: &Snapshot) -> Vec<Milestone> {
             }
         }
         (true, true) => {
-            let new_cook = matches!(
-                (&prev.cook_key, &next.cook_key),
-                (Some(a), Some(b)) if a != b
-            );
-            if new_cook {
+            let (before, after) = (prev.key(), next.key());
+            if before.new_cook(&after) {
                 out.push(Milestone::CookStarted);
                 return out;
             }
             let waiting = !prev.next_stage_ready && next.next_stage_ready;
-            if let (Some(before), Some(after)) = (prev.stage_index, next.stage_index) {
-                if before != after && !waiting {
-                    let was_preheat = prev
-                        .stage(Some(before))
-                        .is_some_and(|s| s.kind == "preheat");
-                    out.push(if was_preheat {
-                        Milestone::PreheatDone
-                    } else {
-                        Milestone::StageStarted
-                    });
-                }
+            if before.new_stage(&after) && !waiting {
+                let was_preheat = prev
+                    .stage(prev.stage_index)
+                    .is_some_and(|s| s.kind == "preheat");
+                out.push(if was_preheat {
+                    Milestone::PreheatDone
+                } else {
+                    Milestone::StageStarted
+                });
             }
             if waiting {
                 out.push(Milestone::StageWaiting);

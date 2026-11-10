@@ -21,6 +21,9 @@ pub struct Liveness {
     /// Unix-epoch milliseconds of the last `EVENT_APO_STATE` received from
     /// Anova. `0` means none has arrived since startup.
     last_state_ms: AtomicU64,
+    /// The same for the frame before it, so a reader can tell how long the
+    /// gap before the last frame was. `0` until two have arrived.
+    previous_state_ms: AtomicU64,
     /// Whether the upstream WebSocket is currently connected.
     connected: AtomicBool,
     /// Whether the oven itself is reaching Anova's cloud. The socket to the
@@ -49,6 +52,7 @@ impl Liveness {
     pub fn new(read_timeout_secs: u64) -> Self {
         Self {
             last_state_ms: AtomicU64::new(0),
+            previous_state_ms: AtomicU64::new(0),
             connected: AtomicBool::new(false),
             oven_online: AtomicBool::new(true),
             // Down from the start: an oven that never connects (local mode,
@@ -61,7 +65,18 @@ impl Liveness {
 
     /// Record that an oven-state frame just arrived.
     pub fn record_state(&self) {
-        self.last_state_ms.store(now_ms(), Ordering::Relaxed);
+        let previous = self.last_state_ms.swap(now_ms(), Ordering::Relaxed);
+        self.previous_state_ms.store(previous, Ordering::Relaxed);
+    }
+
+    /// Unix-epoch milliseconds of the last oven-state frame and of the one
+    /// before it, each `None` until it has arrived.
+    pub fn last_two_states_ms(&self) -> (Option<u64>, Option<u64>) {
+        let at = |ms: u64| (ms != 0).then_some(ms);
+        (
+            at(self.last_state_ms.load(Ordering::Relaxed)),
+            at(self.previous_state_ms.load(Ordering::Relaxed)),
+        )
     }
 
     /// Record the current connection status of the upstream socket. Only ever
@@ -304,5 +319,18 @@ mod tests {
         let l = Liveness::new(60);
         l.set_oven_online(false, None);
         assert_eq!(l.oven_offline_secs(), Some(0));
+    }
+
+    #[test]
+    fn the_last_two_state_frames_are_kept() {
+        let l = Liveness::new(90);
+        assert_eq!(l.last_two_states_ms(), (None, None));
+        l.record_state();
+        let (first, none) = l.last_two_states_ms();
+        assert!(first.is_some() && none.is_none());
+        l.record_state();
+        let (second, previous) = l.last_two_states_ms();
+        assert_eq!(previous, first);
+        assert!(second >= first);
     }
 }

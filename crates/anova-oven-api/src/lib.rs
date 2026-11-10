@@ -229,6 +229,21 @@ pub struct CookProgress {
     /// How many stages the cook has as the user counts them (see [`steps`]).
     #[serde(default)]
     pub step_count: usize,
+    /// When the current stage started, in Unix seconds, so a client can
+    /// count up through a stage with no timer, as the oven's display does.
+    /// Unix seconds rather than an ISO string like `CurrentCook::started_at`,
+    /// so the pico needn't parse dates. The MQTT state carries both stage
+    /// times as ISO strings as well.
+    /// The oven's stage, not the step: a preheat's cook stage starts its own
+    /// count, as on the oven. `None` when the server didn't see the stage
+    /// start (it started, or the oven was away, while the stage began).
+    #[serde(default)]
+    pub stage_started_at: Option<i64>,
+    /// When the current stage's timer runs out, in Unix seconds; `None`
+    /// without a running timer. It stays put between the oven's reports, so
+    /// a countdown built on it doesn't jump.
+    #[serde(default)]
+    pub stage_ends_at: Option<i64>,
 }
 
 /// A recipe's stages as its user sees them, as ranges of the oven's stages.
@@ -722,6 +737,8 @@ mod tests {
             next_stage_prompt: None,
             current_step_index: index,
             step_count: 3,
+            stage_started_at: None,
+            stage_ends_at: None,
         }
     }
 

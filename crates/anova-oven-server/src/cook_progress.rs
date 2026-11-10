@@ -13,12 +13,18 @@
 //! inferred: the stage is `activeStageIndex`, and `next_stage_ready` is
 //! `stageTransitionPendingUserAction` with a stage still to come, or a stage
 //! that holds until the user moves on (see [`follow_oven`]).
+//!
+//! The task also times the current stage ([`StageTimes`]): when it started,
+//! and when its timer ends.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anova_oven_api::{CookProgress, CurrentCook, OvenStatus, Stage};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
+
+use crate::liveness::Liveness;
 
 /// How long the current dry-bulb temperature must sit at or above the preheat
 /// target before we call the stage complete.
@@ -28,6 +34,139 @@ const PREHEAT_STABILITY_WINDOW: Duration = Duration::from_secs(10);
 /// `target - PREHEAT_HYSTERESIS_C` during the stability window resets the
 /// "crossed" timestamp.
 const PREHEAT_HYSTERESIS_C: f32 = 2.0;
+
+/// A gap between two oven reports longer than this means the server wasn't
+/// watching: the oven, or the server's link to it, was away. The oven
+/// reports every 5 s while it cooks and every 30 s while idle.
+const MAX_REPORT_GAP_MS: u64 = 60_000;
+
+/// A new end time this close to the last one keeps the last one. The oven
+/// reports whole seconds, so the same end works out a second either way,
+/// and a countdown would jump. The kept end is the one compared, so a slow
+/// drift builds up and then moves the end by a few seconds at once.
+const END_WOBBLE_SECS: i64 = 2;
+
+/// The cook and the oven stage a report is about, where known. The oven can
+/// leave either out for a moment: a cook ID that arrives late, or a stage
+/// index not reported yet.
+///
+/// The one rule for "another cook" and "another stage", used by the stage
+/// clock here and by the milestones (`stage_started` and friends), so the
+/// two agree on what counts as a new stage or cook. They can still differ
+/// on when: the milestones compare MQTT polls, so they may miss a stage
+/// shorter than a poll, hold back `stage_started` while the next stage
+/// waits for the user, and announce a stage that began while the oven was
+/// away, whose `stage_started_at` is `null`.
+/// A part that is unknown on either side is no change: the server can't
+/// tell, so it doesn't guess.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StageKey {
+    pub cook_id: Option<String>,
+    pub stage_index: Option<usize>,
+}
+
+impl StageKey {
+    /// Another cook: both cook IDs known, and different.
+    pub fn new_cook(&self, next: &StageKey) -> bool {
+        matches!((&self.cook_id, &next.cook_id), (Some(a), Some(b)) if a != b)
+    }
+
+    /// Another stage: both stage indices known, and different.
+    pub fn new_stage(&self, next: &StageKey) -> bool {
+        matches!((self.stage_index, next.stage_index), (Some(a), Some(b)) if a != b)
+    }
+}
+
+/// When an oven report arrived, and whether the server saw the oven without
+/// a break up to it.
+#[derive(Clone, Copy, Debug)]
+struct Arrival {
+    /// Unix seconds.
+    at: i64,
+    /// The report before it came at most [`MAX_REPORT_GAP_MS`] earlier.
+    watched: bool,
+}
+
+/// The arrival of the last report (`last`, Unix ms), from it and the one
+/// before it. Watched only when the gap between them was short.
+fn arrival_from(last: Option<u64>, previous: Option<u64>, now: i64) -> Arrival {
+    match last {
+        Some(last) => Arrival {
+            at: (last / 1000) as i64,
+            watched: previous.is_some_and(|p| last.saturating_sub(p) <= MAX_REPORT_GAP_MS),
+        },
+        None => Arrival {
+            at: now,
+            watched: false,
+        },
+    }
+}
+
+/// The current stage's start and end, as [`CookProgress::stage_started_at`]
+/// and [`CookProgress::stage_ends_at`] carry them.
+///
+/// The start is the arrival of the first report that shows the stage, so it
+/// is up to one report (5 s) late. A start the server didn't see is `None`,
+/// never a guess: one that came before the server's first report, or after
+/// a gap of more than [`MAX_REPORT_GAP_MS`] (the oven was away). A gap that
+/// short is bridged: a stage that began in it is timed from the first
+/// report after it.
+#[derive(Debug, Default)]
+struct StageTimes {
+    /// The stage the times are for; `None` while the oven doesn't cook.
+    key: Option<StageKey>,
+    started_at: Option<i64>,
+    end: StageEnd,
+}
+
+impl StageTimes {
+    /// Follow one report. `key` is `None` while the oven doesn't cook.
+    fn update(&mut self, key: Option<StageKey>, remaining: Option<u64>, total: u64, at: Arrival) {
+        let starts = match (&self.key, &key) {
+            (_, None) => {
+                self.started_at = None;
+                false
+            }
+            (None, Some(_)) => true,
+            (Some(before), Some(after)) => before.new_cook(after) || before.new_stage(after),
+        };
+        if starts {
+            self.started_at = at.watched.then_some(at.at);
+        }
+        self.key = key;
+        self.end.update(remaining, total, at.at);
+    }
+}
+
+/// The end time of the running timer. The oven reports the time left only
+/// now and then, so the end is worked out from when each report arrived,
+/// and stays put between reports.
+#[derive(Debug, Default)]
+struct StageEnd {
+    /// The timer's total and its end, in Unix seconds.
+    anchor: Option<(u64, i64)>,
+}
+
+impl StageEnd {
+    fn update(&mut self, remaining: Option<u64>, total: u64, at: i64) {
+        let Some(remaining) = remaining else {
+            self.anchor = None;
+            return;
+        };
+        let ends_at = at + remaining as i64;
+        // A timer set again (a new total) always moves the end.
+        let keep = self
+            .anchor
+            .is_some_and(|(t, end)| t == total && (end - ends_at).abs() <= END_WOBBLE_SECS);
+        if !keep {
+            self.anchor = Some((total, ends_at));
+        }
+    }
+
+    fn ends_at(&self) -> Option<i64> {
+        self.anchor.map(|(_, end)| end)
+    }
+}
 
 pub enum CookProgressMsg {
     StartedFromRecipe {
@@ -86,6 +225,9 @@ pub struct CookProgressTask {
     follow_oven: bool,
     /// How far short of its target a preheat counts as reached.
     preheat_tolerance_c: f32,
+    times: StageTimes,
+    /// When the oven's reports arrived. `None` in tests.
+    liveness: Option<Arc<Liveness>>,
 }
 
 impl CookProgressTask {
@@ -99,7 +241,56 @@ impl CookProgressTask {
             progress_tx,
             follow_oven,
             preheat_tolerance_c,
+            times: StageTimes::default(),
+            liveness: None,
         }
+    }
+
+    /// Time the stages from when the oven's reports arrived.
+    pub fn with_liveness(mut self, liveness: Arc<Liveness>) -> Self {
+        self.liveness = Some(liveness);
+        self
+    }
+
+    /// The last report's arrival. Without [`Liveness`] (tests), now, seen.
+    ///
+    /// Only fresh frames are recorded. In cloud mode a stale frame (the oven
+    /// not reaching Anova's cloud) still updates the status, so a new stage
+    /// in one is timed from the fresh frame before it.
+    fn arrival(&self) -> Arrival {
+        let now = jiff::Timestamp::now().as_second();
+        match &self.liveness {
+            Some(liveness) => {
+                let (last, previous) = liveness.last_two_states_ms();
+                arrival_from(last, previous, now)
+            }
+            None => Arrival {
+                at: now,
+                watched: true,
+            },
+        }
+    }
+
+    /// Time the stage the oven is in now. The stage index is the one
+    /// [`CookProgress`] carries, else the oven's own, as the milestones read
+    /// it.
+    fn update_times(&mut self, status: Option<&OvenStatus>, at: Arrival) {
+        // Mid-startup: nothing is known yet.
+        let Some(status) = status else { return };
+        let key = status.is_cooking().then(|| StageKey {
+            cook_id: status.cook_id.clone(),
+            stage_index: self
+                .tracker
+                .as_ref()
+                .map(|t| t.current_stage_index)
+                .or(status.active_stage_index),
+        });
+        self.times.update(
+            key,
+            status.timer_remaining_secs(),
+            status.timer_total_secs,
+            at,
+        );
     }
 
     pub async fn run(
@@ -173,12 +364,18 @@ impl CookProgressTask {
     /// periodic Firestore refresh); rebuilds from scratch for a new cook,
     /// inferring the current stage from the latest status.
     fn on_current_cook(&mut self, cook: Option<CurrentCook>, status: Option<&OvenStatus>) {
+        self.follow_cook(cook, status);
+        let at = self.arrival();
+        self.update_times(status, at);
+        self.publish();
+    }
+
+    fn follow_cook(&mut self, cook: Option<CurrentCook>, status: Option<&OvenStatus>) {
         let Some(cook) = cook else {
             if self.tracker.is_some() {
                 debug!("[cook-progress] cleared tracker (current cook gone)");
             }
             self.tracker = None;
-            self.publish();
             return;
         };
 
@@ -192,7 +389,6 @@ impl CookProgressTask {
             if self.tracker.is_some() {
                 debug!("[cook-progress] ignoring current-cook while oven idle");
                 self.tracker = None;
-                self.publish();
             }
             return;
         }
@@ -219,7 +415,6 @@ impl CookProgressTask {
                 stage_count = tracker.stages.len(),
                 "[cook-progress] refreshed stages for ongoing cook"
             );
-            self.publish();
             return;
         }
 
@@ -262,17 +457,26 @@ impl CookProgressTask {
             }
         }
         self.tracker = Some(tracker);
-        self.publish();
     }
 
     fn on_status(&mut self, status: Option<&OvenStatus>) {
+        let at = self.arrival();
+        self.on_status_at(status, at);
+    }
+
+    fn on_status_at(&mut self, status: Option<&OvenStatus>, at: Arrival) {
+        self.follow_status(status);
+        self.update_times(status, at);
+        self.publish();
+    }
+
+    fn follow_status(&mut self, status: Option<&OvenStatus>) {
         let Some(status) = status else { return };
 
         if !status.is_cooking() {
             if self.tracker.is_some() {
                 debug!("[cook-progress] cleared tracker (oven idle)");
                 self.tracker = None;
-                self.publish();
             }
             return;
         }
@@ -288,7 +492,6 @@ impl CookProgressTask {
                     next_stage_ready = tracker.next_stage_ready,
                     "[cook-progress] oven moved on"
                 );
-                self.publish();
             }
             return;
         }
@@ -317,7 +520,6 @@ impl CookProgressTask {
                         "[cook-progress] observed next stage start; clearing next-stage-ready"
                     );
                     tracker.advance_to(next_idx);
-                    self.publish();
                 }
             }
             return;
@@ -357,12 +559,23 @@ impl CookProgressTask {
         // "unauthorized" when sent from our server, so we flag next_stage_ready
         // and let the user advance via the phone app.
         tracker.next_stage_ready = true;
-        self.publish();
     }
 
+    /// Send the progress, when it changed. The handlers send once, at the
+    /// end, so a reader never sees a new stage with the old stage's times.
     fn publish(&self) {
-        let progress = self.tracker.as_ref().map(build_cook_progress);
-        let _ = self.progress_tx.send(progress);
+        let progress = self.tracker.as_ref().map(|t| CookProgress {
+            stage_started_at: self.times.started_at,
+            stage_ends_at: self.times.end.ends_at(),
+            ..build_cook_progress(t)
+        });
+        let _ = self.progress_tx.send_if_modified(|current| {
+            let changed = *current != progress;
+            if changed {
+                *current = progress;
+            }
+            changed
+        });
     }
 }
 
@@ -421,6 +634,9 @@ fn build_cook_progress(tracker: &Tracker) -> CookProgress {
             .position(|r| r.contains(&tracker.current_stage_index))
             .unwrap_or(0),
         step_count: steps.len(),
+        // Set by the task, which keeps the clocks.
+        stage_started_at: None,
+        stage_ends_at: None,
     }
 }
 
@@ -562,8 +778,11 @@ fn infer_stage_index(stages: &[Stage], status: &OvenStatus) -> usize {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{evaluate_stage_completion, CookProgressTask};
+pub(crate) mod tests {
+    use super::{
+        arrival_from, evaluate_stage_completion, Arrival, CookProgressTask, StageEnd, StageKey,
+        StageTimes,
+    };
     use anova_oven_api::{CookProgress, CurrentCook, OvenStatus, Stage};
     use tokio::sync::watch;
 
@@ -711,7 +930,8 @@ mod tests {
         }
     }
 
-    fn base_status() -> OvenStatus {
+    /// A cooking oven at 25 °C. Shared with other modules' tests.
+    pub(crate) fn base_status() -> OvenStatus {
         OvenStatus {
             mode: "cook".into(),
             temperature_unit: "F".into(),
@@ -880,5 +1100,138 @@ mod tests {
         task.on_current_cook(Some(stale_cook()), None);
 
         assert!(task.tracker.is_some());
+    }
+
+    fn key(cook: Option<&str>, index: Option<usize>) -> Option<StageKey> {
+        Some(StageKey {
+            cook_id: cook.map(String::from),
+            stage_index: index,
+        })
+    }
+
+    fn seen(at: i64) -> Arrival {
+        Arrival { at, watched: true }
+    }
+
+    fn unseen(at: i64) -> Arrival {
+        Arrival { at, watched: false }
+    }
+
+    #[test]
+    fn an_unknown_part_is_no_new_cook_or_stage() {
+        let a0 = key(Some("a"), Some(0)).unwrap();
+        let unknown = StageKey::default();
+        assert!(!a0.new_cook(&unknown) && !unknown.new_cook(&a0));
+        assert!(!a0.new_stage(&unknown) && !unknown.new_stage(&a0));
+        let b1 = key(Some("b"), Some(1)).unwrap();
+        assert!(a0.new_cook(&b1) && a0.new_stage(&b1));
+    }
+
+    #[test]
+    fn a_gap_of_over_a_minute_is_not_watched() {
+        let a = arrival_from(Some(100_000), Some(95_000), 0);
+        assert_eq!((a.at, a.watched), (100, true));
+        assert!(!arrival_from(Some(200_000), Some(100_000), 0).watched);
+        // The first report since the server started.
+        assert!(!arrival_from(Some(100_000), None, 0).watched);
+        let a = arrival_from(None, None, 7);
+        assert_eq!((a.at, a.watched), (7, false));
+    }
+
+    #[test]
+    fn a_stage_starts_when_the_server_sees_it_start() {
+        let mut t = StageTimes::default();
+        t.update(None, None, 0, seen(100));
+        assert_eq!(t.started_at, None);
+        // The cook starts; its ID arrives a moment later: the same stage.
+        t.update(key(None, Some(0)), None, 0, seen(110));
+        t.update(key(Some("a"), Some(0)), None, 0, seen(115));
+        assert_eq!(t.started_at, Some(110));
+        t.update(key(Some("a"), Some(1)), None, 0, seen(400));
+        t.update(key(Some("a"), Some(1)), None, 0, seen(900));
+        assert_eq!(t.started_at, Some(400));
+        t.update(None, None, 0, seen(950));
+        assert_eq!(t.started_at, None);
+    }
+
+    #[test]
+    fn a_start_the_server_did_not_see_is_none() {
+        // The server's first report is mid-cook.
+        let mut t = StageTimes::default();
+        t.update(key(Some("a"), Some(1)), None, 0, unseen(100));
+        t.update(key(Some("a"), Some(1)), None, 0, seen(105));
+        assert_eq!(t.started_at, None);
+
+        // The oven was away, and came back in the next stage.
+        let mut t = StageTimes::default();
+        t.update(None, None, 0, seen(0));
+        t.update(key(Some("a"), Some(0)), None, 0, seen(10));
+        assert_eq!(t.started_at, Some(10));
+        t.update(key(Some("a"), Some(1)), None, 0, unseen(3000));
+        assert_eq!(t.started_at, None);
+        // The stage after that is seen again.
+        t.update(key(Some("a"), Some(2)), None, 0, seen(3600));
+        assert_eq!(t.started_at, Some(3600));
+    }
+
+    #[test]
+    fn a_stage_index_that_arrives_late_is_no_new_stage() {
+        let mut t = StageTimes::default();
+        t.update(key(Some("a"), None), None, 0, unseen(100));
+        t.update(key(Some("a"), Some(1)), None, 0, seen(105));
+        assert_eq!(t.started_at, None);
+    }
+
+    #[test]
+    fn a_cook_id_that_goes_away_and_comes_back_is_the_same_cook() {
+        let mut t = StageTimes::default();
+        t.update(None, None, 0, seen(0));
+        t.update(key(Some("a"), Some(0)), None, 0, seen(10));
+        t.update(key(None, Some(0)), None, 0, seen(15));
+        t.update(key(Some("a"), Some(0)), None, 0, seen(20));
+        assert_eq!(t.started_at, Some(10));
+    }
+
+    #[test]
+    fn the_end_stays_put_between_reports() {
+        let mut end = StageEnd::default();
+        end.update(Some(600), 900, 1000);
+        assert_eq!(end.ends_at(), Some(1600));
+        // The next report, 5 s later.
+        end.update(Some(595), 900, 1005);
+        assert_eq!(end.ends_at(), Some(1600));
+        // Whole seconds: the same end works out a second later.
+        end.update(Some(589), 900, 1012);
+        assert_eq!(end.ends_at(), Some(1600));
+        // The timer set again: a new total, a new end.
+        end.update(Some(1200), 1200, 1013);
+        assert_eq!(end.ends_at(), Some(2213));
+        // No running timer: no end.
+        end.update(None, 0, 1014);
+        assert_eq!(end.ends_at(), None);
+    }
+
+    #[test]
+    fn the_progress_carries_the_stage_times() {
+        let (mut task, rx) = local_task_with_rx();
+        task.on_status_at(Some(&idle_status()), seen(100));
+        let mut status = oven_status(0, false);
+        status.cook_id = Some("a".into());
+        task.on_status_at(Some(&status), seen(110));
+        task.on_current_cook(Some(timed_cook()), Some(&status));
+        let p = rx.borrow().clone().expect("progress");
+        assert_eq!(p.stage_started_at, Some(110));
+        assert_eq!(p.stage_ends_at, None);
+
+        let mut status = oven_status(1, false);
+        status.cook_id = Some("a".into());
+        status.timer_mode = "running".into();
+        status.timer_total_secs = 600;
+        status.timer_current_secs = 600;
+        task.on_status_at(Some(&status), seen(400));
+        let p = rx.borrow().clone().expect("progress");
+        assert_eq!(p.current_stage_index, 1);
+        assert_eq!(p.stage_started_at, Some(400));
+        assert_eq!(p.stage_ends_at, Some(1000));
     }
 }
