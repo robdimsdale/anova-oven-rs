@@ -121,6 +121,9 @@ mod tests {
         assert_eq!(stage.title.as_deref(), Some("local probe test"));
         assert_eq!(stage.temperature_c, 60.0);
         assert_eq!(stage.duration_secs, Some(120));
+        // Not in the report, but it was sent with a timer, not to hold.
+        assert_eq!(stage.timer_added, Some(true));
+        assert_eq!(stage.probe_added, Some(false));
         assert_eq!(stage.heating_element_rear, Some(true));
         assert!(!cook.stage_transition_pending_user_action);
         assert_eq!(cook.seconds_elapsed, Some(1));
