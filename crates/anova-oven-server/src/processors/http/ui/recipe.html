@@ -4,16 +4,17 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Recipe · Anova Oven</title>
-  <link rel="stylesheet" href="/ui/style.css">
-  <script src="/ui/common.js"></script>
-  <script src="/ui/steps.js"></script>
+  <base href="/">
+  <link rel="stylesheet" href="ui/style.css">
+  <script src="ui/common.js"></script>
+  <script src="ui/steps.js"></script>
 </head>
 <body>
   <header>
     <span class="brand">Anova Oven</span>
     <nav>
-      <a href="/">Status</a>
-      <a href="/recipes" aria-current="page">Recipes</a>
+      <a href="./">Status</a>
+      <a href="recipes" aria-current="page">Recipes</a>
     </nav>
     <div class="unit-switch" role="group" aria-label="Temperature unit">
       <button type="button" data-unit="F">°F</button>
@@ -50,7 +51,7 @@
       <div class="row spread">
         <div class="row">
           <button type="submit" id="save" class="primary">Save</button>
-          <a class="button" href="/recipes">Cancel</a>
+          <a class="button" href="recipes">Cancel</a>
         </div>
         <button type="button" id="delete" class="danger" hidden>Delete recipe</button>
       </div>
@@ -60,7 +61,10 @@
   <script>
     const $ = (id) => document.getElementById(id);
     const message = $("message");
-    const segment = decodeURIComponent(location.pathname.split("/").filter(Boolean)[1] || "new");
+    // The path after the base is "recipes/<id>". Behind a reverse proxy,
+    // the base holds the prefix, so the prefix may contain anything.
+    const local = location.pathname.slice(new URL(document.baseURI).pathname.length);
+    const segment = decodeURIComponent(local.split("/")[1] || "new");
     const isNew = segment === "new";
     let recipe = null;
 
@@ -104,7 +108,7 @@
       try {
         if (isNew) {
           const created = await api("POST", "/recipes", body);
-          location.href = `/recipes/${encodeURIComponent(created.id)}?saved=1`;
+          location.href = `recipes/${encodeURIComponent(created.id)}?saved=1`;
         } else {
           recipe = await api("PATCH", `/recipes/${encodeURIComponent(recipe.id)}`, body);
           editor.setStages(recipe.stages);
@@ -121,7 +125,7 @@
       clearMessage(message);
       try {
         await api("POST", "/start", { recipe_id: recipe.id });
-        location.href = "/";
+        location.href = "./";
       } catch (e) {
         showMessage(message, e.message);
       }
@@ -131,7 +135,7 @@
       clearMessage(message);
       try {
         const scheduled = await startLater(kind, recipe.title, { recipe_id: recipe.id });
-        if (scheduled) location.href = "/";
+        if (scheduled) location.href = "./";
       } catch (e) {
         showMessage(message, e.message);
       }
@@ -146,7 +150,7 @@
       const stages = recipe.stages.map(({ id, ...stage }) => stage);
       try {
         const created = await api("POST", "/recipes", { title: `${recipe.title} (copy)`, stages });
-        location.href = `/recipes/${encodeURIComponent(created.id)}?copied=1`;
+        location.href = `recipes/${encodeURIComponent(created.id)}?copied=1`;
       } catch (e) {
         showMessage(message, e.message);
       }
@@ -156,7 +160,7 @@
       if (!confirm(`Delete “${recipe.title}”? This can't be undone.`)) return;
       try {
         await api("DELETE", `/recipes/${encodeURIComponent(recipe.id)}`);
-        location.href = "/recipes";
+        location.href = "recipes";
       } catch (e) {
         showMessage(message, e.message);
       }
