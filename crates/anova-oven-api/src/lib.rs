@@ -231,6 +231,9 @@ pub struct CookProgress {
     pub step_count: usize,
     /// When the current stage started, in Unix seconds, so a client can
     /// count up through a stage with no timer, as the oven's display does.
+    /// Unix seconds rather than an ISO string like `CurrentCook::started_at`,
+    /// so the pico needn't parse dates. The MQTT state carries both stage
+    /// times as ISO strings as well.
     /// The oven's stage, not the step: a preheat's cook stage starts its own
     /// count, as on the oven. `None` when the server didn't see the stage
     /// start (it started, or the oven was away, while the stage began).

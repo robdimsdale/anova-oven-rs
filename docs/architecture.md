@@ -465,15 +465,15 @@ cargo run -p anova-oven-server
   the Start in minutes number, or at the Start at time text. The text
   sends Home Assistant's zone with it, so a server in a different zone
   refuses rather than start at the wrong time. `cmd/start_in` also takes
-  `{"recipe_id", "minutes", "replace"}` and `cmd/start_at` `{"recipe_id",
-  "at", "time_zone", "replace"}` (`at` is `HH:MM` or RFC 3339) from a
-  script. A manual cook from Home Assistant is one step, as the web UI's
+  `{"recipe_id", "minutes", "replace"}` and `cmd/start_at`
+  `{"recipe_id", "at", "time_zone", "replace"}` (`at` is `HH:MM` or RFC
+  3339) from a script. A manual cook from Home Assistant is one step, as the web UI's
   stage editor makes one (a cook stage, optionally led by a preheat): its
   fields are number and select entities over a draft the server keeps in
   memory (`mqtt::manual`), with a sensor showing the summary and any
   `problem`, and the Start manual cook button sends it through
-  `StartManualCook`, checked by the same `local_store::normalize` as `POST
-  /start`. `cmd/start_manual` also takes `{"title", "stages"}` for a cook
+  `StartManualCook`, checked by the same `local_store::normalize` as
+  `POST /start`. `cmd/start_manual` also takes `{"title", "stages"}` for a cook
   given in full. Milestones (`cook_started`, `preheat_done`,
   `stage_started`, `stage_waiting`, `cook_done`, `cook_stopped`,
   `oven_lost`) are a pure function of successive snapshots in
@@ -483,9 +483,9 @@ cargo run -p anova-oven-server
   start later, or its time changes. `command_failed` comes from refusals
   and from the state machine's failed acks (a `broadcast` of
   `CommandFailure`). The discovery set is pinned by
-  `testdata/mqtt-discovery.json`; regenerate it with `UPDATE_SNAPSHOTS=1
-  cargo test -p anova-oven-server discovery` after checking no `unique_id`
-  changed.
+  `testdata/mqtt-discovery.json`; regenerate it with
+  `UPDATE_SNAPSHOTS=1 cargo test -p anova-oven-server discovery` after
+  checking no `unique_id` changed.
 - `cook_progress::CookProgressTask` watches `(status, current_cook)`
   and derives `CookProgress` (current stage index, next-stage-ready
   flag, descriptions, stage times). `GET /status` stitches the latest

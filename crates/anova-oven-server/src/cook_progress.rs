@@ -42,7 +42,8 @@ const MAX_REPORT_GAP_MS: u64 = 60_000;
 
 /// A new end time this close to the last one keeps the last one. The oven
 /// reports whole seconds, so the same end works out a second either way,
-/// and a countdown would jump.
+/// and a countdown would jump. The kept end is the one compared, so a slow
+/// drift builds up and then moves the end by a few seconds at once.
 const END_WOBBLE_SECS: i64 = 2;
 
 /// The cook and the oven stage a report is about, where known. The oven can
@@ -50,8 +51,12 @@ const END_WOBBLE_SECS: i64 = 2;
 /// index not reported yet.
 ///
 /// The one rule for "another cook" and "another stage", used by the stage
-/// clock here and by the milestones (`stage_started` and friends), so
-/// `stage_started_at` moves exactly when they announce a new stage or cook.
+/// clock here and by the milestones (`stage_started` and friends), so the
+/// two agree on what counts as a new stage or cook. They can still differ
+/// on when: the milestones compare MQTT polls, so they may miss a stage
+/// shorter than a poll, hold back `stage_started` while the next stage
+/// waits for the user, and announce a stage that began while the oven was
+/// away, whose `stage_started_at` is `null`.
 /// A part that is unknown on either side is no change: the server can't
 /// tell, so it doesn't guess.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -248,6 +253,10 @@ impl CookProgressTask {
     }
 
     /// The last report's arrival. Without [`Liveness`] (tests), now, seen.
+    ///
+    /// Only fresh frames are recorded. In cloud mode a stale frame (the oven
+    /// not reaching Anova's cloud) still updates the status, so a new stage
+    /// in one is timed from the fresh frame before it.
     fn arrival(&self) -> Arrival {
         let now = jiff::Timestamp::now().as_second();
         match &self.liveness {
@@ -1092,6 +1101,7 @@ pub(crate) mod tests {
 
         assert!(task.tracker.is_some());
     }
+
     fn key(cook: Option<&str>, index: Option<usize>) -> Option<StageKey> {
         Some(StageKey {
             cook_id: cook.map(String::from),

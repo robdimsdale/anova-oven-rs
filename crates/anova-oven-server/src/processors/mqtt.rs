@@ -719,8 +719,9 @@ async fn publish_within(
 /// `recipe_title`, `timer_remaining_secs`, `stage_ends_at` (so the phone
 /// counts down without an update every second) and `stage_started_at` (so it
 /// can count up through a stage with no timer). Both come from the cook
-/// progress (see `cook_progress`), as ISO times. `scheduled_start` is there
-/// (`null` when there's none) even before the oven first reports.
+/// progress (see `cook_progress`), as ISO times, and are `null` without it.
+/// `scheduled_start` is there (`null` when there's none) even before the
+/// oven first reports.
 fn state_json(
     status: Option<&OvenStatus>,
     cook: Option<&anova_oven_api::CurrentCook>,
@@ -746,14 +747,10 @@ fn state_json(
         t.and_then(|t| jiff::Timestamp::from_second(t).ok())
             .map(|t| t.to_string())
     };
+    // Without the cook's progress (no current cook yet), both are `null`:
+    // an end worked out from now would move at every publish.
     let progress = status.cook_progress.as_ref();
-    // Without the cook's progress (no current cook yet), the end from now:
-    // it moves a little at every publish, but a running timer has an end.
-    let ends_at = match progress {
-        Some(p) => p.stage_ends_at,
-        None => remaining.map(|secs| jiff::Timestamp::now().as_second() + secs as i64),
-    };
-    state["stage_ends_at"] = iso(ends_at).into();
+    state["stage_ends_at"] = iso(progress.and_then(|p| p.stage_ends_at)).into();
     state["stage_started_at"] = iso(progress.and_then(|p| p.stage_started_at)).into();
     state
 }
@@ -795,6 +792,18 @@ mod tests {
             p.stage_ends_at = None;
             p.stage_started_at = None;
         }
+        let v = state_json(Some(&status), None, true, None);
+        assert_eq!(v["stage_ends_at"], serde_json::Value::Null);
+        assert_eq!(v["stage_started_at"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn a_running_timer_without_the_progress_has_no_end() {
+        let mut status = crate::cook_progress::tests::base_status();
+        status.timer_mode = "running".into();
+        status.timer_total_secs = 600;
+        status.timer_current_secs = 600;
+        assert!(status.timer_remaining_secs().is_some());
         let v = state_json(Some(&status), None, true, None);
         assert_eq!(v["stage_ends_at"], serde_json::Value::Null);
         assert_eq!(v["stage_started_at"], serde_json::Value::Null);
