@@ -478,13 +478,16 @@ cargo run -p anova-oven-server
   `stage_started`, `stage_waiting`, `cook_done`, `cook_stopped`,
   `oven_lost`, `temp_reached`, `water_empty`, `oven_fault`) are a pure
   function of successive snapshots in `mqtt::milestones`, keyed by the
-  oven's `cookId`; `Snapshot::carry` keeps what was already announced.
-  The oven's first report is a baseline, so a restart announces nothing.
-  Every event carries `started_by`, from the start command's JSON. `cook_scheduled` (with
-  `recipe_title`, `recipe_id` and `at`) is sent when a cook is set to
-  start later, or its time changes. `command_failed` comes from refusals
-  and from the state machine's failed acks (a `broadcast` of
-  `CommandFailure`). The discovery set is pinned by
+  oven's `cookId`. `Snapshot::new` makes each snapshot from the previous
+  one, so it keeps what was already announced. The oven's first report is
+  a baseline, so a restart announces nothing. Every milestone carries the
+  `started_by` of the start command that the state machine took for the
+  cook. `cook_scheduled` (with `recipe_title`, `recipe_id` and `at`) is
+  sent when a cook is set to start later, or its time changes, and
+  carries no `started_by`. `command_failed` comes from refusals and from
+  the state machine's failed acks (a `broadcast` of `CommandFailure`). For
+  a refused start, its `started_by` is the start command's own; for
+  anything else it is `null`. The discovery set is pinned by
   `testdata/mqtt-discovery.json`; regenerate it with
   `UPDATE_SNAPSHOTS=1 cargo test -p anova-oven-server discovery` after
   checking no `unique_id` changed.

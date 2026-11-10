@@ -1,7 +1,8 @@
 //! Milestone events for Home Assistant: edges, not states.
 //!
 //! [`milestones`] is a pure function of two [`Snapshot`]s, the previous one
-//! and the new one. The first snapshot after a start is the baseline and
+//! and the new one, where the new one was made from the previous one (see
+//! [`Snapshot::new`]). The first snapshot after a start is the baseline and
 //! fires nothing, so a server restart mid-cook doesn't announce
 //! `cook_started` again. One edge, one event: a preheat whose next stage
 //! waits for the user ends with `stage_waiting`, and `preheat_done` follows
@@ -16,9 +17,10 @@
 //!
 //! `temp_reached`, `water_empty` and `oven_fault` need a memory, so a dip
 //! (the door opened), a tank flag or a fault flag that flaps does not
-//! announce them again. [`Snapshot::carry`] copies what was announced from
-//! the previous snapshot: per stage for the first two, until the oven is
-//! idle with no fault for the third.
+//! announce them again. [`Snapshot::new`] copies what was announced from
+//! the previous snapshot: per stage and target for `temp_reached`, per
+//! stage for `water_empty`, and until the next cook starts for
+//! `oven_fault`.
 
 use anova_oven_api::{CurrentCook, OvenStatus, Stage};
 
@@ -54,7 +56,8 @@ pub struct Snapshot {
     /// The running stage uses water: sous vide or steam.
     pub uses_water: bool,
     pub water_tank_empty: bool,
-    /// The oven has been at the target in this stage. Set by [`Self::carry`].
+    /// The oven has been at the target in this stage, since the target last
+    /// changed. Set by [`Self::carry`].
     pub reached: bool,
     /// `water_empty` was announced in this stage. Set by [`Self::carry`], so
     /// a tank flag that flaps does not announce it again and again.
@@ -62,14 +65,20 @@ pub struct Snapshot {
     /// The faults the oven reports now (see `protocol::faults`).
     pub faults: Vec<String>,
     /// The faults already announced. Set by [`Self::carry`]: kept until the
-    /// oven is idle with no fault, so a flag that flaps announces once.
+    /// next cook starts, so a flag that flaps announces once.
     pub faults_warned: Vec<String>,
 }
 
 impl Snapshot {
-    /// From the full `/status` (with `cook_progress` attached) and the
-    /// current cook.
-    pub fn new(status: Option<&OvenStatus>, cook: Option<&CurrentCook>, connected: bool) -> Self {
+    /// From the full `/status` (with `cook_progress` attached), the current
+    /// cook and the previous snapshot. `prev` is `None` only for the
+    /// baseline; with it, the new snapshot keeps what `prev` announced.
+    pub fn new(
+        status: Option<&OvenStatus>,
+        cook: Option<&CurrentCook>,
+        connected: bool,
+        prev: Option<&Snapshot>,
+    ) -> Self {
         let progress = status.and_then(|s| s.cook_progress.as_ref());
         let stage_index = progress
             .map(|p| p.current_stage_index)
@@ -77,7 +86,7 @@ impl Snapshot {
         let stages = cook.map(|c| c.stages.clone()).unwrap_or_default();
         let stage = stage_index.and_then(|i| stages.get(i));
         let wet = status.is_some_and(|s| s.temperature_bulbs_mode == "wet");
-        Snapshot {
+        let mut snapshot = Snapshot {
             connected,
             cooking: status.is_some_and(OvenStatus::is_cooking),
             cook_key: status.and_then(|s| s.cook_id.clone()),
@@ -110,17 +119,35 @@ impl Snapshot {
             faults: status.map(|s| s.faults.clone()).unwrap_or_default(),
             faults_warned: Vec::new(),
             stages,
+        };
+        match prev {
+            Some(prev) => snapshot.carry(prev),
+            None => snapshot.baseline(),
         }
+        snapshot
     }
 
-    /// Take over what `prev` already announced: `reached` and `tank_warned`
-    /// while the cook and its stage stay the same, `faults_warned` until the
-    /// oven is idle with no fault. Call it before [`milestones`].
-    pub fn carry(&mut self, prev: &Snapshot) {
+    /// The first snapshot: what it already shows counts as announced, so a
+    /// restart mid-cook does not announce `temp_reached`, `water_empty` or
+    /// `oven_fault` again.
+    fn baseline(&mut self) {
+        self.reached = self.near_target();
+        self.tank_warned = self.dry_tank();
+        self.faults_warned = self.faults.clone();
+    }
+
+    /// Take over what `prev` already announced: `reached` while the cook,
+    /// its stage and its target stay the same, `tank_warned` while the cook
+    /// and its stage stay the same, and `faults_warned` until the next cook
+    /// starts. [`Self::new`] calls it.
+    fn carry(&mut self, prev: &Snapshot) {
         let same = self.same_stage(prev);
-        self.reached = self.near_target() || (same && prev.reached);
+        self.reached = self.near_target() || (same && prev.reached && self.same_target(prev));
         self.tank_warned = same && (prev.tank_warned || prev.dry_tank());
-        self.faults_warned = if !self.cooking && self.faults.is_empty() {
+        // A new cook announces again a fault that is still there: the
+        // user is about to cook with it. Between cooks, a flag that flaps
+        // announces once.
+        self.faults_warned = if self.cook_began(prev) {
             Vec::new()
         } else {
             let mut w = prev.faults_warned.clone();
@@ -134,10 +161,23 @@ impl Snapshot {
     }
 
     /// A fault that has not been announced yet.
-    fn new_fault(&self, prev: &Snapshot) -> bool {
-        self.faults
-            .iter()
-            .any(|f| !prev.faults.contains(f) && !self.faults_warned.contains(f))
+    fn new_fault(&self) -> bool {
+        self.faults.iter().any(|f| !self.faults_warned.contains(f))
+    }
+
+    /// A cook begins: the oven goes from idle to cooking, or a new cook
+    /// replaces the running one.
+    fn cook_began(&self, prev: &Snapshot) -> bool {
+        self.cooking && (!prev.cooking || prev.key().new_cook(&self.key()))
+    }
+
+    /// The stage's target is the same as in `prev`. A target that is not
+    /// known on one side changes nothing, as with a late cook ID.
+    fn same_target(&self, prev: &Snapshot) -> bool {
+        match (prev.target_c, self.target_c) {
+            (Some(a), Some(b)) => (a - b).abs() < 0.1,
+            _ => true,
+        }
     }
 
     /// The tank is empty during a stage that needs water.
@@ -309,6 +349,8 @@ pub fn milestones(prev: &Snapshot, next: &Snapshot) -> Vec<Milestone> {
             let preheat = next
                 .stage(next.stage_index)
                 .is_some_and(|s| s.kind == "preheat");
+            // `reached` is false again after a new target
+            // (`cmd/temperature`), so the new target is announced too.
             if !new_cook && next.same_stage(prev) && !prev.reached && next.reached && !preheat {
                 out.push(Milestone::TempReached);
             }
@@ -325,11 +367,12 @@ pub fn milestones(prev: &Snapshot, next: &Snapshot) -> Vec<Milestone> {
     // The tank runs empty during a stage that needs water, or a cook starts
     // (or reaches such a stage) with the tank empty. Once per stage. After
     // `cook_started`, so the processor knows who started the cook first.
-    if next.dry_tank() && !next.tank_warned && !(next.same_stage(prev) && prev.dry_tank()) {
+    if next.dry_tank() && !next.tank_warned {
         out.push(Milestone::WaterEmpty);
     }
-    // A part failed or overheated, in a cook or not. Once per fault.
-    if next.new_fault(prev) {
+    // A part failed or overheated, in a cook or not. Once per fault until
+    // the next cook starts.
+    if next.new_fault() {
         out.push(Milestone::Fault);
     }
     out
@@ -360,9 +403,20 @@ mod tests {
         }
     }
 
+    /// The milestones of successive reports, made as [`Snapshot::new`] makes
+    /// them: the first is the baseline, and each later one carries what the
+    /// one before it announced.
     fn sequence(snapshots: &[Snapshot]) -> Vec<&'static str> {
-        snapshots
-            .windows(2)
+        let mut made: Vec<Snapshot> = Vec::new();
+        for s in snapshots {
+            let mut s = s.clone();
+            match made.last() {
+                Some(prev) => s.carry(prev),
+                None => s.baseline(),
+            }
+            made.push(s);
+        }
+        made.windows(2)
             .flat_map(|w| milestones(&w[0], &w[1]))
             .map(Milestone::as_str)
             .collect()
@@ -466,19 +520,6 @@ mod tests {
         assert!(sequence(&[idle(), idle_lost]).is_empty());
     }
 
-    /// `carry` each snapshot from the one before, as the processor does.
-    fn carried(snapshots: &[Snapshot]) -> Vec<&'static str> {
-        let mut out: Vec<Snapshot> = Vec::new();
-        for s in snapshots {
-            let mut s = s.clone();
-            if let Some(prev) = out.last() {
-                s.carry(prev);
-            }
-            out.push(s);
-        }
-        sequence(&out)
-    }
-
     fn heating(stage_index: usize, temp: f32) -> Snapshot {
         Snapshot {
             temperature_c: Some(temp),
@@ -490,7 +531,7 @@ mod tests {
     #[test]
     fn temp_reached_once_per_stage() {
         assert_eq!(
-            carried(&[
+            sequence(&[
                 heating(1, 20.0),
                 heating(1, 150.0),
                 heating(1, 198.5), // within 2 °C
@@ -505,15 +546,15 @@ mod tests {
     #[test]
     fn temp_reached_not_for_a_preheat_stage_nor_a_hot_start() {
         // Stage 0 is a preheat: preheat_done says it.
-        assert!(carried(&[heating(0, 20.0), heating(0, 199.0)]).is_empty());
+        assert!(sequence(&[heating(0, 20.0), heating(0, 199.0)]).is_empty());
         // The next stage starts at its target already: nothing to announce.
         assert_eq!(
-            carried(&[heating(1, 20.0), heating(1, 200.0), heating(2, 200.0)]),
+            sequence(&[heating(1, 20.0), heating(1, 200.0), heating(2, 200.0)]),
             ["temp_reached", "stage_started"]
         );
         // `reached` does not leak into the next stage: it heats again first.
         assert_eq!(
-            carried(&[
+            sequence(&[
                 heating(1, 20.0),
                 heating(1, 200.0),
                 heating(2, 150.0),
@@ -527,8 +568,8 @@ mod tests {
             target_c: Some(56.0),
             ..heating(1, t)
         };
-        assert!(carried(&[wet(50.0), wet(55.0)]).is_empty());
-        assert_eq!(carried(&[wet(50.0), wet(55.6)]), ["temp_reached"]);
+        assert!(sequence(&[wet(50.0), wet(55.0)]).is_empty());
+        assert_eq!(sequence(&[wet(50.0), wet(55.6)]), ["temp_reached"]);
     }
 
     #[test]
@@ -544,7 +585,7 @@ mod tests {
         };
         // A flag that flaps announces it once per stage.
         assert_eq!(
-            carried(&[
+            sequence(&[
                 steam(false),
                 steam(true),
                 steam(true),
@@ -555,7 +596,7 @@ mod tests {
         );
         // A new stage that needs water announces it again.
         assert_eq!(
-            carried(&[
+            sequence(&[
                 steam(true),
                 Snapshot {
                     stage_index: Some(2),
@@ -618,45 +659,98 @@ mod tests {
     }
 
     #[test]
-    fn a_fault_is_announced_once() {
-        let mut prev = cooking(1);
-        prev.carry(&cooking(1));
-        let mut next = Snapshot {
+    fn a_fault_is_announced_once_until_the_next_cook() {
+        let faulty = |base: Snapshot, faults: &[&str]| Snapshot {
+            faults: faults.iter().map(|f| f.to_string()).collect(),
+            ..base
+        };
+        // In a cook: the flag flaps, and only a second fault is new.
+        assert_eq!(
+            sequence(&[
+                cooking(1),
+                faulty(cooking(1), &["triacs_failed"]),
+                cooking(1),
+                faulty(cooking(1), &["triacs_failed"]),
+                faulty(cooking(1), &["triacs_failed", "fan_failed"]),
+            ]),
+            ["oven_fault", "oven_fault"]
+        );
+        // On an idle oven, a flag that flaps announces once.
+        assert_eq!(
+            sequence(&[
+                idle(),
+                faulty(idle(), &["triacs_failed"]),
+                idle(),
+                faulty(idle(), &["triacs_failed"]),
+                idle(),
+                faulty(idle(), &["triacs_failed"]),
+            ]),
+            ["oven_fault"]
+        );
+        // A new cook announces a fault that is still there again.
+        assert_eq!(
+            sequence(&[
+                faulty(idle(), &[]),
+                faulty(idle(), &["triacs_failed"]),
+                faulty(cooking(0), &["triacs_failed"]),
+            ]),
+            ["oven_fault", "cook_started", "oven_fault"]
+        );
+        // So does a new cook that replaces the running one.
+        let replaced = Snapshot {
+            cook_key: Some("cook-2".into()),
+            ..faulty(cooking(0), &["triacs_failed"])
+        };
+        assert_eq!(
+            sequence(&[faulty(cooking(1), &["triacs_failed"]), replaced]),
+            ["cook_started", "oven_fault"]
+        );
+    }
+
+    #[test]
+    fn a_restart_announces_nothing_the_oven_already_shows() {
+        // The server starts mid-cook: at the target, the tank empty in a
+        // steam stage, and a fault. The baseline counts all three as
+        // announced.
+        let now = Snapshot {
+            uses_water: true,
+            water_tank_empty: true,
             faults: vec!["triacs_failed".into()],
-            ..cooking(1)
+            ..heating(1, 200.0)
         };
-        next.carry(&prev);
-        assert_eq!(milestones(&prev, &next), [Milestone::Fault]);
-        // The flag flaps: off, then on again. No second message.
-        let mut off = cooking(1);
-        off.carry(&next);
-        assert!(milestones(&next, &off).is_empty());
-        let mut again = Snapshot {
-            faults: vec!["triacs_failed".into()],
-            ..cooking(1)
+        assert!(sequence(&[now.clone(), now]).is_empty());
+    }
+
+    #[test]
+    fn a_new_target_re_arms_temp_reached() {
+        let target = |t: f32, temp: f32| Snapshot {
+            target_c: Some(t),
+            ..heating(1, temp)
         };
-        again.carry(&off);
-        assert!(milestones(&off, &again).is_empty());
-        // A second fault is new.
-        let mut more = Snapshot {
-            faults: vec!["triacs_failed".into(), "fan_failed".into()],
-            ..cooking(1)
+        assert_eq!(
+            sequence(&[
+                target(200.0, 150.0),
+                target(200.0, 200.0),
+                target(220.0, 201.0), // cmd/temperature raised it
+                target(220.0, 219.0),
+                target(220.0, 221.0),
+            ]),
+            ["temp_reached", "temp_reached"]
+        );
+        // A target the oven does not report for a moment changes nothing.
+        let unknown = Snapshot {
+            target_c: None,
+            ..heating(1, 200.0)
         };
-        more.carry(&again);
-        assert_eq!(milestones(&again, &more), [Milestone::Fault]);
-        // Idle with no fault forgets them; the next one is announced again.
-        let idle = Snapshot {
-            connected: true,
-            ..Snapshot::default()
-        };
-        let mut clear = idle.clone();
-        clear.carry(&more);
-        let mut back = Snapshot {
-            faults: vec!["triacs_failed".into()],
-            ..idle
-        };
-        back.carry(&clear);
-        assert_eq!(milestones(&clear, &back), [Milestone::Fault]);
+        assert_eq!(
+            sequence(&[
+                heating(1, 150.0),
+                heating(1, 200.0),
+                unknown,
+                heating(1, 200.0)
+            ]),
+            ["temp_reached"]
+        );
     }
 
     #[test]
@@ -667,12 +761,12 @@ mod tests {
         s.active_stage_index = None;
         assert!(!s.is_cooking() && s.is_descaling());
         assert_eq!(s.phase(), "Descaling");
-        let snap = Snapshot::new(Some(&s), None, true);
+        let snap = Snapshot::new(Some(&s), None, true, None);
         assert!(!snap.cooking);
         let mut i = status("idle", 0);
         i.mode = "idle".into();
         i.active_stage_index = None;
-        let idle = Snapshot::new(Some(&i), None, true);
+        let idle = Snapshot::new(Some(&i), None, true, None);
         assert!(milestones(&idle, &snap).is_empty(), "no cook_started");
         assert!(milestones(&snap, &idle).is_empty(), "no cook_stopped");
     }
@@ -691,8 +785,8 @@ mod tests {
             total_stage_count: 1,
         };
         let s = status("idle", 0);
-        assert!(Snapshot::new(Some(&s), Some(&cook(&steam)), true).uses_water);
-        assert!(!Snapshot::new(Some(&s), Some(&cook(&stage("cook"))), true).uses_water);
+        assert!(Snapshot::new(Some(&s), Some(&cook(&steam)), true, None).uses_water);
+        assert!(!Snapshot::new(Some(&s), Some(&cook(&stage("cook"))), true, None).uses_water);
     }
 
     #[test]
