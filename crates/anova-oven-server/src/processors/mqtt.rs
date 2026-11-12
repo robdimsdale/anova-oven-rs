@@ -18,7 +18,7 @@ mod recipes;
 mod start_later;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anova_oven_api::{CookProgress, OvenStatus, Recipe, ScheduledStart};
 use rumqttc::{AsyncClient, Event, LastWill, MqttOptions, Packet, QoS};
@@ -39,6 +39,10 @@ const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// How long a publish may wait for room in the client's queue.
 const PUBLISH_TIMEOUT: Duration = Duration::from_secs(1);
+/// How long a start command's `started_by` waits for its cook to begin.
+/// The oven reports a new cook within seconds; a start it never ran must
+/// not name the user of a later cook started on the oven.
+const STARTED_BY_TTL: Duration = Duration::from_secs(120);
 
 pub struct MqttConfig {
     /// `mqtt://host:1883`; the port defaults to 1883.
@@ -132,25 +136,7 @@ pub async fn run(config: MqttConfig, mut sources: Sources) {
     let (incoming_tx, mut incoming_rx) = mpsc::channel(32);
     tokio::spawn(drive(eventloop, incoming_tx));
 
-    let mut processor = Processor {
-        client,
-        topics: config.topics,
-        local: config.local,
-        time_zone: config.time_zone,
-        recipes: Vec::new(),
-        options: Vec::new(),
-        selected: None,
-        manual: manual::Draft::default(),
-        last_manual: None,
-        start_later: start_later::Draft::default(),
-        last_start_later: None,
-        last_scheduled: None,
-        last_state: None,
-        unit: None,
-        discovered_unit: None,
-        last_snapshot: None,
-        next_stage_ready: None,
-    };
+    let mut processor = Processor::new(client, config.topics, config.local, config.time_zone);
     let mut poll = tokio::time::interval(POLL_INTERVAL);
 
     loop {
@@ -250,9 +236,45 @@ struct Processor {
     /// mid-cook announces nothing.
     last_snapshot: Option<Snapshot>,
     next_stage_ready: Option<bool>,
+    /// The `started_by` of the last start command, and when it came, until
+    /// the cook it started begins (or [`STARTED_BY_TTL`] passes).
+    pending_started_by: Option<(String, Instant)>,
+    /// Who started the running cook: the `started_by` of its start command,
+    /// or `None` (started on the oven, by a schedule, or without one). Every
+    /// event of the cook carries it.
+    started_by: Option<String>,
 }
 
 impl Processor {
+    fn new(
+        client: AsyncClient,
+        topics: Topics,
+        local: bool,
+        time_zone: Option<jiff::tz::TimeZone>,
+    ) -> Self {
+        Processor {
+            client,
+            topics,
+            local,
+            time_zone,
+            recipes: Vec::new(),
+            options: Vec::new(),
+            selected: None,
+            manual: manual::Draft::default(),
+            last_manual: None,
+            start_later: start_later::Draft::default(),
+            last_start_later: None,
+            last_scheduled: None,
+            last_state: None,
+            unit: None,
+            discovered_unit: None,
+            last_snapshot: None,
+            next_stage_ready: None,
+            pending_started_by: None,
+            started_by: None,
+        }
+    }
+
     async fn publish(&self, topic: String, retain: bool, payload: impl Into<Vec<u8>>) {
         publish_within(&self.client, PUBLISH_TIMEOUT, topic, retain, payload).await;
     }
@@ -408,7 +430,12 @@ impl Processor {
             self.last_state = Some(state);
         }
 
-        let snapshot = Snapshot::new(status.as_ref(), model.current_cook.as_ref(), connected);
+        let snapshot = Snapshot::new(
+            status.as_ref(),
+            model.current_cook.as_ref(),
+            connected,
+            self.last_snapshot.as_ref(),
+        );
         let ready = snapshot.next_stage_ready && snapshot.connected;
         if force || self.next_stage_ready != Some(ready) {
             let availability = if ready { "online" } else { "offline" };
@@ -417,10 +444,25 @@ impl Processor {
             self.next_stage_ready = Some(ready);
         }
 
-        if let Some(prev) = &self.last_snapshot {
-            for milestone in milestones::milestones(prev, &snapshot) {
+        // A scheduled cook that fired (or was cancelled) is no one's: a
+        // `started_by` still pending must not name its user.
+        let scheduled = model.scheduled_start;
+        if matches!(&self.last_scheduled, Some(Some(_))) && scheduled.is_none() {
+            self.pending_started_by = None;
+        }
+
+        let had_baseline = self.last_snapshot.is_some();
+        if let Some(prev) = self.last_snapshot.take() {
+            for milestone in milestones::milestones(&prev, &snapshot) {
+                if milestone == Milestone::CookStarted {
+                    self.started_by = self
+                        .pending_started_by
+                        .take()
+                        .filter(|(_, at)| at.elapsed() < STARTED_BY_TTL)
+                        .map(|(user, _)| user);
+                }
                 let source = if milestone.describes_previous() {
-                    prev
+                    &prev
                 } else {
                     &snapshot
                 };
@@ -428,11 +470,19 @@ impl Processor {
                     .await;
             }
         }
-        self.last_snapshot = Some(snapshot);
+        // The cook's events are out: a later fault on an idle oven is no
+        // one's.
+        if snapshot.connected && !snapshot.cooking {
+            self.started_by = None;
+        }
+        // The baseline is the oven's first report. Before it, the status
+        // says idle, so a restart mid-cook would announce the cook again.
+        if had_baseline || (connected && status.is_some()) {
+            self.last_snapshot = Some(snapshot);
+        }
 
         // A new or moved scheduled cook. Not its start or cancellation: the
         // cook's own events, or a `command_failed`, say what happened.
-        let scheduled = model.scheduled_start;
         if let Some(prev) = &self.last_scheduled {
             let moved = |s: &&ScheduledStart| {
                 prev.as_ref()
@@ -456,21 +506,22 @@ impl Processor {
         self.publish_start_later().await;
     }
 
-    async fn event(&self, milestone: Milestone, payload: serde_json::Value) {
+    async fn event(&self, milestone: Milestone, mut payload: serde_json::Value) {
         info!(event = milestone.as_str(), "[mqtt] milestone");
+        payload["started_by"] = self.started_by.clone().into();
         self.publish(self.topics.event(), false, payload.to_string())
             .await;
     }
 
     async fn command_failed(&self, command: &str, reason: &str) {
+        self.start_failed(command, reason, None).await;
+    }
+
+    /// A `command_failed` that names who sent the refused command: the
+    /// `started_by` of a start command, never the running cook's.
+    async fn start_failed(&self, command: &str, reason: &str, requested_by: Option<&str>) {
         warn!(command, reason, "[mqtt] command failed");
-        let mut payload = self
-            .last_snapshot
-            .clone()
-            .unwrap_or_default()
-            .payload("command_failed");
-        payload["command"] = command.into();
-        payload["reason"] = reason.into();
+        let payload = failure_payload(self.last_snapshot.as_ref(), command, reason, requested_by);
         self.publish(self.topics.event(), false, payload.to_string())
             .await;
     }
@@ -484,6 +535,11 @@ impl Processor {
         };
         let text = String::from_utf8_lossy(payload).trim().to_string();
         debug!(command = %name, payload = %text, "[mqtt] command");
+
+        // Kept for the cook only once the state machine takes the start (see
+        // below), so a refused start never names its user on a later cook.
+        let is_start = name == "start" || name == "start_manual";
+        let requested_by = if is_start { started_by(&text) } else { None };
 
         let (reply_tx, reply_rx) = oneshot::channel();
         let cmd = match name.as_str() {
@@ -505,7 +561,8 @@ impl Processor {
                     .and_then(|v| v.get("recipe_id")?.as_str().map(String::from))
                     .or_else(|| self.selected.clone());
                 let Some(recipe_id) = recipe_id else {
-                    self.command_failed("start", "no recipe selected").await;
+                    self.start_failed("start", "no recipe selected", requested_by.as_deref())
+                        .await;
                     return;
                 };
                 StateMachineCommand::StartCook {
@@ -528,7 +585,8 @@ impl Processor {
                         reply: reply_tx,
                     },
                     Err(e) => {
-                        self.command_failed("start_manual", &e).await;
+                        self.start_failed("start_manual", &e, requested_by.as_deref())
+                            .await;
                         return;
                     }
                 }
@@ -580,15 +638,51 @@ impl Processor {
         if sources.sm_cmd_tx.send(cmd).await.is_err() {
             return;
         }
+        // This task waits for the reply, so `on_change` can't see the new
+        // cook before `pending_started_by` is set.
         match reply_rx.await {
+            Ok(Ok(())) if is_start => {
+                // A start without `started_by` clears it, so an earlier
+                // user isn't named.
+                self.pending_started_by = requested_by.map(|user| (user, Instant::now()));
+            }
+            // A scheduled cook started now is no one's.
+            Ok(Ok(())) if name == "start_scheduled_now" => self.pending_started_by = None,
             Ok(Ok(())) => {}
-            Ok(Err(e)) => self.command_failed(&name, &e.to_string()).await,
-            Err(_) => {
-                self.command_failed(&name, "state machine dropped the reply")
+            Ok(Err(e)) => {
+                self.start_failed(&name, &e.to_string(), requested_by.as_deref())
                     .await
+            }
+            Err(_) => {
+                self.start_failed(
+                    &name,
+                    "state machine dropped the reply",
+                    requested_by.as_deref(),
+                )
+                .await
             }
         }
     }
+}
+
+/// The `command_failed` payload: the last snapshot's view of the oven, the
+/// command, the reason, and `started_by`. That is the refused start's own
+/// `started_by` (`null` for any other command), never the running cook's,
+/// so a notification reaches the person whose command failed.
+fn failure_payload(
+    snapshot: Option<&Snapshot>,
+    command: &str,
+    reason: &str,
+    requested_by: Option<&str>,
+) -> serde_json::Value {
+    let mut payload = snapshot
+        .cloned()
+        .unwrap_or_default()
+        .payload("command_failed");
+    payload["command"] = command.into();
+    payload["reason"] = reason.into();
+    payload["started_by"] = requested_by.into();
+    payload
 }
 
 impl Processor {
@@ -630,6 +724,21 @@ impl Processor {
             }
         }
     }
+}
+
+/// The `started_by` of a start command's JSON: who asked for the cook, such
+/// as a Home Assistant user ID. The server only passes it on in the cook's
+/// events, so a notification can go to that person. It is not checked
+/// against anything and grants nothing. Only a short plain ID is taken
+/// (letters, digits, `-`, `_`, `.`, at most 64), since every event repeats
+/// it.
+fn started_by(text: &str) -> Option<String> {
+    let json = serde_json::from_str::<serde_json::Value>(text).ok()?;
+    let user = json.get("started_by")?.as_str()?;
+    let plain = user
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b));
+    (plain && !user.is_empty() && user.len() <= 64).then(|| user.to_string())
 }
 
 /// A manual cook given in full, as `POST /start` takes one.
@@ -758,6 +867,7 @@ fn state_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::types::SmError;
 
     #[tokio::test]
     async fn a_publish_gives_up_when_the_queue_stays_full() {
@@ -807,6 +917,141 @@ mod tests {
         let v = state_json(Some(&status), None, true, None);
         assert_eq!(v["stage_ends_at"], serde_json::Value::Null);
         assert_eq!(v["stage_started_at"], serde_json::Value::Null);
+    }
+
+    /// A processor, and the sources it reads, with a state machine that
+    /// answers every start with `answer()` (`Ok` accepts it).
+    fn processor_with(answer: fn() -> Result<(), SmError>) -> (Processor, Sources) {
+        let (client, eventloop) = AsyncClient::new(MqttOptions::new("test", "localhost", 1883), 64);
+        // Never polled; kept alive so publishes queue instead of failing.
+        std::mem::forget(eventloop);
+        let topics = Topics {
+            prefix: "anova/oven".into(),
+            discovery: "homeassistant".into(),
+        };
+        let (sm_cmd_tx, mut sm_cmd_rx) = mpsc::channel(4);
+        tokio::spawn(async move {
+            while let Some(cmd) = sm_cmd_rx.recv().await {
+                match cmd {
+                    StateMachineCommand::StartCook { reply, .. }
+                    | StateMachineCommand::StartManualCook { reply, .. }
+                    | StateMachineCommand::StartScheduledNow { reply } => {
+                        let _ = reply.send(answer());
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let sources = Sources {
+            read_model: watch::channel(ReadModel::default()).1,
+            cook_progress: watch::channel(None).1,
+            liveness: Arc::new(Liveness::new(30)),
+            failures: broadcast::channel(4).1,
+            sm_cmd_tx,
+        };
+        (Processor::new(client, topics, true, None), sources)
+    }
+
+    fn pending(p: &Processor) -> Option<&str> {
+        p.pending_started_by.as_ref().map(|(user, _)| user.as_str())
+    }
+
+    #[tokio::test]
+    async fn only_an_accepted_start_keeps_its_started_by() {
+        let start = br#"{"recipe_id": "r1", "started_by": "alice"}"#;
+        let (mut p, sources) = processor_with(|| Ok(()));
+        p.on_command("anova/oven/cmd/start", start, &sources).await;
+        assert_eq!(pending(&p), Some("alice"));
+        // A later start without one clears it.
+        p.on_command("anova/oven/cmd/start", br#"{"recipe_id": "r1"}"#, &sources)
+            .await;
+        assert_eq!(pending(&p), None);
+
+        // The state machine refuses it.
+        let (mut p, sources) = processor_with(|| Err(SmError::Disconnected));
+        p.on_command("anova/oven/cmd/start", start, &sources).await;
+        assert_eq!(pending(&p), None);
+    }
+
+    #[tokio::test]
+    async fn an_early_refusal_keeps_no_started_by() {
+        let (mut p, sources) = processor_with(|| Ok(()));
+        // No recipe given and none selected.
+        p.on_command(
+            "anova/oven/cmd/start",
+            br#"{"started_by": "alice"}"#,
+            &sources,
+        )
+        .await;
+        assert_eq!(pending(&p), None);
+        // A manual cook that `manual::check` refuses: no stages.
+        let bad = br#"{"title": "x", "stages": [], "started_by": "alice"}"#;
+        p.on_command("anova/oven/cmd/start_manual", bad, &sources)
+            .await;
+        assert_eq!(pending(&p), None);
+        // A refused start leaves an earlier accepted one alone.
+        p.on_command(
+            "anova/oven/cmd/start",
+            br#"{"recipe_id": "r1", "started_by": "bob"}"#,
+            &sources,
+        )
+        .await;
+        p.on_command(
+            "anova/oven/cmd/start",
+            br#"{"started_by": "alice"}"#,
+            &sources,
+        )
+        .await;
+        assert_eq!(pending(&p), Some("bob"));
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_cook_started_now_is_no_ones() {
+        let (mut p, sources) = processor_with(|| Ok(()));
+        p.on_command(
+            "anova/oven/cmd/start",
+            br#"{"recipe_id": "r1", "started_by": "alice"}"#,
+            &sources,
+        )
+        .await;
+        p.on_command("anova/oven/cmd/start_scheduled_now", b"PRESS", &sources)
+            .await;
+        assert_eq!(pending(&p), None);
+    }
+
+    #[test]
+    fn command_failed_names_the_requester_not_the_running_cook() {
+        // Alice's cook runs. Bob's start is refused: his name, not hers.
+        let running = Snapshot {
+            connected: true,
+            cooking: true,
+            cook_key: Some("cook-1".into()),
+            ..Default::default()
+        };
+        let p = failure_payload(Some(&running), "start", "busy", Some("bob"));
+        assert_eq!(p["event_type"], "command_failed");
+        assert_eq!(p["command"], "start");
+        assert_eq!(p["reason"], "busy");
+        assert_eq!(p["started_by"], "bob");
+        // Any other command names no one.
+        let p = failure_payload(Some(&running), "lamp", "offline", None);
+        assert_eq!(p["started_by"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn started_by_takes_only_a_short_plain_id() {
+        let id = "8f1b2c3d4e5f40718293a4b5c6d7e8f9";
+        assert_eq!(
+            started_by(&format!(r#"{{"recipe_id": "r1", "started_by": "{id}"}}"#)),
+            Some(id.to_string())
+        );
+        assert_eq!(started_by(r#"{"recipe_id": "r1"}"#), None);
+        assert_eq!(started_by("PRESS"), None);
+        for bad in ["", " ", "a b", "<script>", "x\n", &"a".repeat(65)] {
+            let json = serde_json::json!({ "started_by": bad }).to_string();
+            assert_eq!(started_by(&json), None, "{bad}");
+        }
+        assert_eq!(started_by(r#"{"started_by": 7}"#), None);
     }
 
     #[test]

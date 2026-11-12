@@ -465,6 +465,9 @@
       "cook_stopped",
       "command_failed",
       "oven_lost",
+      "temp_reached",
+      "water_empty",
+      "oven_fault",
       "cook_scheduled"
     ],
     "has_entity_name": true,

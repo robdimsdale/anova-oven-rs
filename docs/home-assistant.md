@@ -176,6 +176,9 @@ again. So the server publishes them to the cook event entity, not retained:
 | `command_failed` | A command was refused, or the oven didn't ack it |
 | `oven_lost` | The oven's connection drops while a cook is running |
 | `cook_scheduled` | A cook is set to start later, or its time changes |
+| `temp_reached` | The oven reaches the stage's target (within 2 °C, 0.5 °C in sous vide), once per stage and again after the target changes; not for a preheat stage, which says `preheat_done` |
+| `water_empty` | The tank is empty while a stage needs water (steam or sous vide), once per stage |
+| `oven_fault` | The oven reports a fault (see the Problem sensor), in a cook or not; once per fault until the next cook starts, which announces a fault that is still there again |
 
 One edge, one event: a preheat whose next stage waits for the user (to put
 the food in) ends with `stage_waiting`, and `preheat_done` or
@@ -184,18 +187,51 @@ the food in) ends with `stage_waiting`, and `preheat_done` or
 Each payload carries `event_type`, `cook_id`, `recipe_title`, `step_index`,
 `step_count`, `current_step` and `next_step` (summaries), and
 `next_step_prompt` (the note while it waits), all counting steps as the
-recipe editor does. `command_failed` adds the command and the reason;
-`cook_scheduled` carries `recipe_title`, `recipe_id` and `at`. `cook_id` is
+recipe editor does. They also carry `preheat` (the oven is in the step's
+preheat), `target_c`, `wet`, `unit` and `faults`, so a notification can
+say what the oven heats to and why it warns, and `started_by`.
+`command_failed` adds the command and the reason, and its `started_by` is
+the refused start command's own (`null` for any other command), not the
+running cook's. `cook_scheduled` carries `recipe_title`, `recipe_id` and
+`at`, and no `started_by`. `cook_id` is
 the oven's `cookId`, so a notification can use it as a tag, and each
 milestone replaces the previous one for that cook instead of piling up.
+
+`started_by` is who started the cook: the `started_by` string of the
+`cmd/start` or `cmd/start_manual` JSON that started it, such as a Home
+Assistant user ID, so a notification can go to that person. It is `null`
+for a cook started on the oven, by a schedule, or by a command without
+one, and the server forgets a `started_by` whose cook didn't begin within
+2 minutes, so it never names the user of a later cook. The server keeps
+it only when the state machine takes the start: a refused start never
+names its user on a later cook. A scheduled cook, started on time or with
+Start scheduled cook now, has none. Only a short plain ID is taken
+(letters, digits, `-`, `_`, `.`, at most 64 characters). It grants nothing
+(see Security decisions).
+
+Only MQTT starts can carry `started_by`. `POST /start` does not take it, so
+a cook started from the web UI or the CLI has `null`.
+
+`temp_reached` uses the server's own threshold (2 °C, 0.5 °C in sous
+vide). It can differ from the oven's own "temperature reached": on a timer
+stage that waits for the temperature, the oven's timer can start a little
+earlier or later than this event.
 
 How they're made:
 
 - **In the MQTT processor**, as a pure function of successive snapshots of
   what `/status` serves (`mqtt::milestones`), not in the state machine:
   cook progress lives in `CookProgressTask`.
-- **The first snapshot after the server starts is a baseline**, so a
+- **The oven's first report after the server starts is a baseline**, so a
   restart mid-cook announces nothing, in either mode, with no persistence.
+  Snapshots from before that report say idle, so they don't count.
+- **`temp_reached`, `water_empty` and `oven_fault` need a memory**, so a
+  dip (the door opened), a tank flag or a fault flag that flaps doesn't
+  announce again. `Snapshot::new` copies it from the previous snapshot:
+  per stage and target for `temp_reached`, per stage for `water_empty`,
+  and until the next cook starts for `oven_fault`. An idle oven with a
+  flag that flaps then announces it once, not at every flap. The baseline
+  counts what it already shows as announced.
 - **Cooks are keyed by the oven's `cookId`**, not the current cook's start
   time, which in local mode moves once (from the state machine's
   placeholder to the journal's) and fired `cook_started` twice.
@@ -226,6 +262,12 @@ Decided 2026-10-15.
   the LAN can drive the oven through the server. That's accepted for a home
   network, and it sets the bar for the next item: there's little point
   guarding the oven's connection more tightly than the HTTP API.
+- **`started_by` is a label, not an identity.** Anything that can publish
+  to `cmd/start` can put any `started_by` in it. The server passes it on in
+  the cook's events and never uses it to allow or refuse anything. A
+  consumer may use it to pick who gets a notification, never to decide
+  what someone may do. A cook started on the oven has none, and every
+  user of the house should then get its notifications.
 - **Authenticating the oven's connection: deferred.**
 
   *The exposure.* The device listener reads the JWT's `deviceId` without
