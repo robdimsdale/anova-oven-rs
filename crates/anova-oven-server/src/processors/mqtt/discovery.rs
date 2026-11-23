@@ -1,7 +1,8 @@
 //! Home Assistant MQTT discovery: one device, "Anova Oven", and its entities.
 //!
 //! Every config is retained under
-//! `<discovery prefix>/<component>/anova_oven/<object>/config`. Entities
+//! `<discovery prefix>/<component>/<device id>/<object>/config`, the device
+//! id being `anova_oven` unless `ANOVA_MQTT_DEVICE_ID` says otherwise. Entities
 //! only local mode can drive (next step, lamp, set temperature, set timer)
 //! get an empty retained config in cloud mode, which removes them, so Home
 //! Assistant never shows a control the cloud will refuse.
@@ -20,6 +21,13 @@ use super::milestones::EVENT_TYPES;
 pub struct Topics {
     pub prefix: String,
     pub discovery: String,
+    /// Home Assistant's device identifier, and the start of every
+    /// `unique_id` and entity id: `anova_oven` by default. A second oven
+    /// (a second server on the same broker) needs its own, or Home
+    /// Assistant merges the two into one device.
+    pub device_id: String,
+    /// The device's name in Home Assistant: `Anova Oven` by default.
+    pub device_name: String,
 }
 
 impl Topics {
@@ -61,7 +69,7 @@ impl Topics {
         self.under("cmd/#")
     }
     fn config(&self, component: &str, object: &str) -> String {
-        format!("{}/{component}/anova_oven/{object}/config", self.discovery)
+        format!("{}/{component}/{}/{object}/config", self.discovery, self.device_id)
     }
 }
 
@@ -143,14 +151,14 @@ fn config(topics: &Topics, e: &Entity) -> Value {
 
     let mut config = json!({
         "name": e.name,
-        "unique_id": format!("anova_oven_{}", e.object),
-        "default_entity_id": format!("{}.anova_oven_{}", e.component, e.object),
+        "unique_id": format!("{}_{}", topics.device_id, e.object),
+        "default_entity_id": format!("{}.{}_{}", e.component, topics.device_id, e.object),
         "has_entity_name": true,
         "availability": availability,
         "availability_mode": "all",
         "device": {
-            "identifiers": ["anova_oven"],
-            "name": "Anova Oven",
+            "identifiers": [topics.device_id],
+            "name": topics.device_name,
             "manufacturer": "Anova",
             "model": "Precision Oven",
         },
@@ -781,6 +789,8 @@ mod tests {
         Topics {
             prefix: "anova/oven".into(),
             discovery: "homeassistant".into(),
+            device_id: "anova_oven".into(),
+            device_name: "Anova Oven".into(),
         }
     }
 
@@ -803,6 +813,35 @@ mod tests {
                 })
                 .collect(),
         )
+    }
+
+    /// A second oven's server, with its own device id and name, publishes
+    /// under its own node and ids, so Home Assistant keeps two devices.
+    #[test]
+    fn a_second_device_gets_its_own_ids() {
+        let topics = Topics {
+            prefix: "anova/outdoor_oven".into(),
+            discovery: "homeassistant".into(),
+            device_id: "anova_outdoor_oven".into(),
+            device_name: "Anova Outdoor Oven".into(),
+        };
+        let configs = configs(&topics, true, &[], "C");
+        assert!(!configs.is_empty());
+        for (topic, payload) in configs {
+            assert!(
+                topic.starts_with("homeassistant/") && topic.contains("/anova_outdoor_oven/"),
+                "{topic}"
+            );
+            if payload.is_empty() {
+                continue;
+            }
+            let v: Value = serde_json::from_str(&payload).unwrap();
+            assert!(v["unique_id"].as_str().unwrap().starts_with("anova_outdoor_oven_"));
+            let entity = v["default_entity_id"].as_str().unwrap();
+            assert!(entity.split_once('.').unwrap().1.starts_with("anova_outdoor_oven_"), "{entity}");
+            assert_eq!(v["device"]["identifiers"], json!(["anova_outdoor_oven"]));
+            assert_eq!(v["device"]["name"], "Anova Outdoor Oven");
+        }
     }
 
     /// The whole discovery set, local mode. To accept a deliberate change:

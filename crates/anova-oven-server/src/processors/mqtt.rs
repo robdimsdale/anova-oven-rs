@@ -60,6 +60,35 @@ pub struct MqttConfig {
     pub time_zone: Option<jiff::tz::TimeZone>,
 }
 
+/// `ANOVA_MQTT_DEVICE_ID`, or `anova_oven` when it's unset or blank. It
+/// goes into topics and entity ids, so it's lowercased and anything but
+/// letters, digits and `_` becomes `_` ("Outdoor oven" -> `outdoor_oven`).
+fn device_id(value: Option<&str>) -> String {
+    let id: String = value
+        .map(str::trim)
+        .unwrap_or("")
+        .chars()
+        .map(|c| match c.to_ascii_lowercase() {
+            c @ ('a'..='z' | '0'..='9' | '_') => c,
+            _ => '_',
+        })
+        .collect();
+    if id.trim_matches('_').is_empty() {
+        "anova_oven".into()
+    } else {
+        id
+    }
+}
+
+/// `ANOVA_MQTT_DEVICE_NAME`, or `Anova Oven` when it's unset or blank.
+fn device_name(value: Option<&str>) -> String {
+    value
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("Anova Oven")
+        .to_string()
+}
+
 /// `ANOVA_MQTT_CLIENT_ID`, or `anova-oven-server` when it's unset or blank.
 fn client_id(value: Option<&str>) -> String {
     value
@@ -82,6 +111,8 @@ impl MqttConfig {
                     .unwrap_or_else(|_| "anova/oven".into()),
                 discovery: std::env::var("ANOVA_MQTT_DISCOVERY_PREFIX")
                     .unwrap_or_else(|_| "homeassistant".into()),
+                device_id: device_id(std::env::var("ANOVA_MQTT_DEVICE_ID").ok().as_deref()),
+                device_name: device_name(std::env::var("ANOVA_MQTT_DEVICE_NAME").ok().as_deref()),
             },
             local,
             client_id: client_id(std::env::var("ANOVA_MQTT_CLIENT_ID").ok().as_deref()),
@@ -928,6 +959,8 @@ mod tests {
         let topics = Topics {
             prefix: "anova/oven".into(),
             discovery: "homeassistant".into(),
+            device_id: "anova_oven".into(),
+            device_name: "Anova Oven".into(),
         };
         let (sm_cmd_tx, mut sm_cmd_rx) = mpsc::channel(4);
         tokio::spawn(async move {
@@ -1116,6 +1149,8 @@ mod tests {
             topics: Topics {
                 prefix: "anova/oven".into(),
                 discovery: "homeassistant".into(),
+                device_id: "anova_oven".into(),
+                device_name: "Anova Oven".into(),
             },
             local: true,
             client_id: "anova-oven-test".into(),
@@ -1131,5 +1166,22 @@ mod tests {
         assert_eq!(client_id(None), "anova-oven-server");
         assert_eq!(client_id(Some("  ")), "anova-oven-server");
         assert_eq!(client_id(Some(" oven-test ")), "oven-test");
+    }
+
+    #[test]
+    fn device_id_defaults_and_is_made_safe_for_topics() {
+        assert_eq!(device_id(None), "anova_oven");
+        assert_eq!(device_id(Some("  ")), "anova_oven");
+        assert_eq!(device_id(Some("--")), "anova_oven");
+        assert_eq!(device_id(Some(" anova_outdoor_oven ")), "anova_outdoor_oven");
+        assert_eq!(device_id(Some("Outdoor Oven")), "outdoor_oven");
+        assert_eq!(device_id(Some("oven/2+#")), "oven_2__");
+    }
+
+    #[test]
+    fn device_name_defaults_when_unset_or_blank() {
+        assert_eq!(device_name(None), "Anova Oven");
+        assert_eq!(device_name(Some(" ")), "Anova Oven");
+        assert_eq!(device_name(Some(" Outdoor Oven ")), "Outdoor Oven");
     }
 }

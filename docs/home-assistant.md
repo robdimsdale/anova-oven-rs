@@ -80,7 +80,8 @@ mode, so Home Assistant never shows a button the cloud will refuse.
 
 ## Entities
 
-One device, "Anova Oven". The full set, with every `unique_id`, is pinned
+One device, "Anova Oven" (see [Two ovens](#two-ovens) for a second). The
+full set, with every `unique_id`, is pinned
 by `crates/anova-oven-server/testdata/mqtt-discovery.json`.
 
 - **Sensors:** mode, temperature, target temperature, wet bulb, probe,
@@ -251,6 +252,27 @@ How they're made:
 | `ANOVA_MQTT_TOPIC_PREFIX` | `anova/oven` | |
 | `ANOVA_MQTT_DISCOVERY_PREFIX` | `homeassistant` | Home Assistant's default |
 | `ANOVA_MQTT_CLIENT_ID` | `anova-oven-server` | a second server on the same broker needs its own |
+| `ANOVA_MQTT_DEVICE_ID` | `anova_oven` | Home Assistant's device id, and the start of every `unique_id` and entity id; lowercased, and anything but letters, digits and `_` becomes `_` |
+| `ANOVA_MQTT_DEVICE_NAME` | `Anova Oven` | the device's name in Home Assistant |
+
+### Two ovens
+
+Each oven needs its own server, and on a shared broker each server needs
+its own `ANOVA_MQTT_CLIENT_ID`, `ANOVA_MQTT_TOPIC_PREFIX` and
+`ANOVA_MQTT_DEVICE_ID`. With the same device id, the second server's
+discovery overwrites the first's and Home Assistant shows one device. For
+example:
+
+```sh
+ANOVA_MQTT_CLIENT_ID=anova-outdoor-oven
+ANOVA_MQTT_TOPIC_PREFIX=anova/outdoor_oven
+ANOVA_MQTT_DEVICE_ID=anova_outdoor_oven
+ANOVA_MQTT_DEVICE_NAME="Anova Outdoor Oven"
+```
+
+gives `sensor.anova_outdoor_oven_temperature` and so on. Changing the
+device id of a server already in Home Assistant creates new entities, the
+same as any `unique_id` change.
 
 ## Security decisions
 
