@@ -89,7 +89,7 @@
   # Bitmap fonts (u8g2 collection) for distance-readable text. Renders straight
   # to an embedded-graphics DrawTarget via its FontRenderer; pulled in only by
   # the `_graphics` feature.
-  u8g2-fonts = { version = "0.8", optional = true, default-features = false }
+  u8g2-fonts = { version = "0.9", optional = true, default-features = false }
 
   anova-oven-api = { path = "../anova-oven-api", default-features = false }
   # Pure-logic core extracted from this crate so it can be host-tested
